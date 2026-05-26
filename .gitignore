@@ -1,0 +1,16 @@
+# Zephyr / west build output
+build/
+build_*/
+
+# macOS metadata
+.DS_Store
+
+# Claude Code session state
+.claude/
+
+# Editor scratch
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
