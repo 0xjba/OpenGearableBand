@@ -126,13 +126,25 @@ private:
     bool checkSQI(float* ppg_data);
     MotionState getMotionState(float* imu_data);
     float runAutocorrelation(float* ppg);
-    float runFFT(float* ppg);
+    // runFFT takes an optional stride_bin parameter for spectral
+    // exclusion: any bin within +/-1 of stride_bin (or its /3 sub-
+    // harmonic) is shadowed from the peak search.  Pass -1 to disable.
+    float runFFT(float* ppg, int stride_bin);
     // Chained 3-stage NLMS: cleans X-, Y-, then Z-correlated motion
     // from the PPG and FFTs the residual.  imu_x / imu_y / imu_z must
     // be DC-removed by the caller so gravity doesn't dominate the
     // adaptation -- otherwise the filter spends its coefficient budget
     // modeling the 1 g offset instead of the kinetic AC content.
-    float runAdaptiveNLMS(float* ppg, float* imu_x, float* imu_y, float* imu_z);
+    float runAdaptiveNLMS(float* ppg,
+                          float* imu_x, float* imu_y, float* imu_z,
+                          int stride_bin);
+    // Find the dominant IMU motion-frequency bin (the user's stride
+    // cadence during walking/running).  Returns the FFT bin index of
+    // the maximum magnitude in the [0.6, 3.33 Hz] band of the IMU SMV
+    // spectrum.  Side effect: overwrites fft_output[] and fft_magnitudes[]
+    // (those buffers get overwritten again by runFFT later in the same
+    // window, so no real harm).
+    int findStrideBin(float* imu_smv);
     // autocorr_n is the LENGTH OF THE INPUT to arm_correlate_f32, not
     // the length of the output array.  Output has 2*autocorr_n - 1
     // elements with zero lag at index autocorr_n - 1.

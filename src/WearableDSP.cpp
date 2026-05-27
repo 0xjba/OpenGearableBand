@@ -270,7 +270,17 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
     }
     last_motion = motion;
 
-    // 6. Extract a raw BPM using the path that matches the motion state.
+    // 6. Find the IMU stride frequency (only when we'll need it, i.e.
+    //    when motion is non-stationary and the NLMS path is going to
+    //    feed FFT).  Used for spectral exclusion in runFFT below.
+    //    stride_bin <= 0 means "no exclusion" (passed through unused
+    //    in the autocorr path).
+    int stride_bin = -1;
+    if (sqi_passed && motion != STATIONARY) {
+        stride_bin = findStrideBin(imu_smv);
+    }
+
+    // 7. Extract a raw BPM using the path that matches the motion state.
     //    Only run this path if SQI passed -- otherwise raw_bpm stays 0 and
     //    the diagnostic log makes that explicit.
     float raw_bpm = 0.0f;
@@ -307,12 +317,16 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
                 // -- FFT would obediently pick it.  Route through the
                 // 3-axis chained NLMS so the X/Y/Z-correlated motion is
                 // subtracted out of the PPG before the FFT bin search.
-                raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_x, imu_y, imu_z);
+                // Pass stride_bin so the FFT also shadows the residual
+                // stride and stride/3 sub-harmonic that NLMS can't fully
+                // cancel (these were the dominant false peaks observed
+                // in the v0.3 jogging trace).
+                raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_x, imu_y, imu_z, stride_bin);
                 kalman.r = 2.0f;
                 path = "nlms-micro";
                 break;
             case HEAVY_MOTION:
-                raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_x, imu_y, imu_z);
+                raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_x, imu_y, imu_z, stride_bin);
                 kalman.r = 5.0f;
                 path = "nlms-heavy";
                 break;
@@ -325,9 +339,9 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
     //    the path produced.  Lets us see whether a stuck Kalman is caused by
     //    SQI rejection, peak-finder returning 0, or out-of-range BPM.
     LOG_INF("dsp: ppg_dc=%.0f ppg_var=%.0f imu_var=%.3f motion=%d sqi=%d "
-            "path=%s raw=%.2f in_range=%d kalman=%.2f",
+            "path=%s stride=%d raw=%.2f in_range=%d kalman=%.2f",
             (double)ac_mean, (double)ppg_var, (double)imu_var,
-            (int)motion, (int)sqi_passed, path,
+            (int)motion, (int)sqi_passed, path, stride_bin,
             (double)raw_bpm, (int)bpm_in_range, (double)kalman.x);
 
     if (!sqi_passed)    return kalman.x;
@@ -352,17 +366,39 @@ float WearableDSP::runAutocorrelation(float* ppg) {
     return (60.0f * SAMPLE_RATE) / (float)delay_index;
 }
 
-float WearableDSP::runFFT(float* ppg) {
+float WearableDSP::runFFT(float* ppg, int stride_bin) {
     arm_rfft_fast_f32(&fft_inst, ppg, fft_output, 0);
     arm_cmplx_mag_f32(fft_output, fft_magnitudes, BUFFER_SIZE / 2);
-    
+
     int min_idx = (int)(0.6f * BUFFER_SIZE / SAMPLE_RATE);
     int max_idx = (int)(3.33f * BUFFER_SIZE / SAMPLE_RATE);
-    
+
+    // Spectral exclusion (data-driven from v0.3 jogging trace).  NLMS
+    // does linear cancellation of IMU-correlated motion, but it cannot
+    // remove non-linear / breathing-driven optical artifacts.  Those
+    // showed up as two false poles in the PPG spectrum:
+    //   * the stride fundamental (bin 13 = 2.54 Hz in the trace, 6/31 picks)
+    //   * the stride 3rd sub-harmonic (bin 4 = 0.85 Hz, 9/31 picks)
+    // The cardiac peak sits between them (bin 9-10) and gets shouted
+    // down.  Shadow both poles +/-1 bin (the +/-1 absorbs spectral
+    // leakage from rectangular windowing) and the FFT is forced to
+    // pick from the remaining bins.
+    //
+    // Pass stride_bin <= 0 to disable exclusion.
+    int sub_stride_bin = (stride_bin > 0) ? (stride_bin / 3) : -1;
+
     float max_val = 0;
     int max_idx_found = 0;
-    
+
     for (int i = min_idx; i <= max_idx; i++) {
+        if (stride_bin > 0 &&
+            i >= stride_bin - 1 && i <= stride_bin + 1) {
+            continue;  // shadow stride fundamental +/-1 bin
+        }
+        if (sub_stride_bin > 0 &&
+            i >= sub_stride_bin - 1 && i <= sub_stride_bin + 1) {
+            continue;  // shadow stride/3 sub-harmonic +/-1 bin
+        }
         if (fft_magnitudes[i] > max_val) {
             max_val = fft_magnitudes[i];
             max_idx_found = i;
@@ -371,10 +407,40 @@ float WearableDSP::runFFT(float* ppg) {
     return ((float)max_idx_found * SAMPLE_RATE / (float)BUFFER_SIZE) * 60.0f;
 }
 
+int WearableDSP::findStrideBin(float* imu_smv) {
+    // FFT the (DC-removed) IMU SMV to locate the user's stride
+    // frequency.  Same FFT instance (BUFFER_SIZE-point) the PPG path
+    // will use later in the same window -- arm_rfft_fast_f32 doesn't
+    // carry state between calls, so this is safe.
+    //
+    // We use SMV (not a single axis) because stride motion projects
+    // onto every axis depending on wrist orientation; SMV captures
+    // it regardless.  The SMV's frequency-doubling artifact (which
+    // disqualified it as an NLMS reference) is irrelevant here -- we
+    // only care about WHICH bin has the peak, and the stride
+    // fundamental will be the dominant SMV peak whether at f or 2f.
+    arm_rfft_fast_f32(&fft_inst, imu_smv, fft_output, 0);
+    arm_cmplx_mag_f32(fft_output, fft_magnitudes, BUFFER_SIZE / 2);
+
+    int min_idx = (int)(0.6f * BUFFER_SIZE / SAMPLE_RATE);
+    int max_idx = (int)(3.33f * BUFFER_SIZE / SAMPLE_RATE);
+
+    float max_val = 0;
+    int max_bin = 0;
+    for (int i = min_idx; i <= max_idx; i++) {
+        if (fft_magnitudes[i] > max_val) {
+            max_val = fft_magnitudes[i];
+            max_bin = i;
+        }
+    }
+    return max_bin;
+}
+
 float WearableDSP::runAdaptiveNLMS(float* ppg,
                                    float* imu_x,
                                    float* imu_y,
-                                   float* imu_z)
+                                   float* imu_z,
+                                   int stride_bin)
 {
     // Chained 3-stage NLMS multi-reference adaptive filter.
     //
@@ -400,7 +466,7 @@ float WearableDSP::runAdaptiveNLMS(float* ppg,
                      nlms_noise_estimate, nlms_residual_yz, BUFFER_SIZE);
     arm_lms_norm_f32(&lms_inst_z, imu_z, nlms_residual_yz,
                      nlms_noise_estimate, nlms_final, BUFFER_SIZE);
-    return runFFT(nlms_final);
+    return runFFT(nlms_final, stride_bin);
 }
 
 int WearableDSP::findSecondPeak(float* data, int autocorr_n) {
