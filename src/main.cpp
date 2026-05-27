@@ -353,11 +353,12 @@ K_THREAD_DEFINE(reset_thread_id, 1024, reset_thread_entry, NULL, NULL, NULL, 10,
 //   WORKOUT       Triggered by SIGN_MOT INT1 (sustained walking/running
 //                 detected by the LSM6DSL embedded engine).  Same acq +
 //                 DSP setup as SNAPSHOT, but it stays on -- transitioning
-//                 back to IDLE only after WORKOUT_EXIT_STATIONARY_WINDOWS
-//                 consecutive STATIONARY windows from the DSP.  We do a
-//                 time-gated verification first (WORKOUT_VERIFY_MS) so a
-//                 brief gesture or a single staircase doesn't drop the
-//                 system into continuous mode for nothing.
+//                 back to IDLE only after WORKOUT_EXIT_COOLDOWN_WINDOWS
+//                 consecutive non-HEAVY (STATIONARY or MICRO_MOTION)
+//                 windows from the DSP.  We do a time-gated verification
+//                 first (WORKOUT_VERIFY_MS) so a brief gesture or a
+//                 single staircase doesn't drop the system into
+//                 continuous mode for nothing.
 //
 // Transition events are delivered via semaphores, so the state-machine
 // thread runs at the kernel's lowest priority and spends almost all of
@@ -401,7 +402,18 @@ static const char *power_state_str(PowerState s) {
 #define SNAPSHOT_DURATION_MS              (22 * 1000)
 #define WORKOUT_VERIFY_MS                 (3 * 60 * 1000)  // 3 min motion confirmation
 #define WORKOUT_VERIFY_MOTION_RATIO_PCT   70               // >=70% of windows in motion
-#define WORKOUT_EXIT_STATIONARY_WINDOWS   117              // ~5 min at 2.56s/window
+// Cooldown for WORKOUT exit: 60 windows of NOT HEAVY motion (= STATIONARY or
+// MICRO).  Empirically (v0.2 jogging trace), requiring 117 consecutive pure
+// STATIONARY windows was unreachable in real life -- typing, shifting, or
+// reaching for things produced MICRO bursts that reset the streak forever,
+// effectively trapping WORKOUT mode on (observed: still in WORKOUT after
+// 15 min of clear post-jog rest).  Treating MICRO as "non-heavy" exits
+// WORKOUT during low-intensity activity too -- a slow leisurely walk will
+// drop back to SNAPSHOT cadence, which is the right product call: the
+// 5-min snapshot still tracks the user, the continuous 100 Hz path is
+// reserved for activities where second-to-second HR really changes (jog,
+// HIIT, cycling).  Only sustained HEAVY (imu_var > 0.5) resets the streak.
+#define WORKOUT_EXIT_COOLDOWN_WINDOWS     60               // ~2.5 min at 2.56s/window
 #define WORKOUT_NOT_WORN_EXIT_WINDOWS     2                // ~5s, exit if band removed
 
 // Snapshot cadence.  The k_timer just gives a semaphore; the state
@@ -594,10 +606,14 @@ static void run_workout(void) {
     // Two exit conditions:
     //   1. The band came off (NOT_WORN for >= WORKOUT_NOT_WORN_EXIT_WINDOWS).
     //      Snap to IDLE -- a band on the desk should not stay in WORKOUT.
-    //   2. Sustained quiet (WORKOUT_EXIT_STATIONARY_WINDOWS consecutive
-    //      STATIONARY windows).  A single twitch mid-walk won't bounce
-    //      us out; the streak only resets on real motion.
-    uint32_t stationary_streak = 0;
+    //   2. Cooldown: WORKOUT_EXIT_COOLDOWN_WINDOWS consecutive non-HEAVY
+    //      windows.  MICRO_MOTION counts toward the streak; only sustained
+    //      HEAVY resets it.  This is an explicit product call: continuous
+    //      100 Hz mode is reserved for high-variance activities (jog,
+    //      cycling, HIIT) where HR really changes second-to-second.  A
+    //      slow walk legitimately drops out -- the SNAPSHOT cadence at
+    //      5 min still tracks the user with negligible duty cycle.
+    uint32_t cooldown_streak = 0;
     uint32_t not_worn_streak = 0;
     uint32_t seq_last = atomic_get(&latest_window_seq);
 
@@ -615,21 +631,21 @@ static void run_workout(void) {
                 transition_to_idle();
                 return;
             }
-            stationary_streak = 0;  // don't credit non-worn windows
+            cooldown_streak = 0;  // don't credit non-worn windows
             continue;
         }
         not_worn_streak = 0;
 
         MotionState m = (MotionState)atomic_get(&latest_motion_state);
-        if (m == STATIONARY) {
-            if (++stationary_streak >= WORKOUT_EXIT_STATIONARY_WINDOWS) {
-                LOG_INF("WORKOUT: %u stationary windows -> exit to IDLE",
-                        stationary_streak);
+        if (m != HEAVY_MOTION) {
+            if (++cooldown_streak >= WORKOUT_EXIT_COOLDOWN_WINDOWS) {
+                LOG_INF("WORKOUT: %u non-heavy windows -> exit to IDLE",
+                        cooldown_streak);
                 transition_to_idle();
                 return;
             }
         } else {
-            stationary_streak = 0;
+            cooldown_streak = 0;
         }
     }
 }
