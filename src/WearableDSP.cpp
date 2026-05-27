@@ -277,7 +277,7 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
     //    in the autocorr path).
     int stride_bin = -1;
     if (sqi_passed && motion != STATIONARY) {
-        stride_bin = findStrideBin(imu_smv);
+        stride_bin = findStrideBin(imu_x, imu_y, imu_z);
     }
 
     // 7. Extract a raw BPM using the path that matches the motion state.
@@ -335,16 +335,19 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
 
     bool bpm_in_range = (raw_bpm >= MIN_BPM && raw_bpm <= MAX_BPM);
 
-    // Physiological rate-of-change gate.  Reject NLMS raws that imply
-    // biologically impossible per-window HR changes.  STATIONARY/autocorr
-    // is exempt -- that path is trusted and we want it to converge fast.
-    float delta_abs = raw_bpm - kalman.x;
-    if (delta_abs < 0.0f) delta_abs = -delta_abs;
+    // Asymmetric slew-rate limiter.  Reject NLMS raws that imply a
+    // biologically impossible per-window DROP.  Rises are accepted
+    // unconditionally (HR onset can be fast; Kalman gain limits the
+    // per-update damage if a rise is actually a motion artifact).
+    // STATIONARY/autocorr is exempt either way.
     bool delta_ok = true;
-    if (motion == MICRO_MOTION) {
-        delta_ok = (delta_abs <= MAX_DELTA_MICRO_BPM);
-    } else if (motion == HEAVY_MOTION) {
-        delta_ok = (delta_abs <= MAX_DELTA_HEAVY_BPM);
+    if (raw_bpm < kalman.x) {
+        float drop = kalman.x - raw_bpm;
+        if (motion == MICRO_MOTION) {
+            delta_ok = (drop <= MAX_DROP_MICRO_BPM);
+        } else if (motion == HEAVY_MOTION) {
+            delta_ok = (drop <= MAX_DROP_HEAVY_BPM);
+        }
     }
 
     // 7. One diagnostic line per window: every gate's verdict + the raw BPM
@@ -421,19 +424,32 @@ float WearableDSP::runFFT(float* ppg, int stride_bin) {
     return ((float)max_idx_found * SAMPLE_RATE / (float)BUFFER_SIZE) * 60.0f;
 }
 
-int WearableDSP::findStrideBin(float* imu_smv) {
-    // FFT the (DC-removed) IMU SMV to locate the user's stride
-    // frequency.  Same FFT instance (BUFFER_SIZE-point) the PPG path
-    // will use later in the same window -- arm_rfft_fast_f32 doesn't
-    // carry state between calls, so this is safe.
+int WearableDSP::findStrideBin(float* imu_x, float* imu_y, float* imu_z) {
+    // Locate the user's stride frequency from the IMU.  Earlier version
+    // used SMV; that broke for fast sprints (3 Hz stride -> 6 Hz in SMV
+    // -- out of the [0.6, 3.33 Hz] search range -- so findStrideBin
+    // locked onto the sub-harmonic at bin 8 instead of the real stride
+    // at bin 15).  Raw axes preserve the fundamental frequency.
     //
-    // We use SMV (not a single axis) because stride motion projects
-    // onto every axis depending on wrist orientation; SMV captures
-    // it regardless.  The SMV's frequency-doubling artifact (which
-    // disqualified it as an NLMS reference) is irrelevant here -- we
-    // only care about WHICH bin has the peak, and the stride
-    // fundamental will be the dominant SMV peak whether at f or 2f.
-    arm_rfft_fast_f32(&fft_inst, imu_smv, fft_output, 0);
+    // Pick the axis with the highest variance for THIS window.  Wrist
+    // orientation is user/situation-dependent: arm swing projects mostly
+    // onto Y when the wrist is palm-up at the start of the swing, X when
+    // turned, etc.  Picking the dominant axis dynamically captures stride
+    // regardless of orientation.
+    //
+    // Caller must have already DC-removed the axes so gravity isn't the
+    // dominant "variance" (which would always select whichever axis
+    // happens to be gravity-aligned).
+    float var_x, var_y, var_z;
+    arm_var_f32(imu_x, BUFFER_SIZE, &var_x);
+    arm_var_f32(imu_y, BUFFER_SIZE, &var_y);
+    arm_var_f32(imu_z, BUFFER_SIZE, &var_z);
+
+    float *selected = imu_x;
+    if (var_y >= var_x && var_y >= var_z) selected = imu_y;
+    else if (var_z >= var_x && var_z >= var_y) selected = imu_z;
+
+    arm_rfft_fast_f32(&fft_inst, selected, fft_output, 0);
     arm_cmplx_mag_f32(fft_output, fft_magnitudes, BUFFER_SIZE / 2);
 
     int min_idx = (int)(0.6f * BUFFER_SIZE / SAMPLE_RATE);

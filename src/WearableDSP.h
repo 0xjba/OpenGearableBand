@@ -29,34 +29,37 @@ enum WearState {
 // Typical worn signal: 30k-80k.  Ambient / no contact: < 2k.
 #define WEAR_PPG_THRESHOLD       10000.0f
 
-// Slew-rate limiter on raw_bpm vs. current Kalman state.
+// Asymmetric slew-rate limiter on raw_bpm vs. current Kalman state.
 //
-// Without this, the v0.3 jogging trace showed Kalman dropping 119 -> 95
-// in ~25 s after the user stopped running -- pulled down by noisy NLMS
-// raws (single-window values of 46, 58, 70 BPM) while the user's actual
-// HR was decaying gradually.  Apple Watch's "sticky" post-workout
-// behavior is exactly this construct: reject raws that imply
-// biologically impossible per-window changes.
+// Heart-rate physiology is fundamentally asymmetric: HR can rise fast
+// during exercise onset (60+ BPM/min) but drops slowly during recovery
+// (HRR is 20-30 BPM in the first full minute even for fit adults).  A
+// symmetric gate breaks the onset case because Kalman state can be
+// stale (a 60-second gap between a resting snapshot at HR=70 and the
+// start of a sprint at HR=130 makes the first onset raw look like a
+// 60 BPM "jump" -- legitimate change, not artifact).  Symmetric gate
+// was tried and regressed: kalman stuck at 68 through a 30 s sprint
+// while Apple Watch climbed to 120-130.
 //
-// Cardiology calibration: Heart Rate Recovery (HRR) for a fit adult is
-// 20-30 BPM in the FIRST FULL MINUTE after stopping exercise.  Per
-// 2.56 s window that's ~1.0-1.3 BPM.  Our 30 / 50 BPM bounds are an
-// order of magnitude above true HRR, so legitimate recovery is fully
-// trackable; the bounds only fire on motion-artifact spikes (the
-// observed bad raws were 25-70 BPM step changes in a single window).
+// Asymmetric design:
+//   * RISES (raw > kalman) are accepted regardless of magnitude.  HR
+//     climbs are always physiologically possible; if motion artifact
+//     causes a spurious rise, the Kalman gain (small per update) limits
+//     the damage to a few BPM per window.
+//   * DROPS (raw < kalman) are gated.  A genuine 50+ BPM drop in one
+//     2.56 s window is biologically impossible -- a heart cannot
+//     decelerate that fast.  Such raws are motion-artifact spikes
+//     (sub-stride, breathing residuals) and rejecting them keeps
+//     Kalman "sticky" during cooldown the way Apple Watch behaves.
 //
-// 50 BPM in 2.5 s = 1200 BPM/min rate of change.  Real exercise onset
-// peaks at maybe 60 BPM/min, so 50 in a single window is the edge of
-// plausible -- generous enough to track aggressive HR changes but
-// rejects the clear motion-artifact spikes the NLMS path produces.
-// MICRO is tighter because the user is no longer actively exercising
-// when motion is light; real HR change should be slower.
+// Drop bounds are an order of magnitude above true HRR, so legitimate
+// recovery tracks fully; bounds only fire on artifact spikes.
 //
-// STATIONARY (autocorr) is NOT gated -- that path is independently
-// validated at +/-1 BPM accuracy and we want it to converge quickly
-// once the wrist is still.
-#define MAX_DELTA_MICRO_BPM      30.0f
-#define MAX_DELTA_HEAVY_BPM      50.0f
+// STATIONARY (autocorr) is NOT gated -- the autocorr path is +/-1 BPM
+// accurate independently, and we want it to converge fast once the
+// wrist is still.
+#define MAX_DROP_MICRO_BPM       30.0f
+#define MAX_DROP_HEAVY_BPM       50.0f
 // Number of consecutive passing windows required for WORN.  Buffer is
 // BUFFER_SIZE samples = 2 overlap-windows long, so 2 passes guarantees
 // the entire buffer is post-wear data.  Bumped from 3 to 4 to give the
@@ -168,12 +171,16 @@ private:
                           float* imu_x, float* imu_y, float* imu_z,
                           int stride_bin);
     // Find the dominant IMU motion-frequency bin (the user's stride
-    // cadence during walking/running).  Returns the FFT bin index of
-    // the maximum magnitude in the [0.6, 3.33 Hz] band of the IMU SMV
-    // spectrum.  Side effect: overwrites fft_output[] and fft_magnitudes[]
-    // (those buffers get overwritten again by runFFT later in the same
-    // window, so no real harm).
-    int findStrideBin(float* imu_smv);
+    // cadence during walking/running).  Uses the highest-variance
+    // raw axis (X, Y, or Z) -- NOT SMV.  SMV's magnitude operation
+    // doubles the AC frequency of the underlying motion, which moves
+    // a 3 Hz sprint stride out to 6 Hz (out of our [0.6, 3.33 Hz]
+    // search range) and causes findStrideBin to lock onto the wrong
+    // sub-harmonic.  Raw axes preserve the fundamental frequency
+    // regardless of cadence.  Side effect: overwrites fft_output[]
+    // and fft_magnitudes[] (those buffers get overwritten again by
+    // runFFT later in the same window, so no real harm).
+    int findStrideBin(float* imu_x, float* imu_y, float* imu_z);
     // autocorr_n is the LENGTH OF THE INPUT to arm_correlate_f32, not
     // the length of the output array.  Output has 2*autocorr_n - 1
     // elements with zero lag at index autocorr_n - 1.
