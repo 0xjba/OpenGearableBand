@@ -147,11 +147,36 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
         return 0.0f;
     }
 
-    // 2. DC removal for PPG so the band-pass IIR sees a near-zero-mean input
-    //    (smaller startup transient than feeding it the raw 180k-DC signal).
-    float ac_mean;
+    // 2. Endpoint detrending for PPG.  Plain mean subtraction handles
+    //    a flat DC offset, but during the first ~10 s of fresh band
+    //    contact the optical baseline DRIFTS noticeably (snap-1 trace:
+    //    ppg_dc rising 136964 -> 137047 -> 137283 over three windows
+    //    as skin/capillaries/LED equilibrate).  Plain mean subtraction
+    //    leaves that drift as a ~100-count linear ramp residual inside
+    //    the buffer -- positive at the start, negative at the end --
+    //    which is a step input to the 4th-order band-pass IIR and
+    //    triggers ringing at the lower cutoff (0.6 Hz, whose period
+    //    of 167 samples gets clipped by our [30, 150] autocorr search
+    //    to a spurious lag-145 peak = 41 BPM exactly).
+    //
+    //    Endpoint detrending subtracts a straight line drawn through
+    //    the first and last buffer samples, forcing both endpoints to
+    //    exactly 0.  No step input -> no IIR ring.
+    //
+    //    The 2-point slope estimate is biased by cardiac AC at the
+    //    endpoints (max bias ~ peak-cardiac-amplitude / N ~ 0.2
+    //    counts/sample), which is small relative to the actual drift
+    //    rate (~0.4-0.8 counts/sample observed).  A least-squares
+    //    fit would be more accurate but is overkill for this case.
+    float ac_mean;  // kept for the dsp: diagnostic log
     arm_mean_f32(ppg_buffer, BUFFER_SIZE, &ac_mean);
-    for (int i = 0; i < BUFFER_SIZE; i++) ppg_buffer[i] -= ac_mean;
+
+    float first_val = ppg_buffer[0];
+    float last_val  = ppg_buffer[BUFFER_SIZE - 1];
+    float slope = (last_val - first_val) / (float)(BUFFER_SIZE - 1);
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+        ppg_buffer[i] -= (first_val + slope * (float)i);
+    }
 
     // 2b. Band-pass to 0.6 - 3.3 Hz.  In-place is safe (verified: CMSIS
     //     processes stage-by-stage across the block, reading each sample

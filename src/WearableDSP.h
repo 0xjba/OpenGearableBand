@@ -29,9 +29,15 @@ enum WearState {
 // Typical worn signal: 30k-80k.  Ambient / no contact: < 2k.
 #define WEAR_PPG_THRESHOLD       10000.0f
 // Number of consecutive passing windows required for WORN.  Buffer is
-// BUFFER_SIZE samples = 2 overlap-windows long, so 2 passes guarantees the
-// entire buffer is post-wear data.  Use 3 for one extra margin window.
-#define WEAR_PASSES_REQUIRED     3
+// BUFFER_SIZE samples = 2 overlap-windows long, so 2 passes guarantees
+// the entire buffer is post-wear data.  Bumped from 3 to 4 to give the
+// skin one more 2.5 s window to physiologically settle (skin compresses,
+// capillaries equilibrate, LED warms the surface) before we start
+// trusting the math.  Observed in v0.2 boot snapshots: ppg_dc rises
+// 100-300 counts per window for the first 2-3 worn windows as the
+// optical baseline drifts; that drift is large enough to dominate
+// the cardiac AC and ring the band-pass IIR.
+#define WEAR_PASSES_REQUIRED     4
 
 // Number of windows the motion-state classifier remains "warm" after any
 // motion event.  1 window = one 50%-overlap step (~2.56 s) -- long enough
