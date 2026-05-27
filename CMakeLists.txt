@@ -4,7 +4,8 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(wearable_hr_monitor)
 
-target_sources(app PRIVATE 
+target_sources(app PRIVATE
     src/main.cpp
     src/WearableDSP.cpp
+    src/power_ctrl.cpp
 )
