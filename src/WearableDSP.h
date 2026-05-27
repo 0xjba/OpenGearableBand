@@ -59,22 +59,49 @@ class WearableDSP {
 private:
     KalmanFilter1D kalman;
     arm_rfft_fast_instance_f32 fft_inst;
-    arm_lms_norm_instance_f32 lms_inst;
+
+    // Chained multi-axis NLMS for motion-artifact cancellation.
+    // SMV = sqrt(X^2 + Y^2 + Z^2) has frequency-doubled AC content
+    // relative to the original wrist-motion frequency (an arm swing at
+    // 2.5 Hz produces 5 Hz in SMV due to the magnitude operation), so
+    // NLMS with SMV reference cannot subtract the 2.5 Hz PPG motion
+    // artifact.  Raw X, Y, Z axes preserve the fundamental frequency.
+    // Chain three single-reference NLMS filters: each axis scrubs its
+    // own correlated content from the residual of the prior stage.
+    arm_lms_norm_instance_f32 lms_inst_x;
+    arm_lms_norm_instance_f32 lms_inst_y;
+    arm_lms_norm_instance_f32 lms_inst_z;
+    float lms_state_x[BUFFER_SIZE + 32];
+    float lms_state_y[BUFFER_SIZE + 32];
+    float lms_state_z[BUFFER_SIZE + 32];
+    float lms_coeffs_x[32];
+    float lms_coeffs_y[32];
+    float lms_coeffs_z[32];
 
     // 4th-order Butterworth band-pass IIR (0.6 - 3.3 Hz @ 100 Hz Fs),
     // 2 biquad sections in cascade.  State buffer is 4 floats per stage.
     arm_biquad_casd_df1_inst_f32 bp_inst;
     float bp_state[4 * 2];
 
-    float lms_state[BUFFER_SIZE + 32];
-    float lms_coeffs[32];
     float fft_output[BUFFER_SIZE];
     float fft_magnitudes[BUFFER_SIZE / 2];
 
     // Large buffers moved from stack to member variables to prevent stack overflow
     float correlation[BUFFER_SIZE * 2 - 1];
-    float clean_signal[BUFFER_SIZE];
-    float error[BUFFER_SIZE];
+    // Intermediate buffers for the 3-stage NLMS chain:
+    //   nlms_noise_estimate  -- "pOut" parameter, the LMS's predicted
+    //                            noise term (we don't use it but the
+    //                            CMSIS call requires a non-NULL pointer)
+    //   nlms_residual_xy     -- output of stage 1 (X-cleaned), input
+    //                            to stage 2
+    //   nlms_residual_yz     -- output of stage 2 (X+Y-cleaned), input
+    //                            to stage 3
+    //   nlms_final           -- output of stage 3 (X+Y+Z-cleaned), this
+    //                            is what we FFT
+    float nlms_noise_estimate[BUFFER_SIZE];
+    float nlms_residual_xy[BUFFER_SIZE];
+    float nlms_residual_yz[BUFFER_SIZE];
+    float nlms_final[BUFFER_SIZE];
 
     // Wear-state machine state
     WearState wear_state = WEAR_NOT_WORN;
@@ -100,7 +127,12 @@ private:
     MotionState getMotionState(float* imu_data);
     float runAutocorrelation(float* ppg);
     float runFFT(float* ppg);
-    float runAdaptiveNLMS(float* ppg, float* imu);
+    // Chained 3-stage NLMS: cleans X-, Y-, then Z-correlated motion
+    // from the PPG and FFTs the residual.  imu_x / imu_y / imu_z must
+    // be DC-removed by the caller so gravity doesn't dominate the
+    // adaptation -- otherwise the filter spends its coefficient budget
+    // modeling the 1 g offset instead of the kinetic AC content.
+    float runAdaptiveNLMS(float* ppg, float* imu_x, float* imu_y, float* imu_z);
     // autocorr_n is the LENGTH OF THE INPUT to arm_correlate_f32, not
     // the length of the output array.  Output has 2*autocorr_n - 1
     // elements with zero lag at index autocorr_n - 1.
@@ -114,7 +146,16 @@ private:
 
 public:
     WearableDSP();
-    float processHeartRate(float* ppg_buffer, float* imu_buffer);
+    // imu_smv is used ONLY for motion-state variance classification
+    // (still the right metric for that: gravity-removed SMV variance
+    // cleanly separates stationary / micro / heavy regardless of axis
+    // orientation).  imu_x / imu_y / imu_z are the references for the
+    // chained NLMS motion-artifact cancellation.
+    float processHeartRate(float* ppg_buffer,
+                           float* imu_smv,
+                           float* imu_x,
+                           float* imu_y,
+                           float* imu_z);
     WearState getWearState() const { return wear_state; }
     MotionState getMotionState() const { return last_motion; }
 };

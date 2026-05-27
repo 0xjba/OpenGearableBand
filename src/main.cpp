@@ -27,15 +27,28 @@ const struct device *max30102_dev = DEVICE_DT_GET(DT_NODELABEL(max30102));
 // Its node label is typically 'lsm6ds3tr_c' in the standard Zephyr board tree.
 const struct device *imu_dev = DEVICE_DT_GET(DT_NODELABEL(lsm6ds3tr_c));
 
-// Global Buffers
+// Global Buffers.
+//   imu_smv_buffer carries the Signal Magnitude Vector for motion-state
+//   variance classification (orientation-agnostic, single scalar).
+//   imu_{x,y,z}_buffer carry the raw per-axis accelerations -- needed
+//   as separate NLMS references because SMV's magnitude operation
+//   frequency-doubles the AC content (a 2.5 Hz arm swing becomes 5 Hz
+//   in SMV) which makes it useless for cancelling the original 2.5 Hz
+//   PPG motion artifact.
 float ppg_buffer[BUFFER_SIZE];
-float imu_buffer[BUFFER_SIZE];
+float imu_smv_buffer[BUFFER_SIZE];
+float imu_x_buffer[BUFFER_SIZE];
+float imu_y_buffer[BUFFER_SIZE];
+float imu_z_buffer[BUFFER_SIZE];
 volatile int sample_index = 0;
 
 // DSP processing buffers (decoupled so the acquisition thread can keep
 // writing the next window while the DSP thread is still crunching).
 float dsp_ppg_buffer[BUFFER_SIZE];
-float dsp_imu_buffer[BUFFER_SIZE];
+float dsp_imu_smv[BUFFER_SIZE];
+float dsp_imu_x[BUFFER_SIZE];
+float dsp_imu_y[BUFFER_SIZE];
+float dsp_imu_z[BUFFER_SIZE];
 
 // DSP Instance
 WearableDSP dsp;
@@ -240,8 +253,11 @@ void acq_thread_entry(void *, void *, void *) {
             window_start_ms = k_uptime_get();
         }
 
-        ppg_buffer[sample_index] = (float)sensor_value_to_double(&ir_val);
-        imu_buffer[sample_index] = smv;
+        ppg_buffer[sample_index]     = (float)sensor_value_to_double(&ir_val);
+        imu_smv_buffer[sample_index] = smv;
+        imu_x_buffer[sample_index]   = ax;
+        imu_y_buffer[sample_index]   = ay;
+        imu_z_buffer[sample_index]   = az;
 
         // Log the first 5 stored samples of each acquisition burst --
         // enough to confirm sensors warmed up cleanly without flooding
@@ -273,13 +289,23 @@ void acq_thread_entry(void *, void *, void *) {
                     samples_in_window, elapsed_ms,
                     (double)measured_hz, acq_overruns);
 
-            memcpy(dsp_ppg_buffer, ppg_buffer, sizeof(float) * BUFFER_SIZE);
-            memcpy(dsp_imu_buffer, imu_buffer, sizeof(float) * BUFFER_SIZE);
+            // Snapshot all five acquisition buffers into the DSP
+            // copies so the DSP thread sees a coherent 5.12 s window
+            // even as new samples land into the acquisition buffers.
+            memcpy(dsp_ppg_buffer, ppg_buffer,     sizeof(float) * BUFFER_SIZE);
+            memcpy(dsp_imu_smv,    imu_smv_buffer, sizeof(float) * BUFFER_SIZE);
+            memcpy(dsp_imu_x,      imu_x_buffer,   sizeof(float) * BUFFER_SIZE);
+            memcpy(dsp_imu_y,      imu_y_buffer,   sizeof(float) * BUFFER_SIZE);
+            memcpy(dsp_imu_z,      imu_z_buffer,   sizeof(float) * BUFFER_SIZE);
 
-            // 50 % overlap: keep the second half as the start of the next window.
+            // 50% overlap: keep the second half as the start of the
+            // next window, for all five acquisition buffers.
             int overlap = BUFFER_SIZE / 2;
-            memmove(ppg_buffer, &ppg_buffer[overlap], sizeof(float) * overlap);
-            memmove(imu_buffer, &imu_buffer[overlap], sizeof(float) * overlap);
+            memmove(ppg_buffer,     &ppg_buffer[overlap],     sizeof(float) * overlap);
+            memmove(imu_smv_buffer, &imu_smv_buffer[overlap], sizeof(float) * overlap);
+            memmove(imu_x_buffer,   &imu_x_buffer[overlap],   sizeof(float) * overlap);
+            memmove(imu_y_buffer,   &imu_y_buffer[overlap],   sizeof(float) * overlap);
+            memmove(imu_z_buffer,   &imu_z_buffer[overlap],   sizeof(float) * overlap);
             sample_index = overlap;
 
             window_start_ms = now;
@@ -306,7 +332,11 @@ void dsp_thread_entry(void *, void *, void *) {
     while (1) {
         k_sem_take(&dsp_process_sem, K_FOREVER);
 
-        float final_bpm = dsp.processHeartRate(dsp_ppg_buffer, dsp_imu_buffer);
+        float final_bpm = dsp.processHeartRate(dsp_ppg_buffer,
+                                               dsp_imu_smv,
+                                               dsp_imu_x,
+                                               dsp_imu_y,
+                                               dsp_imu_z);
         WearState ws = dsp.getWearState();
         MotionState ms = dsp.getMotionState();
 

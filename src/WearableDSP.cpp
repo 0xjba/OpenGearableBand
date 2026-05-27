@@ -67,9 +67,18 @@ void WearableDSP::resetAdaptiveFilters() {
     kalman.p = 1.0f;
     kalman.k = 0.0f;
 
-    // NLMS: zero coefficients, re-init so internal state pointer is rewound.
-    for (int i = 0; i < 32; i++) lms_coeffs[i] = 0.0f;
-    arm_lms_norm_init_f32(&lms_inst, 32, lms_coeffs, lms_state, 0.01f, BUFFER_SIZE);
+    // Three independent NLMS filters: zero coefficients, re-init so
+    // each instance's internal state-buffer pointer is rewound.  Same
+    // step size (0.01) and tap count (32) across all three -- gives
+    // them comparable adaptation behavior on their respective axes.
+    for (int i = 0; i < 32; i++) {
+        lms_coeffs_x[i] = 0.0f;
+        lms_coeffs_y[i] = 0.0f;
+        lms_coeffs_z[i] = 0.0f;
+    }
+    arm_lms_norm_init_f32(&lms_inst_x, 32, lms_coeffs_x, lms_state_x, 0.01f, BUFFER_SIZE);
+    arm_lms_norm_init_f32(&lms_inst_y, 32, lms_coeffs_y, lms_state_y, 0.01f, BUFFER_SIZE);
+    arm_lms_norm_init_f32(&lms_inst_z, 32, lms_coeffs_z, lms_state_z, 0.01f, BUFFER_SIZE);
 
     // Band-pass IIR: arm_biquad_cascade_df1_init_f32 memsets the state
     // buffer to zero (verified in CMSIS-DSP source), so this both
@@ -99,7 +108,11 @@ MotionState WearableDSP::getMotionState(float* imu_data) {
     return HEAVY_MOTION;
 }
 
-float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
+float WearableDSP::processHeartRate(float* ppg_buffer,
+                                    float* imu_smv,
+                                    float* imu_x,
+                                    float* imu_y,
+                                    float* imu_z) {
     // 1. Wear-state machine.  Check raw PPG mean BEFORE DC removal.
     float raw_mean;
     arm_mean_f32(ppg_buffer, BUFFER_SIZE, &raw_mean);
@@ -191,11 +204,27 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
     arm_biquad_cascade_df1_init_f32(&bp_inst, 2, BP_COEFFS, bp_state);
     arm_biquad_cascade_df1_f32(&bp_inst, ppg_buffer, ppg_buffer, BUFFER_SIZE);
 
-    // 3. DC removal for IMU (drops the gravity bias).  No band-pass on IMU
-    //    -- NLMS wants the full motion spectrum as its reference.
-    float imu_dc;
-    arm_mean_f32(imu_buffer, BUFFER_SIZE, &imu_dc);
-    for (int i = 0; i < BUFFER_SIZE; i++) imu_buffer[i] -= imu_dc;
+    // 3. DC removal for IMU (drops the gravity bias).  No band-pass on
+    //    IMU -- NLMS wants the full motion spectrum as its reference.
+    //
+    //    All four signals get the gravity bias stripped:
+    //      * SMV (motion-state variance metric -- ~1 g DC at rest)
+    //      * X, Y, Z axes individually (NLMS references; without DC
+    //        removal the filter would burn coefficients modeling the
+    //        ~1 g component split across whichever axes are aligned
+    //        with gravity, leaving little capacity for the actual
+    //        kinetic AC content it's supposed to subtract).
+    float imu_dc, dc_x, dc_y, dc_z;
+    arm_mean_f32(imu_smv, BUFFER_SIZE, &imu_dc);
+    arm_mean_f32(imu_x,   BUFFER_SIZE, &dc_x);
+    arm_mean_f32(imu_y,   BUFFER_SIZE, &dc_y);
+    arm_mean_f32(imu_z,   BUFFER_SIZE, &dc_z);
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+        imu_smv[i] -= imu_dc;
+        imu_x[i]   -= dc_x;
+        imu_y[i]   -= dc_y;
+        imu_z[i]   -= dc_z;
+    }
 
     // 4. SQI: variance of the AC PPG.  Reject if too flat (signal is dead)
     //    or too wild (motion, light leak, contact loss).
@@ -227,7 +256,7 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
     // window after the wrist has stopped moving (proven by the 17:17
     // trace: imu_var=0.046 but raw_bpm=139.53 from a still-ringing PPG).
     float imu_var;
-    arm_var_f32(imu_buffer, BUFFER_SIZE, &imu_var);
+    arm_var_f32(imu_smv, BUFFER_SIZE, &imu_var);
     MotionState motion;
     if      (imu_var < 0.01f) motion = STATIONARY;
     else if (imu_var < 0.5f)  motion = MICRO_MOTION;
@@ -275,15 +304,15 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
                 // Plain FFT used to live here, but with the 0.6-3.3 Hz
                 // band-pass, any wrist motion at 1-3 Hz lands inside the
                 // pass band as a peak just as tall as the heart-rate peak
-                // -- FFT would obediently pick it.  Route through NLMS so
-                // the IMU-correlated component is subtracted out of the
-                // PPG before the FFT bin search runs.
-                raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_buffer);
+                // -- FFT would obediently pick it.  Route through the
+                // 3-axis chained NLMS so the X/Y/Z-correlated motion is
+                // subtracted out of the PPG before the FFT bin search.
+                raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_x, imu_y, imu_z);
                 kalman.r = 2.0f;
                 path = "nlms-micro";
                 break;
             case HEAVY_MOTION:
-                raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_buffer);
+                raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_x, imu_y, imu_z);
                 kalman.r = 5.0f;
                 path = "nlms-heavy";
                 break;
@@ -342,9 +371,36 @@ float WearableDSP::runFFT(float* ppg) {
     return ((float)max_idx_found * SAMPLE_RATE / (float)BUFFER_SIZE) * 60.0f;
 }
 
-float WearableDSP::runAdaptiveNLMS(float* ppg, float* imu) {
-    arm_lms_norm_f32(&lms_inst, imu, ppg, this->clean_signal, this->error, BUFFER_SIZE);
-    return runFFT(error);
+float WearableDSP::runAdaptiveNLMS(float* ppg,
+                                   float* imu_x,
+                                   float* imu_y,
+                                   float* imu_z)
+{
+    // Chained 3-stage NLMS multi-reference adaptive filter.
+    //
+    // arm_lms_norm_f32 signature is misleading -- naming-wise:
+    //   pSrc  = reference signal (the noise we want to subtract)
+    //   pRef  = desired signal (the noisy input)
+    //   pOut  = ESTIMATED NOISE produced by the filter (not "clean")
+    //   pErr  = ERROR = desired - estimated_noise = the cleaned signal
+    //
+    // So we feed each stage:
+    //   reference = one IMU axis (already DC-removed by caller)
+    //   desired   = the residual from the previous stage (or raw PPG
+    //               for stage 1)
+    //   pOut      = nlms_noise_estimate (scratch sink, we never read it)
+    //   pErr      = the residual for the next stage
+    //
+    // After stage 3, nlms_final holds the PPG with X-, Y-, and Z-
+    // correlated motion content subtracted out.  FFT picks the
+    // strongest bin in the [0.6, 3.3] Hz band on that residual.
+    arm_lms_norm_f32(&lms_inst_x, imu_x, ppg,
+                     nlms_noise_estimate, nlms_residual_xy, BUFFER_SIZE);
+    arm_lms_norm_f32(&lms_inst_y, imu_y, nlms_residual_xy,
+                     nlms_noise_estimate, nlms_residual_yz, BUFFER_SIZE);
+    arm_lms_norm_f32(&lms_inst_z, imu_z, nlms_residual_yz,
+                     nlms_noise_estimate, nlms_final, BUFFER_SIZE);
+    return runFFT(nlms_final);
 }
 
 int WearableDSP::findSecondPeak(float* data, int autocorr_n) {
