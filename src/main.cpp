@@ -60,7 +60,17 @@ K_SEM_DEFINE(motion_wake_sem, 0, 1);
 // no apparent caller of k_sem_give(acq_tick_sem)).  Also gives us a
 // clean per-burst sample counter for accurate Hz reporting.
 static volatile bool acq_active = false;
-static volatile uint32_t acq_burst_samples = 0;
+static volatile uint32_t acq_burst_samples = 0;   // total ticks since burst start (incl. discards)
+static volatile uint32_t acq_burst_stored = 0;    // stored samples since burst start
+
+// Number of samples to discard at the start of every acquisition burst.
+// The MAX30102 produces a ~16 000-count linear ramp over the first ~5
+// FIFO entries after coming out of SHDN (LED warm-up + ADC settle +
+// possibly stale FIFO contents).  That ramp is a giant step input to
+// the 4th-order band-pass IIR and biases autocorrelation peak-finding
+// for many samples after.  Discarding 10 samples (100 ms) is well past
+// the observed end of the ramp and adds invisible latency to the user.
+#define ACQ_WARMUP_SAMPLES                10
 
 // Cross-thread observation of the DSP's per-window state.  The DSP
 // thread bumps latest_window_seq each cycle and writes the latest
@@ -211,31 +221,49 @@ void acq_thread_entry(void *, void *, void *) {
         float az = (float)sensor_value_to_double(&accel_z);
         float smv = sqrtf(ax * ax + ay * ay + az * az);
 
+        // HARDWARE FIX: discard the first ACQ_WARMUP_SAMPLES of every
+        // burst to flush the MAX30102 wake-from-SHDN artifact (see the
+        // comment on ACQ_WARMUP_SAMPLES).  Fetches above ran regardless
+        // so the chip's FIFO continues to drain on schedule; only the
+        // store + downstream pipeline is gated.
+        acq_burst_samples++;
+        if (acq_burst_samples <= ACQ_WARMUP_SAMPLES) {
+            continue;
+        }
+
+        // First STORED sample of the burst marks the true start of
+        // the first measurement window.  Resetting window_start_ms
+        // here means the reported Hz reflects the chip's actual
+        // sample rate, not the wall-clock that included the warmup
+        // discards.
+        if (acq_burst_stored == 0) {
+            window_start_ms = k_uptime_get();
+        }
+
         ppg_buffer[sample_index] = (float)sensor_value_to_double(&ir_val);
         imu_buffer[sample_index] = smv;
 
-        // Log the first 5 samples of each acquisition burst -- enough
-        // to confirm sensors warmed up cleanly without flooding the
-        // serial console on every snapshot.
-        if (acq_burst_samples < 5) {
+        // Log the first 5 stored samples of each acquisition burst --
+        // enough to confirm sensors warmed up cleanly without flooding
+        // the serial console on every snapshot.
+        if (acq_burst_stored < 5) {
             LOG_INF("Sample %u: PPG(IR)=%.1f, accel=(%.2f, %.2f, %.2f) SMV=%.3f",
-                    acq_burst_samples, (double)ppg_buffer[sample_index],
+                    acq_burst_stored, (double)ppg_buffer[sample_index],
                     (double)ax, (double)ay, (double)az, (double)smv);
         }
 
         sample_index++;
-        acq_burst_samples++;
+        acq_burst_stored++;
 
         if (sample_index >= BUFFER_SIZE) {
             int64_t now = k_uptime_get();
             int64_t elapsed_ms = now - window_start_ms;
-            // Per-burst sample counter resets in start_acquisition(),
-            // so the "is this the first window in the current burst?"
-            // check is precise.  First window of a burst processes 512
-            // fresh samples; subsequent overlapped windows process 256.
+            // First window of a burst processes BUFFER_SIZE stored
+            // samples; subsequent overlapped windows process
+            // BUFFER_SIZE/2 new samples on top of the carried half.
             uint32_t samples_in_window =
-                (acq_burst_samples == BUFFER_SIZE) ? BUFFER_SIZE
-                                                   : (BUFFER_SIZE / 2);
+                (acq_burst_stored == BUFFER_SIZE) ? BUFFER_SIZE
+                                                  : (BUFFER_SIZE / 2);
             float measured_hz =
                 (elapsed_ms > 0)
                     ? ((float)samples_in_window * 1000.0f / (float)elapsed_ms)
@@ -437,6 +465,11 @@ static void start_acquisition(void) {
     sample_index = 0;
     acq_overruns = 0;
     acq_burst_samples = 0;
+    acq_burst_stored = 0;
+    // window_start_ms will be reset by acq_thread when the first
+    // post-warmup stored sample lands; this initial value just
+    // protects against an early "buffer full" check pulling an
+    // uninitialised delta.
     window_start_ms = k_uptime_get();
     // Set the gate BEFORE starting the timer so the very first tick
     // arrives at acq_thread with acq_active already true.

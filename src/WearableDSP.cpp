@@ -210,9 +210,27 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
     if (sqi_passed) {
         switch (motion) {
             case STATIONARY:
-                raw_bpm = runAutocorrelation(ppg_buffer);
-                kalman.r = 0.5f;
-                path = "autocorr";
+                // Contact-settling gate.  When the wrist is still, a
+                // well-settled signal has ppg_var ~1000-2000 (steady-
+                // state autocorr trace).  If ppg_var is much higher
+                // while motion is STATIONARY, the optical contact is
+                // unstable -- user adjusting the strap, finger tapping
+                // the sensor, or a fresh-on transient.  Autocorr's
+                // peak-finding becomes unreliable here (observed: lag-
+                // 100+ peaks that translate to fake ~50 BPM readings),
+                // so hold the Kalman state rather than commit garbage
+                // to it.  5000 puts the threshold comfortably above
+                // the settled range and well below the observed
+                // settling range (8000-20000 in the v0.2 boot snapshot).
+                if (ppg_var > 5000.0f) {
+                    path = "autocorr-settling";
+                    // raw_bpm stays 0 -- the in-range gate below will
+                    // reject it and the function returns kalman.x.
+                } else {
+                    raw_bpm = runAutocorrelation(ppg_buffer);
+                    kalman.r = 0.5f;
+                    path = "autocorr";
+                }
                 break;
             case MICRO_MOTION:
                 // Plain FFT used to live here, but with the 0.6-3.3 Hz
