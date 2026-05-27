@@ -3,6 +3,20 @@
 
 LOG_MODULE_REGISTER(dsp, LOG_LEVEL_INF);
 
+// Skip the first AUTOCORR_TRANSIENT_SKIP samples of the band-pass IIR's
+// output before correlating.  The 4th-order Butterworth IIR is re-init'd
+// per window (forced by the 50% buffer overlap -- carrying filter state
+// across the overlap-shift would misalign x[n-1]/x[n-2] vs the new
+// sample positions), so the first ~70 samples of every window's output
+// are dominated by the filter's impulse response rather than by signal.
+// Those samples participate in autocorrelation at every lag and can
+// create false correlation peaks -- observed: snapshot-1 trace had a
+// fully clean signal (ppg_var=804, motion=STATIONARY) but autocorr's
+// first WORN window returned raw=41.38 (lag 145) while Apple Watch
+// reported 81-83 BPM.  80 samples = 0.8 s gives one extra time constant
+// of margin past the filter's ~0.7 s settle.
+#define AUTOCORR_TRANSIENT_SKIP   80
+
 // ----------------------------------------------------------------------------
 // PPG band-pass filter coefficients.
 //
@@ -268,9 +282,19 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
 }
 
 float WearableDSP::runAutocorrelation(float* ppg) {
-    arm_correlate_f32(ppg, BUFFER_SIZE, ppg, BUFFER_SIZE, this->correlation);
-    int delay_index = findSecondPeak(correlation, BUFFER_SIZE * 2 - 1); 
-    if(delay_index == 0) return 0;
+    // Discard the first AUTOCORR_TRANSIENT_SKIP samples of the band-
+    // passed buffer (see the comment on the constant for why).  The
+    // PPG data is still valid -- we just don't include the IIR's
+    // settle window in the lag-correlation sum.  Result is shorter
+    // (n=432 instead of 512) but still well-conditioned for the
+    // lag range [30, 150] we care about (zero_lag_index = 431,
+    // search runs to index 581, output length is 863).
+    const int n = BUFFER_SIZE - AUTOCORR_TRANSIENT_SKIP;
+    arm_correlate_f32(ppg + AUTOCORR_TRANSIENT_SKIP, n,
+                      ppg + AUTOCORR_TRANSIENT_SKIP, n,
+                      this->correlation);
+    int delay_index = findSecondPeak(this->correlation, n);
+    if (delay_index == 0) return 0;
     return (60.0f * SAMPLE_RATE) / (float)delay_index;
 }
 
@@ -298,19 +322,23 @@ float WearableDSP::runAdaptiveNLMS(float* ppg, float* imu) {
     return runFFT(error);
 }
 
-int WearableDSP::findSecondPeak(float* data, int length) {
-    // Zero lag sits at index BUFFER_SIZE - 1 in the full correlation array.
-    // Search window covers plausible heart-rate periods:
+int WearableDSP::findSecondPeak(float* data, int autocorr_n) {
+    // arm_correlate_f32 on N samples produces a (2N-1)-length output
+    // with zero lag at index N-1.  Caller passes N (the autocorrelation
+    // INPUT length); we derive zero-lag and output bounds from it so
+    // this function works for any input length, not just the full
+    // BUFFER_SIZE.  Search window covers plausible HR periods:
     //   min_lag = 60/MAX_BPM * SR =  30 samples (200 BPM)
     //   max_lag = 60/MIN_BPM * SR = 150 samples ( 40 BPM)
-    int zero_lag_index = BUFFER_SIZE - 1;
+    int zero_lag_index = autocorr_n - 1;
+    int output_length = 2 * autocorr_n - 1;
     int min_lag = (int)((60.0f / MAX_BPM) * SAMPLE_RATE);
     int max_lag = (int)((60.0f / MIN_BPM) * SAMPLE_RATE);
 
     int start_index = zero_lag_index + min_lag;
     int end_index = zero_lag_index + max_lag;
-    if (end_index >= length) {
-        end_index = length - 1;
+    if (end_index >= output_length) {
+        end_index = output_length - 1;
     }
 
     // Pass 1: in-range global max, used purely as a prominence reference.

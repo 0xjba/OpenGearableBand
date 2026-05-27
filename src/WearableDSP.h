@@ -95,7 +95,10 @@ private:
     float runAutocorrelation(float* ppg);
     float runFFT(float* ppg);
     float runAdaptiveNLMS(float* ppg, float* imu);
-    int findSecondPeak(float* data, int length);
+    // autocorr_n is the LENGTH OF THE INPUT to arm_correlate_f32, not
+    // the length of the output array.  Output has 2*autocorr_n - 1
+    // elements with zero lag at index autocorr_n - 1.
+    int findSecondPeak(float* data, int autocorr_n);
 
     // Reset Kalman + NLMS to their initial values.  Called on the
     // NOT_WORN -> STABILIZING edge so the first BPM after wearing isn't
