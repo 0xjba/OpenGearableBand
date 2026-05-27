@@ -52,6 +52,16 @@ K_SEM_DEFINE(dsp_process_sem, 0, 1);
 // is designed) should not queue up wake events.
 K_SEM_DEFINE(motion_wake_sem, 0, 1);
 
+// Acquisition-active gate.  Set true inside start_acquisition(), cleared
+// in stop_acquisition().  acq_thread refuses to process samples unless
+// this is true -- defends against spurious sem fires of unknown origin
+// (observed: a Sample 0 line appearing at boot ~49 ms in, between the
+// MAX30102 shutdown and LSM6DSL enable, with all-zero accel values and
+// no apparent caller of k_sem_give(acq_tick_sem)).  Also gives us a
+// clean per-burst sample counter for accurate Hz reporting.
+static volatile bool acq_active = false;
+static volatile uint32_t acq_burst_samples = 0;
+
 // Cross-thread observation of the DSP's per-window state.  The DSP
 // thread bumps latest_window_seq each cycle and writes the latest
 // motion and wear classifications; the power-state thread polls them.
@@ -153,11 +163,16 @@ static void bt_ready(int err) {
 // latency cannot push the sampling cadence below the chip's 100 Hz rate.
 void acq_thread_entry(void *, void *, void *) {
     LOG_INF("Data acquisition thread started");
-    uint32_t count = 0;
     window_start_ms = k_uptime_get();
 
     while (1) {
         k_sem_take(&acq_tick_sem, K_FOREVER);
+
+        // Drop any tick that arrives while acquisition isn't supposed to
+        // be running (boot, IDLE between snapshots, transitions).
+        if (!acq_active) {
+            continue;
+        }
 
         if (sample_index >= BUFFER_SIZE) {
             continue;
@@ -199,22 +214,28 @@ void acq_thread_entry(void *, void *, void *) {
         ppg_buffer[sample_index] = (float)sensor_value_to_double(&ir_val);
         imu_buffer[sample_index] = smv;
 
-        if (count < 10) {
+        // Log the first 5 samples of each acquisition burst -- enough
+        // to confirm sensors warmed up cleanly without flooding the
+        // serial console on every snapshot.
+        if (acq_burst_samples < 5) {
             LOG_INF("Sample %u: PPG(IR)=%.1f, accel=(%.2f, %.2f, %.2f) SMV=%.3f",
-                    count, (double)ppg_buffer[sample_index],
+                    acq_burst_samples, (double)ppg_buffer[sample_index],
                     (double)ax, (double)ay, (double)az, (double)smv);
         }
 
         sample_index++;
-        count++;
+        acq_burst_samples++;
 
         if (sample_index >= BUFFER_SIZE) {
             int64_t now = k_uptime_get();
             int64_t elapsed_ms = now - window_start_ms;
-            // Measured rate over the half-window (256 samples after the
-            // first window; BUFFER_SIZE samples for the very first one).
+            // Per-burst sample counter resets in start_acquisition(),
+            // so the "is this the first window in the current burst?"
+            // check is precise.  First window of a burst processes 512
+            // fresh samples; subsequent overlapped windows process 256.
             uint32_t samples_in_window =
-                (count == BUFFER_SIZE) ? BUFFER_SIZE : (BUFFER_SIZE / 2);
+                (acq_burst_samples == BUFFER_SIZE) ? BUFFER_SIZE
+                                                   : (BUFFER_SIZE / 2);
             float measured_hz =
                 (elapsed_ms > 0)
                     ? ((float)samples_in_window * 1000.0f / (float)elapsed_ms)
@@ -403,11 +424,19 @@ K_TIMER_DEFINE(snapshot_tick, snapshot_tick_handler, NULL);
 static void start_acquisition(void) {
     sample_index = 0;
     acq_overruns = 0;
+    acq_burst_samples = 0;
     window_start_ms = k_uptime_get();
+    // Set the gate BEFORE starting the timer so the very first tick
+    // arrives at acq_thread with acq_active already true.
+    acq_active = true;
     k_timer_start(&acq_timer, K_MSEC(10), K_MSEC(10));
 }
 
 static void stop_acquisition(void) {
+    // Clear the gate BEFORE stopping the timer so any tick already in
+    // flight on the way to acq_thread will be dropped at the gate check
+    // rather than processed in some weird half-state.
+    acq_active = false;
     k_timer_stop(&acq_timer);
     // Drain any pending tick semaphore so the next start_acquisition()
     // doesn't process a stale tick before the timer's first new fire.
