@@ -317,10 +317,10 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
                 // -- FFT would obediently pick it.  Route through the
                 // 3-axis chained NLMS so the X/Y/Z-correlated motion is
                 // subtracted out of the PPG before the FFT bin search.
-                // Pass stride_bin so the FFT also shadows the residual
-                // stride and stride/3 sub-harmonic that NLMS can't fully
-                // cancel (these were the dominant false peaks observed
-                // in the v0.3 jogging trace).
+                // findStrideBin (called above) populated the dynamic
+                // imu_shadow_mask which runFFT uses to shadow any bin
+                // the IMU spectrum lit up as a motion peak -- catches
+                // residuals that the chained NLMS leaves behind.
                 raw_bpm = runAdaptiveNLMS(ppg_buffer, imu_x, imu_y, imu_z, stride_bin);
                 kalman.r = 2.0f;
                 path = "nlms-micro";
@@ -388,48 +388,28 @@ float WearableDSP::runAutocorrelation(float* ppg) {
 }
 
 float WearableDSP::runFFT(float* ppg, int stride_bin) {
+    (void)stride_bin;  // retained in signature for log-side diagnostics;
+                       // shadowing is now driven by imu_shadow_mask, which
+                       // findStrideBin populated from the IMU spectrum.
+
     arm_rfft_fast_f32(&fft_inst, ppg, fft_output, 0);
     arm_cmplx_mag_f32(fft_output, fft_magnitudes, BUFFER_SIZE / 2);
 
     int min_idx = (int)(0.6f * BUFFER_SIZE / SAMPLE_RATE);
     int max_idx = (int)(3.33f * BUFFER_SIZE / SAMPLE_RATE);
 
-    // Spectral exclusion (data-driven across two jogging traces).
-    // NLMS does linear cancellation of IMU-correlated motion but
-    // cannot fully suppress nonlinear / harmonic residuals, which
-    // show up as three poles in the PPG spectrum we need to shadow:
-    //
-    //   * stride fundamental (bin = stride_bin) -- partial NLMS leak
-    //   * stride / 3 sub-harmonic -- breathing / nonlinear pickup
-    //     (first jogging trace: stride bin 13, 1/3 = bin 4, 9/31 picks)
-    //   * 2 x stride harmonic -- THIS WAS THE REGRESSION SOURCE in the
-    //     second sprint trace.  PPG FFT kept picking bins 14-17 during
-    //     cooldown (stride detected at bin 7-8; 2x = bin 14-16), which
-    //     pushed Kalman to 152 BPM while the user's Apple Watch read
-    //     95-100.  The 2x harmonic of an asymmetric motion (foot
-    //     strikes are sharper than the air phase) is real, strong,
-    //     and the chained NLMS only partially cancels it.  Shadow it.
-    //
-    // Pass stride_bin <= 0 to disable exclusion.
-    // +/-1 absorbs spectral leakage from rectangular windowing.
-    int sub_stride_bin = (stride_bin > 0) ? (stride_bin / 3) : -1;
-    int x2_stride_bin  = (stride_bin > 0) ? (stride_bin * 2) : -1;
-
+    // Spectral exclusion: skip any bin that the IMU FFT flagged as a
+    // significant motion peak (>= 3x in-band mean, widened to +/-1).
+    // See the long comment in findStrideBin for the rationale; the
+    // shadow mask is rebuilt each window.  If findStrideBin wasn't
+    // called this window (autocorr path), runFFT also isn't called,
+    // so there's no stale-mask hazard.
     float max_val = 0;
     int max_idx_found = 0;
 
     for (int i = min_idx; i <= max_idx; i++) {
-        if (stride_bin > 0 &&
-            i >= stride_bin - 1 && i <= stride_bin + 1) {
-            continue;  // shadow stride fundamental +/-1 bin
-        }
-        if (sub_stride_bin > 0 &&
-            i >= sub_stride_bin - 1 && i <= sub_stride_bin + 1) {
-            continue;  // shadow stride/3 sub-harmonic +/-1 bin
-        }
-        if (x2_stride_bin > 0 &&
-            i >= x2_stride_bin - 1 && i <= x2_stride_bin + 1) {
-            continue;  // shadow 2 x stride harmonic +/-1 bin
+        if (imu_shadow_mask & (1U << i)) {
+            continue;
         }
         if (fft_magnitudes[i] > max_val) {
             max_val = fft_magnitudes[i];
@@ -472,12 +452,45 @@ int WearableDSP::findStrideBin(float* imu_x, float* imu_y, float* imu_z) {
 
     float max_val = 0;
     int max_bin = 0;
+    float sum = 0.0f;
     for (int i = min_idx; i <= max_idx; i++) {
+        sum += fft_magnitudes[i];
         if (fft_magnitudes[i] > max_val) {
             max_val = fft_magnitudes[i];
             max_bin = i;
         }
     }
+
+    // Build the dynamic shadow mask.  Replaces the older "shadow at
+    // stride, stride/3, 2x stride +/- 1 bin" rule which had three
+    // failure modes in field traces:
+    //   (a) stride bin bounces +/-1 window-to-window for fast cadence
+    //       (variance-based axis selection can flip dominant axes),
+    //       so the 2x position is off by +/-2 bins -- enough to miss.
+    //   (b) rectangular-window spectral leakage spreads each motion
+    //       peak across +/-2-3 bins; +/-1 shadow misses the skirts
+    //       and the cardiac search picks the skirt as "the" peak.
+    //   (c) motion harmonics are not always cleanly integer (asymm
+    //       gait + wrist rotation produce fractional inter-harmonics).
+    //
+    // Threshold = 3x in-band mean.  A typical jogging IMU spectrum has
+    // 2-3 prominent peaks (fundamental + 1-2 harmonics) plus a noise
+    // floor; 3x mean cleanly separates the peaks from the floor without
+    // catching small wiggles.  Each flagged bin is widened by +/-1 to
+    // catch the leakage skirts.
+    float mean = sum / (float)(max_idx - min_idx + 1);
+    float threshold = 3.0f * mean;
+    imu_shadow_mask = 0;
+    for (int i = min_idx; i <= max_idx; i++) {
+        if (fft_magnitudes[i] >= threshold) {
+            int lo = (i > 0)  ? i - 1 : 0;
+            int hi = (i < 31) ? i + 1 : 31;
+            for (int j = lo; j <= hi; j++) {
+                imu_shadow_mask |= (1U << j);
+            }
+        }
+    }
+
     return max_bin;
 }
 

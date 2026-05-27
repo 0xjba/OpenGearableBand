@@ -46,9 +46,9 @@ enum WearState {
 //     gated drops can't undo the un-gated rises.
 //
 // Current design: SYMMETRIC.  Both directions gated identically.  No
-// ratchet.  Combined with the 2x stride harmonic exclusion in runFFT,
-// the gate's job is purely to reject extreme outliers; the spectral
-// path does most of the heavy lifting.
+// ratchet.  Combined with the dynamic IMU shadow mask in runFFT
+// (see imu_shadow_mask), the gate's job is purely to reject extreme
+// outliers; the spectral path does most of the heavy lifting.
 //
 // Bound calibration from the trace:
 //   * Apple Watch peak HR ~120-130 during exercise.
@@ -147,6 +147,19 @@ private:
     WearState wear_state = WEAR_NOT_WORN;
     int wear_pass_count = 0;
 
+    // Dynamic spectral shadow mask, recomputed each window by
+    // findStrideBin().  Bit i is set if the IMU FFT magnitude at bin i
+    // exceeded 3x the in-band mean (i.e. bin i is a "significant motion
+    // peak", regardless of whether it's the stride fundamental, an
+    // integer harmonic, a sub-harmonic, or just spectral leakage).
+    // runFFT skips set bins when searching for the cardiac peak.  This
+    // replaces the earlier fixed shadowing of stride / sub / 2x because
+    // (a) stride detection bounces +/-1 bin window to window, (b)
+    // spectral leakage spreads each peak across +/-2 bins, and (c)
+    // motion isn't always cleanly integer-harmonic.  Capacity = 32
+    // bins which comfortably covers our [3, 17] search range.
+    uint32_t imu_shadow_mask = 0;
+
     // Last motion classification produced by processHeartRate().  Exposed
     // via getMotionState() so the power state machine can observe how
     // active the user is without re-running the IMU variance calc.
@@ -166,9 +179,11 @@ private:
     bool checkSQI(float* ppg_data);
     MotionState getMotionState(float* imu_data);
     float runAutocorrelation(float* ppg);
-    // runFFT takes an optional stride_bin parameter for spectral
-    // exclusion: any bin within +/-1 of stride_bin (or its /3 sub-
-    // harmonic) is shadowed from the peak search.  Pass -1 to disable.
+    // runFFT performs spectral exclusion via the dynamic imu_shadow_mask
+    // populated by the most recent findStrideBin() call (any bin >= 3x
+    // the IMU spectrum's in-band mean, widened by +/-1).  The stride_bin
+    // parameter is no longer used for shadowing; it's retained so the
+    // caller can log the detected stride alongside the FFT result.
     float runFFT(float* ppg, int stride_bin);
     // Chained 3-stage NLMS: cleans X-, Y-, then Z-correlated motion
     // from the PPG and FFTs the residual.  imu_x / imu_y / imu_z must
