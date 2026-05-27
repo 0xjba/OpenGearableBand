@@ -14,6 +14,7 @@
 #include <math.h>
 
 #include "WearableDSP.h"
+#include "power_ctrl.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -42,6 +43,55 @@ WearableDSP dsp;
 // deadline doesn't queue catch-up reads — overruns are detected separately.
 K_SEM_DEFINE(acq_tick_sem, 0, 1);
 K_SEM_DEFINE(dsp_process_sem, 0, 1);
+
+// SIGN_MOT wake signal from the LSM6DSL's embedded Significant Motion
+// engine.  The ISR cannot do real work; it only gives this semaphore,
+// which the power state machine (step 6) blocks on.  Binary because
+// rapid back-to-back fires (which shouldn't happen given how sig-mot
+// is designed) should not queue up wake events.
+K_SEM_DEFINE(motion_wake_sem, 0, 1);
+
+// LSM6DSL INT1 pin spec, pulled from the board DTS (lsm6ds3tr_c.irq-gpios
+// = <&gpio0 11 GPIO_ACTIVE_HIGH>).  Using GPIO_DT_SPEC_GET means a board
+// rev that moved the pin would not silently miscompile.
+static const struct gpio_dt_spec lsm6dsl_int1 =
+    GPIO_DT_SPEC_GET(DT_NODELABEL(lsm6ds3tr_c), irq_gpios);
+static struct gpio_callback lsm6dsl_int1_cb_data;
+
+static void lsm6dsl_int1_isr(const struct device *, struct gpio_callback *, uint32_t)
+{
+    /* Edge-triggered: just signal the state machine and get out.  Any
+     * actual work (reading FUNC_SRC1, deciding state, etc.) belongs in
+     * the consuming thread, not in the ISR context.
+     */
+    k_sem_give(&motion_wake_sem);
+}
+
+static int motion_wake_init(void)
+{
+    if (!gpio_is_ready_dt(&lsm6dsl_int1)) {
+        LOG_ERR("LSM6DSL INT1 pin not ready");
+        return -ENODEV;
+    }
+    int err = gpio_pin_configure_dt(&lsm6dsl_int1, GPIO_INPUT);
+    if (err) {
+        LOG_ERR("INT1 configure failed (%d)", err);
+        return err;
+    }
+    err = gpio_pin_interrupt_configure_dt(&lsm6dsl_int1, GPIO_INT_EDGE_TO_ACTIVE);
+    if (err) {
+        LOG_ERR("INT1 edge-interrupt configure failed (%d)", err);
+        return err;
+    }
+    gpio_init_callback(&lsm6dsl_int1_cb_data, lsm6dsl_int1_isr, BIT(lsm6dsl_int1.pin));
+    err = gpio_add_callback(lsm6dsl_int1.port, &lsm6dsl_int1_cb_data);
+    if (err) {
+        LOG_ERR("INT1 add_callback failed (%d)", err);
+        return err;
+    }
+    LOG_INF("LSM6DSL INT1 (P0.%d) callback installed", lsm6dsl_int1.pin);
+    return 0;
+}
 
 static volatile uint32_t acq_overruns = 0;
 static int64_t window_start_ms = 0;
@@ -240,6 +290,24 @@ void reset_thread_entry(void *, void *, void *) {
 
 K_THREAD_DEFINE(reset_thread_id, 1024, reset_thread_entry, NULL, NULL, NULL, 10, 0, 0);
 
+// --- Step 5 verification thread (TRANSITIONAL) ---
+// Just drains motion_wake_sem and logs each SIGN_MOT event.  This lets us
+// validate the GPIO-callback + sig-motion-engine path on hardware before
+// the full state machine (step 6) consumes the semaphore.  This thread
+// will be deleted when step 6 lands; the semaphore stays.
+void motion_wake_log_thread_entry(void *, void *, void *)
+{
+    LOG_INF("Motion-wake log thread started (waiting on SIGN_MOT)");
+    uint32_t count = 0;
+    while (1) {
+        k_sem_take(&motion_wake_sem, K_FOREVER);
+        count++;
+        LOG_INF("*** SIGN_MOT fired (#%u) ***", count);
+    }
+}
+K_THREAD_DEFINE(motion_wake_log_id, 1024, motion_wake_log_thread_entry,
+                NULL, NULL, NULL, 9, 0, 0);
+
 static void init_xiao_pins() {
     // Battery divider and high-current-charge pins.  The IMU power pin
     // (P1.08) is NOT touched here: the Xiao Sense board DTS declares a
@@ -279,6 +347,13 @@ int main(void) {
     int err = bt_enable(bt_ready);
     if (err) {
         LOG_ERR("Bluetooth init failed (err %d)", err);
+    }
+
+    // Wake-on-motion infrastructure.  GPIO callback first (so a spurious
+    // edge from enabling the engine wouldn't be missed), then enable the
+    // Significant Motion engine inside the LSM6DSL.
+    if (motion_wake_init() == 0) {
+        lsm6dsl_enable_sign_motion();
     }
 
     // 10 ms periodic tick drives the acquisition thread.  k_timer fires from
