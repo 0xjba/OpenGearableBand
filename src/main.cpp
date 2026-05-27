@@ -428,6 +428,13 @@ static const char *power_state_str(PowerState s) {
 // At 15 s we only got 2 measurements -- the BPM was close to truth but
 // noisier than necessary.  22 s is a better noise/duty-cycle trade.
 #define SNAPSHOT_DURATION_MS              (22 * 1000)
+
+// Early-abort the snapshot if the wear-state machine reports NOT_WORN
+// for this many consecutive windows.  ~5 s window-step at 2.56 s/window.
+// Saves ~14 s of MAX30102 LED current per unworn snapshot (band on
+// desk, in a bag, etc).  STABILIZING and WORN both reset the streak,
+// so a slow band-on mid-snapshot is not prematurely killed.
+#define SNAPSHOT_NOT_WORN_ABORT_WINDOWS   2
 #define WORKOUT_VERIFY_MS                 (3 * 60 * 1000)  // 3 min motion confirmation
 #define WORKOUT_VERIFY_MOTION_RATIO_PCT   70               // >=70% of windows in motion
 // Cooldown for WORKOUT exit: 60 windows of NOT HEAVY motion (= STATIONARY or
@@ -572,9 +579,37 @@ static void run_idle(void) {
 }
 
 static void run_snapshot(void) {
-    // Just wait for the snapshot duration to expire.  DSP results are
-    // pushed over BLE by the existing dsp_thread.
-    k_sleep(K_MSEC(SNAPSHOT_DURATION_MS));
+    // Run for up to SNAPSHOT_DURATION_MS, but bail to IDLE early if
+    // the wear-state machine reports NOT_WORN for
+    // SNAPSHOT_NOT_WORN_ABORT_WINDOWS consecutive windows.  Saves the
+    // MAX30102 LED current and CPU cycles that would otherwise burn
+    // for the full 22 s while the band sits unworn on a desk.
+    //
+    // Any non-NOT_WORN state (STABILIZING or WORN) resets the streak,
+    // so a band donned mid-snapshot is not killed by an earlier brief
+    // NOT_WORN observation.
+    int64_t deadline = k_uptime_get() + SNAPSHOT_DURATION_MS;
+    uint32_t seq_last = atomic_get(&latest_window_seq);
+    uint32_t not_worn_streak = 0;
+
+    while (k_uptime_get() < deadline) {
+        k_sleep(K_MSEC(500));
+        uint32_t seq_now = atomic_get(&latest_window_seq);
+        if (seq_now == seq_last) continue;
+        seq_last = seq_now;
+
+        WearState w = (WearState)atomic_get(&latest_wear_state);
+        if (w == WEAR_NOT_WORN) {
+            if (++not_worn_streak >= SNAPSHOT_NOT_WORN_ABORT_WINDOWS) {
+                LOG_INF("SNAPSHOT: NOT_WORN for %u windows -> abort to IDLE",
+                        not_worn_streak);
+                transition_to_idle();
+                return;
+            }
+        } else {
+            not_worn_streak = 0;
+        }
+    }
     transition_to_idle();
 }
 
