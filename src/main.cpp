@@ -52,12 +52,20 @@ K_SEM_DEFINE(dsp_process_sem, 0, 1);
 // is designed) should not queue up wake events.
 K_SEM_DEFINE(motion_wake_sem, 0, 1);
 
-// Cross-thread observation of the DSP's per-window motion state.  The
-// DSP thread bumps latest_window_seq each cycle and writes the latest
-// motion classification; the power-state thread polls these.  atomic_t
-// so reads/writes are torn-read-safe across threads.
+// Cross-thread observation of the DSP's per-window state.  The DSP
+// thread bumps latest_window_seq each cycle and writes the latest
+// motion and wear classifications; the power-state thread polls them.
+// atomic_t so reads/writes are torn-read-safe across threads.
+//
+// latest_wear_state exists specifically so the power state machine can
+// notice if the band is removed mid-WORKOUT and bail out -- without it,
+// the user removing the band while exercising left WORKOUT permanently
+// glued (motion classifier returns stale data when wear gate rejects,
+// and the wear gate's "0 BPM" output doesn't propagate to the state
+// machine).
 static atomic_t latest_window_seq = ATOMIC_INIT(0);
 static atomic_t latest_motion_state = ATOMIC_INIT(STATIONARY);
+static atomic_t latest_wear_state = ATOMIC_INIT(WEAR_NOT_WORN);
 
 // LSM6DSL INT1 pin spec, pulled from the board DTS (lsm6ds3tr_c.irq-gpios
 // = <&gpio0 11 GPIO_ACTIVE_HIGH>).  Using GPIO_DT_SPEC_GET means a board
@@ -255,10 +263,11 @@ void dsp_thread_entry(void *, void *, void *) {
 
         LOG_INF("Wear=%s  BPM=%.2f", wear_state_str(ws), (double)final_bpm);
 
-        // Publish motion state + window sequence for the power state
-        // machine to observe.  Sequence increments unconditionally so
-        // a poller can detect "new window" without missing any.
+        // Publish motion + wear state + window sequence for the power
+        // state machine to observe.  Sequence increments unconditionally
+        // so a poller can detect "new window" without missing any.
         atomic_set(&latest_motion_state, (atomic_val_t)ms);
+        atomic_set(&latest_wear_state, (atomic_val_t)ws);
         atomic_inc(&latest_window_seq);
 
         // Only push HRS notifications when the device is actually worn.
@@ -353,11 +362,19 @@ static const char *power_state_str(PowerState s) {
 
 // Tunables.  Comments cite the reasoning so anyone (including future me)
 // can revisit without re-deriving from scratch.
-#define SNAPSHOT_INTERVAL_MS              (5 * 60 * 1000)  // 5 min between snapshots
+//
+// TODO(power-v2): SNAPSHOT_INTERVAL_MS = 2 min is the *testing* value so
+// we don't have to wait 5 minutes between observations during bring-up.
+// Bump back to (5 * 60 * 1000) before shipping.  Battery math: at 5 min
+// the duty cycle is 15 / 300 = 5%, at 2 min it's 15 / 120 = 12.5% --
+// noticeable but not catastrophic.
+#define SNAPSHOT_INTERVAL_MS              (2 * 60 * 1000)  // TESTING: 2 min
+#define SNAPSHOT_FIRST_BOOT_MS            (30 * 1000)      // 30s for first IDLE after boot
 #define SNAPSHOT_DURATION_MS              (15 * 1000)      // 15s on per snapshot
 #define WORKOUT_VERIFY_MS                 (3 * 60 * 1000)  // 3 min motion confirmation
 #define WORKOUT_VERIFY_MOTION_RATIO_PCT   70               // >=70% of windows in motion
 #define WORKOUT_EXIT_STATIONARY_WINDOWS   117              // ~5 min at 2.56s/window
+#define WORKOUT_NOT_WORN_EXIT_WINDOWS     2                // ~5s, exit if band removed
 
 // Snapshot cadence.  The k_timer just gives a semaphore; the state
 // machine consumes it.  Started in transition_to_idle(), stopped on the
@@ -401,8 +418,19 @@ static void transition_to_idle(void) {
     max30102_shutdown();
     lsm6dsl_enable_sign_motion();       // re-arm (clears + enables)
     k_sem_reset(&motion_wake_sem);      // drop any stale edge
-    k_timer_start(&snapshot_tick,
-                  K_MSEC(SNAPSHOT_INTERVAL_MS),
+
+    // First IDLE after boot: schedule the first snapshot soon (30 s) so
+    // the user gets a visible sign of life rather than waiting a full
+    // SNAPSHOT_INTERVAL_MS.  Subsequent IDLE entries (after a snapshot
+    // or workout) use the normal cadence -- by then there have been
+    // recent fresh readings already.
+    static bool first_idle_entry = true;
+    k_timeout_t initial_delay = first_idle_entry
+        ? K_MSEC(SNAPSHOT_FIRST_BOOT_MS)
+        : K_MSEC(SNAPSHOT_INTERVAL_MS);
+    first_idle_entry = false;
+
+    k_timer_start(&snapshot_tick, initial_delay,
                   K_MSEC(SNAPSHOT_INTERVAL_MS));
     power_state = PS_IDLE;
 }
@@ -475,15 +503,33 @@ static void run_workout_verify(void) {
     // see MICRO_MOTION or HEAVY_MOTION; a brief gesture will settle
     // back to STATIONARY quickly.  Threshold: >=70% of observed
     // windows must be motion-class to commit to WORKOUT.
+    //
+    // Wear gate: if the user removed the band (or never had it on -- the
+    // band might be sitting on a desk while being shaken), the DSP
+    // reports NOT_WORN.  Bail out immediately rather than rack up a
+    // false-positive verify.
     int64_t deadline = k_uptime_get() + WORKOUT_VERIFY_MS;
     uint32_t seq_last = atomic_get(&latest_window_seq);
     uint32_t windows = 0, motion_windows = 0;
+    uint32_t not_worn_streak = 0;
 
     while (k_uptime_get() < deadline) {
         k_sleep(K_MSEC(500));
         uint32_t seq_now = atomic_get(&latest_window_seq);
         if (seq_now == seq_last) continue;
         seq_last = seq_now;
+
+        WearState w = (WearState)atomic_get(&latest_wear_state);
+        if (w == WEAR_NOT_WORN) {
+            if (++not_worn_streak >= WORKOUT_NOT_WORN_EXIT_WINDOWS) {
+                LOG_INF("VERIFY: NOT_WORN for %u windows -> abort to IDLE",
+                        not_worn_streak);
+                transition_to_idle();
+                return;
+            }
+            continue;  // don't count motion stats while the band's off
+        }
+        not_worn_streak = 0;
 
         MotionState m = (MotionState)atomic_get(&latest_motion_state);
         windows++;
@@ -509,11 +555,14 @@ static void run_workout_verify(void) {
 }
 
 static void run_workout(void) {
-    // Watch for sustained quiet: WORKOUT_EXIT_STATIONARY_WINDOWS
-    // consecutive STATIONARY windows from the DSP -> exit to IDLE.
-    // Anything non-STATIONARY resets the counter; a single twitch
-    // mid-walk won't bounce us out.
+    // Two exit conditions:
+    //   1. The band came off (NOT_WORN for >= WORKOUT_NOT_WORN_EXIT_WINDOWS).
+    //      Snap to IDLE -- a band on the desk should not stay in WORKOUT.
+    //   2. Sustained quiet (WORKOUT_EXIT_STATIONARY_WINDOWS consecutive
+    //      STATIONARY windows).  A single twitch mid-walk won't bounce
+    //      us out; the streak only resets on real motion.
     uint32_t stationary_streak = 0;
+    uint32_t not_worn_streak = 0;
     uint32_t seq_last = atomic_get(&latest_window_seq);
 
     while (1) {
@@ -522,10 +571,23 @@ static void run_workout(void) {
         if (seq_now == seq_last) continue;
         seq_last = seq_now;
 
+        WearState w = (WearState)atomic_get(&latest_wear_state);
+        if (w == WEAR_NOT_WORN) {
+            if (++not_worn_streak >= WORKOUT_NOT_WORN_EXIT_WINDOWS) {
+                LOG_INF("WORKOUT: NOT_WORN for %u windows -> exit to IDLE",
+                        not_worn_streak);
+                transition_to_idle();
+                return;
+            }
+            stationary_streak = 0;  // don't credit non-worn windows
+            continue;
+        }
+        not_worn_streak = 0;
+
         MotionState m = (MotionState)atomic_get(&latest_motion_state);
         if (m == STATIONARY) {
             if (++stationary_streak >= WORKOUT_EXIT_STATIONARY_WINDOWS) {
-                LOG_INF("WORKOUT: %u stationary windows -> exit",
+                LOG_INF("WORKOUT: %u stationary windows -> exit to IDLE",
                         stationary_streak);
                 transition_to_idle();
                 return;

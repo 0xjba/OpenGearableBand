@@ -124,6 +124,12 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
         // off-wrist is correct.
         wear_pass_count = 0;
         wear_state = WEAR_NOT_WORN;
+        // Reset last_motion explicitly: returning early skips the motion
+        // classifier, and a stale MICRO/HEAVY value left over from the
+        // last worn window will fool the power state machine into
+        // thinking the user is still exercising (proven by trace: 68/69
+        // motion windows in VERIFY while the wear gate said NOT_WORN).
+        last_motion = STATIONARY;
         return 0.0f;
     }
 
