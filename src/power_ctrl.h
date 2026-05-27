@@ -33,6 +33,26 @@ extern "C" {
 int max30102_shutdown(void);
 int max30102_wake(void);
 
+/* LSM6DSL embedded functions ---------------------------------------------
+ * The Zephyr lsm6dsl driver only exposes SENSOR_TRIG_DATA_READY (literal
+ * __ASSERT_NO_MSG in its trigger code) and never touches CTRL10_C or
+ * INT1_CTRL when CONFIG_LSM6DSL_TRIGGER_NONE=y (which is our setting).
+ * We therefore configure the chip's built-in Significant Motion engine
+ * directly: the algorithm is tuned by STMicroelectronics to fire only
+ * on sustained walking-or-running-class kinematics (it ignores typing,
+ * driving, brushing teeth) and routes a single edge to INT1 (= P0.11
+ * on the Xiao Sense board DTS).
+ *
+ * lsm6dsl_enable_sign_motion() turns the engine on and routes the event
+ * to INT1.  lsm6dsl_disable_sign_motion() unhooks it -- call this once
+ * we've transitioned into WORKOUT so the engine doesn't keep firing
+ * spuriously while we're already in continuous mode.
+ *
+ * Both return 0 on success, negative errno on I2C failure.
+ */
+int lsm6dsl_enable_sign_motion(void);
+int lsm6dsl_disable_sign_motion(void);
+
 #ifdef __cplusplus
 }
 #endif
