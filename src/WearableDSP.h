@@ -28,6 +28,27 @@ enum WearState {
 // PPG raw-count threshold (MAX30102 IR channel, LED2_PA=0x33 ~ 10 mA).
 // Typical worn signal: 30k-80k.  Ambient / no contact: < 2k.
 #define WEAR_PPG_THRESHOLD       10000.0f
+
+// Physiological rate-of-change gate on raw_bpm vs. current Kalman state.
+// Without this, the v0.3 jogging trace showed Kalman dropping 119 -> 95
+// in ~25 s after the user stopped running -- pulled down by noisy NLMS
+// raws (single-window values of 46, 58, 70 BPM) while the user's actual
+// HR was decaying gradually.  Apple Watch's "sticky" post-workout
+// behavior is exactly this gate: reject raws that imply biologically
+// impossible per-window changes.
+//
+// 50 BPM in 2.5 s = 1200 BPM/min rate of change.  Real exercise onset
+// peaks at maybe 60 BPM/min, so 50 in a single window is the edge of
+// plausible -- generous enough to track aggressive HR changes but
+// rejects the clear motion-artifact spikes the NLMS path produces.
+// MICRO is tighter because the user is no longer actively exercising
+// when motion is light; real HR change should be slower.
+//
+// STATIONARY (autocorr) is NOT gated -- that path is independently
+// validated at +/-1 BPM accuracy and we want it to converge quickly
+// once the wrist is still.
+#define MAX_DELTA_MICRO_BPM      30.0f
+#define MAX_DELTA_HEAVY_BPM      50.0f
 // Number of consecutive passing windows required for WORN.  Buffer is
 // BUFFER_SIZE samples = 2 overlap-windows long, so 2 passes guarantees
 // the entire buffer is post-wear data.  Bumped from 3 to 4 to give the

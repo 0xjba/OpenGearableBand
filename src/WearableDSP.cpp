@@ -335,17 +335,31 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
 
     bool bpm_in_range = (raw_bpm >= MIN_BPM && raw_bpm <= MAX_BPM);
 
+    // Physiological rate-of-change gate.  Reject NLMS raws that imply
+    // biologically impossible per-window HR changes.  STATIONARY/autocorr
+    // is exempt -- that path is trusted and we want it to converge fast.
+    float delta_abs = raw_bpm - kalman.x;
+    if (delta_abs < 0.0f) delta_abs = -delta_abs;
+    bool delta_ok = true;
+    if (motion == MICRO_MOTION) {
+        delta_ok = (delta_abs <= MAX_DELTA_MICRO_BPM);
+    } else if (motion == HEAVY_MOTION) {
+        delta_ok = (delta_abs <= MAX_DELTA_HEAVY_BPM);
+    }
+
     // 7. One diagnostic line per window: every gate's verdict + the raw BPM
     //    the path produced.  Lets us see whether a stuck Kalman is caused by
-    //    SQI rejection, peak-finder returning 0, or out-of-range BPM.
+    //    SQI rejection, peak-finder returning 0, out-of-range BPM, or the
+    //    new delta gate rejecting a physiologically-impossible jump.
     LOG_INF("dsp: ppg_dc=%.0f ppg_var=%.0f imu_var=%.3f motion=%d sqi=%d "
-            "path=%s stride=%d raw=%.2f in_range=%d kalman=%.2f",
+            "path=%s stride=%d raw=%.2f in_range=%d delta_ok=%d kalman=%.2f",
             (double)ac_mean, (double)ppg_var, (double)imu_var,
             (int)motion, (int)sqi_passed, path, stride_bin,
-            (double)raw_bpm, (int)bpm_in_range, (double)kalman.x);
+            (double)raw_bpm, (int)bpm_in_range, (int)delta_ok, (double)kalman.x);
 
     if (!sqi_passed)    return kalman.x;
     if (!bpm_in_range)  return kalman.x;
+    if (!delta_ok)      return kalman.x;
     return kalman.update(raw_bpm);
 }
 
