@@ -12,6 +12,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/services/hrs.h>
 #include <math.h>
+#include <zephyr/sys/atomic.h>
 
 #include "WearableDSP.h"
 #include "power_ctrl.h"
@@ -50,6 +51,13 @@ K_SEM_DEFINE(dsp_process_sem, 0, 1);
 // rapid back-to-back fires (which shouldn't happen given how sig-mot
 // is designed) should not queue up wake events.
 K_SEM_DEFINE(motion_wake_sem, 0, 1);
+
+// Cross-thread observation of the DSP's per-window motion state.  The
+// DSP thread bumps latest_window_seq each cycle and writes the latest
+// motion classification; the power-state thread polls these.  atomic_t
+// so reads/writes are torn-read-safe across threads.
+static atomic_t latest_window_seq = ATOMIC_INIT(0);
+static atomic_t latest_motion_state = ATOMIC_INIT(STATIONARY);
 
 // LSM6DSL INT1 pin spec, pulled from the board DTS (lsm6ds3tr_c.irq-gpios
 // = <&gpio0 11 GPIO_ACTIVE_HIGH>).  Using GPIO_DT_SPEC_GET means a board
@@ -243,8 +251,15 @@ void dsp_thread_entry(void *, void *, void *) {
 
         float final_bpm = dsp.processHeartRate(dsp_ppg_buffer, dsp_imu_buffer);
         WearState ws = dsp.getWearState();
+        MotionState ms = dsp.getMotionState();
 
         LOG_INF("Wear=%s  BPM=%.2f", wear_state_str(ws), (double)final_bpm);
+
+        // Publish motion state + window sequence for the power state
+        // machine to observe.  Sequence increments unconditionally so
+        // a poller can detect "new window" without missing any.
+        atomic_set(&latest_motion_state, (atomic_val_t)ms);
+        atomic_inc(&latest_window_seq);
 
         // Only push HRS notifications when the device is actually worn.
         // During NOT_WORN / STABILIZING the BPM is meaningless, and pushing
@@ -290,23 +305,255 @@ void reset_thread_entry(void *, void *, void *) {
 
 K_THREAD_DEFINE(reset_thread_id, 1024, reset_thread_entry, NULL, NULL, NULL, 10, 0, 0);
 
-// --- Step 5 verification thread (TRANSITIONAL) ---
-// Just drains motion_wake_sem and logs each SIGN_MOT event.  This lets us
-// validate the GPIO-callback + sig-motion-engine path on hardware before
-// the full state machine (step 6) consumes the semaphore.  This thread
-// will be deleted when step 6 lands; the semaphore stays.
-void motion_wake_log_thread_entry(void *, void *, void *)
-{
-    LOG_INF("Motion-wake log thread started (waiting on SIGN_MOT)");
-    uint32_t count = 0;
-    while (1) {
-        k_sem_take(&motion_wake_sem, K_FOREVER);
-        count++;
-        LOG_INF("*** SIGN_MOT fired (#%u) ***", count);
+// ============================================================================
+//  Power state machine (steps 6 + 7)
+// ============================================================================
+//
+//   IDLE          MAX30102 shutdown, acq_timer stopped, LSM6DSL sig-motion
+//                 engine armed, 5-minute snapshot k_timer running, BLE
+//                 advertising at default cadence.  CPU is in WFI between
+//                 BLE events and timer ticks (CONFIG_PM=y).
+//
+//   SNAPSHOT      Triggered by the 5-min snapshot timer.  Wakes MAX30102,
+//                 starts the 10ms acq_timer, runs the existing DSP for
+//                 SNAPSHOT_DURATION_MS, then back to IDLE.  15s window is
+//                 long enough for the wear state machine (3 windows =
+//                 ~7.7 s) plus a few WORN windows for Kalman to converge.
+//
+//   WORKOUT       Triggered by SIGN_MOT INT1 (sustained walking/running
+//                 detected by the LSM6DSL embedded engine).  Same acq +
+//                 DSP setup as SNAPSHOT, but it stays on -- transitioning
+//                 back to IDLE only after WORKOUT_EXIT_STATIONARY_WINDOWS
+//                 consecutive STATIONARY windows from the DSP.  We do a
+//                 time-gated verification first (WORKOUT_VERIFY_MS) so a
+//                 brief gesture or a single staircase doesn't drop the
+//                 system into continuous mode for nothing.
+//
+// Transition events are delivered via semaphores, so the state-machine
+// thread runs at the kernel's lowest priority and spends almost all of
+// its time blocked (= CPU asleep).
+
+enum PowerState {
+    PS_IDLE,
+    PS_SNAPSHOT,
+    PS_WORKOUT_VERIFY,
+    PS_WORKOUT,
+};
+
+static volatile PowerState power_state = PS_IDLE;
+static const char *power_state_str(PowerState s) {
+    switch (s) {
+        case PS_IDLE:           return "IDLE";
+        case PS_SNAPSHOT:       return "SNAPSHOT";
+        case PS_WORKOUT_VERIFY: return "WORKOUT_VERIFY";
+        case PS_WORKOUT:        return "WORKOUT";
+        default:                return "?";
     }
 }
-K_THREAD_DEFINE(motion_wake_log_id, 1024, motion_wake_log_thread_entry,
-                NULL, NULL, NULL, 9, 0, 0);
+
+// Tunables.  Comments cite the reasoning so anyone (including future me)
+// can revisit without re-deriving from scratch.
+#define SNAPSHOT_INTERVAL_MS              (5 * 60 * 1000)  // 5 min between snapshots
+#define SNAPSHOT_DURATION_MS              (15 * 1000)      // 15s on per snapshot
+#define WORKOUT_VERIFY_MS                 (3 * 60 * 1000)  // 3 min motion confirmation
+#define WORKOUT_VERIFY_MOTION_RATIO_PCT   70               // >=70% of windows in motion
+#define WORKOUT_EXIT_STATIONARY_WINDOWS   117              // ~5 min at 2.56s/window
+
+// Snapshot cadence.  The k_timer just gives a semaphore; the state
+// machine consumes it.  Started in transition_to_idle(), stopped on the
+// way out of IDLE.
+K_SEM_DEFINE(snapshot_tick_sem, 0, 1);
+static void snapshot_tick_handler(struct k_timer *) {
+    k_sem_give(&snapshot_tick_sem);
+}
+K_TIMER_DEFINE(snapshot_tick, snapshot_tick_handler, NULL);
+
+// latest_window_seq and latest_motion_state are declared at file scope
+// above (near the other shared state) so dsp_thread_entry can publish
+// to them before the power-state thread block is even defined.
+
+// Acquisition helpers ---------------------------------------------------
+// We toggle the existing acq_timer rather than the threads -- threads
+// stay alive and just block on their semaphores when the timer's stopped.
+
+static void start_acquisition(void) {
+    sample_index = 0;
+    acq_overruns = 0;
+    window_start_ms = k_uptime_get();
+    k_timer_start(&acq_timer, K_MSEC(10), K_MSEC(10));
+}
+
+static void stop_acquisition(void) {
+    k_timer_stop(&acq_timer);
+    // Drain any pending tick semaphore so the next start_acquisition()
+    // doesn't process a stale tick before the timer's first new fire.
+    k_sem_reset(&acq_tick_sem);
+}
+
+// State transitions -----------------------------------------------------
+// Centralised so every state entry runs through the same audit log line
+// and so the order of "configure sensors" -> "set state" -> "start
+// timers" is consistent.
+
+static void transition_to_idle(void) {
+    LOG_INF("PowerState: %s -> IDLE", power_state_str(power_state));
+    stop_acquisition();
+    max30102_shutdown();
+    lsm6dsl_enable_sign_motion();       // re-arm (clears + enables)
+    k_sem_reset(&motion_wake_sem);      // drop any stale edge
+    k_timer_start(&snapshot_tick,
+                  K_MSEC(SNAPSHOT_INTERVAL_MS),
+                  K_MSEC(SNAPSHOT_INTERVAL_MS));
+    power_state = PS_IDLE;
+}
+
+static void transition_to_snapshot(void) {
+    LOG_INF("PowerState: %s -> SNAPSHOT", power_state_str(power_state));
+    k_timer_stop(&snapshot_tick);
+    max30102_wake();
+    start_acquisition();
+    power_state = PS_SNAPSHOT;
+}
+
+static void transition_to_workout_verify(void) {
+    LOG_INF("PowerState: %s -> WORKOUT_VERIFY", power_state_str(power_state));
+    k_timer_stop(&snapshot_tick);
+    lsm6dsl_disable_sign_motion();      // we're tracking motion ourselves now
+    max30102_wake();
+    start_acquisition();
+    power_state = PS_WORKOUT_VERIFY;
+}
+
+static void transition_to_workout(void) {
+    LOG_INF("PowerState: %s -> WORKOUT", power_state_str(power_state));
+    // Acquisition is already running from VERIFY -- nothing to start.
+    power_state = PS_WORKOUT;
+}
+
+// Per-state run loops --------------------------------------------------
+
+static void run_idle(void) {
+    // Wait on either the snapshot timer or a motion wake event.  k_poll
+    // lets us block on N semaphores at once; the first one signalled
+    // wins.
+    struct k_poll_event events[2] = {
+        K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,
+                                 K_POLL_MODE_NOTIFY_ONLY,
+                                 &snapshot_tick_sem),
+        K_POLL_EVENT_INITIALIZER(K_POLL_TYPE_SEM_AVAILABLE,
+                                 K_POLL_MODE_NOTIFY_ONLY,
+                                 &motion_wake_sem),
+    };
+    k_poll(events, ARRAY_SIZE(events), K_FOREVER);
+
+    // Motion takes priority over a snapshot tick that fired at the same
+    // moment -- we'd rather start tracking the workout than burn the
+    // 15s on a snapshot first.
+    if (events[1].state == K_POLL_STATE_SEM_AVAILABLE) {
+        k_sem_take(&motion_wake_sem, K_NO_WAIT);
+        k_sem_reset(&snapshot_tick_sem);  // ignore the tick we didn't service
+        transition_to_workout_verify();
+        return;
+    }
+    if (events[0].state == K_POLL_STATE_SEM_AVAILABLE) {
+        k_sem_take(&snapshot_tick_sem, K_NO_WAIT);
+        transition_to_snapshot();
+        return;
+    }
+}
+
+static void run_snapshot(void) {
+    // Just wait for the snapshot duration to expire.  DSP results are
+    // pushed over BLE by the existing dsp_thread.
+    k_sleep(K_MSEC(SNAPSHOT_DURATION_MS));
+    transition_to_idle();
+}
+
+static void run_workout_verify(void) {
+    // Poll the DSP's per-window motion classification across the verify
+    // window.  If the user is really exercising, the DSP will mostly
+    // see MICRO_MOTION or HEAVY_MOTION; a brief gesture will settle
+    // back to STATIONARY quickly.  Threshold: >=70% of observed
+    // windows must be motion-class to commit to WORKOUT.
+    int64_t deadline = k_uptime_get() + WORKOUT_VERIFY_MS;
+    uint32_t seq_last = atomic_get(&latest_window_seq);
+    uint32_t windows = 0, motion_windows = 0;
+
+    while (k_uptime_get() < deadline) {
+        k_sleep(K_MSEC(500));
+        uint32_t seq_now = atomic_get(&latest_window_seq);
+        if (seq_now == seq_last) continue;
+        seq_last = seq_now;
+
+        MotionState m = (MotionState)atomic_get(&latest_motion_state);
+        windows++;
+        if (m != STATIONARY) motion_windows++;
+    }
+
+    // Need a minimum sample size to avoid a single window dictating
+    // the verdict.  Verify period is ~3 min, expected ~70 windows;
+    // demanding at least 30 windows guards against edge cases (DSP
+    // not running, wear-state stuck in STABILIZING, etc.).
+    bool commit = (windows >= 30) &&
+                  ((motion_windows * 100u) >= (windows * WORKOUT_VERIFY_MOTION_RATIO_PCT));
+
+    LOG_INF("VERIFY: %u/%u motion windows (%u%%); commit=%d",
+            motion_windows, windows,
+            windows ? (motion_windows * 100u / windows) : 0, commit);
+
+    if (commit) {
+        transition_to_workout();
+    } else {
+        transition_to_idle();
+    }
+}
+
+static void run_workout(void) {
+    // Watch for sustained quiet: WORKOUT_EXIT_STATIONARY_WINDOWS
+    // consecutive STATIONARY windows from the DSP -> exit to IDLE.
+    // Anything non-STATIONARY resets the counter; a single twitch
+    // mid-walk won't bounce us out.
+    uint32_t stationary_streak = 0;
+    uint32_t seq_last = atomic_get(&latest_window_seq);
+
+    while (1) {
+        k_sleep(K_MSEC(500));
+        uint32_t seq_now = atomic_get(&latest_window_seq);
+        if (seq_now == seq_last) continue;
+        seq_last = seq_now;
+
+        MotionState m = (MotionState)atomic_get(&latest_motion_state);
+        if (m == STATIONARY) {
+            if (++stationary_streak >= WORKOUT_EXIT_STATIONARY_WINDOWS) {
+                LOG_INF("WORKOUT: %u stationary windows -> exit",
+                        stationary_streak);
+                transition_to_idle();
+                return;
+            }
+        } else {
+            stationary_streak = 0;
+        }
+    }
+}
+
+// State machine thread -------------------------------------------------
+
+void power_state_thread_entry(void *, void *, void *) {
+    LOG_INF("Power state machine starting");
+    // Initial state: IDLE (sensors off, snapshot timer running).
+    transition_to_idle();
+
+    while (1) {
+        switch (power_state) {
+            case PS_IDLE:           run_idle();           break;
+            case PS_SNAPSHOT:       run_snapshot();       break;
+            case PS_WORKOUT_VERIFY: run_workout_verify(); break;
+            case PS_WORKOUT:        run_workout();        break;
+        }
+    }
+}
+K_THREAD_DEFINE(power_state_thread_id, 2048, power_state_thread_entry,
+                NULL, NULL, NULL, 8, 0, 0);
 
 static void init_xiao_pins() {
     // Battery divider and high-current-charge pins.  The IMU power pin
@@ -349,17 +596,15 @@ int main(void) {
         LOG_ERR("Bluetooth init failed (err %d)", err);
     }
 
-    // Wake-on-motion infrastructure.  GPIO callback first (so a spurious
-    // edge from enabling the engine wouldn't be missed), then enable the
-    // Significant Motion engine inside the LSM6DSL.
-    if (motion_wake_init() == 0) {
-        lsm6dsl_enable_sign_motion();
-    }
+    // GPIO callback for SIGN_MOT INT1.  Just installing the callback
+    // here; the actual sig-motion engine enable, and the acq_timer
+    // start, are owned by the power state machine (it transitions
+    // into IDLE on boot, which configures both).
+    motion_wake_init();
 
-    // 10 ms periodic tick drives the acquisition thread.  k_timer fires from
-    // the system timer ISR, so the cadence is independent of I2C latency or
-    // DSP processing time.
-    k_timer_start(&acq_timer, K_MSEC(10), K_MSEC(10));
+    // From this point on, the power state machine thread (started
+    // automatically by K_THREAD_DEFINE) drives all sensor power and
+    // acquisition timing.  main() has no more work to do.
 
     while (1) {
         // Main thread can handle background tasks such as battery reading

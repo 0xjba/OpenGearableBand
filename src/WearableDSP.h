@@ -74,6 +74,11 @@ private:
     WearState wear_state = WEAR_NOT_WORN;
     int wear_pass_count = 0;
 
+    // Last motion classification produced by processHeartRate().  Exposed
+    // via getMotionState() so the power state machine can observe how
+    // active the user is without re-running the IMU variance calc.
+    MotionState last_motion = STATIONARY;
+
     // Motion-state hysteresis.  When IMU variance crosses into MICRO or
     // HEAVY in window N, we cannot trust the IMU's "quiet now" reading in
     // window N+1 -- mechanical settle of the blood column, IIR-filter
@@ -102,4 +107,5 @@ public:
     WearableDSP();
     float processHeartRate(float* ppg_buffer, float* imu_buffer);
     WearState getWearState() const { return wear_state; }
+    MotionState getMotionState() const { return last_motion; }
 };

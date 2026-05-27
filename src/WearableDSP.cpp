@@ -194,6 +194,7 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_buffer) {
         motion = MICRO_MOTION;
         motion_cooldown--;
     }
+    last_motion = motion;
 
     // 6. Extract a raw BPM using the path that matches the motion state.
     //    Only run this path if SQI passed -- otherwise raw_bpm stays 0 and
