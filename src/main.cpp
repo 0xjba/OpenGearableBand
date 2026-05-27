@@ -370,7 +370,14 @@ static const char *power_state_str(PowerState s) {
 // noticeable but not catastrophic.
 #define SNAPSHOT_INTERVAL_MS              (2 * 60 * 1000)  // TESTING: 2 min
 #define SNAPSHOT_FIRST_BOOT_MS            (30 * 1000)      // 30s for first IDLE after boot
-#define SNAPSHOT_DURATION_MS              (15 * 1000)      // 15s on per snapshot
+// Snapshot duration budget at 22 s:
+//   * 7.7 s consumed by wear-state stabilization (3 windows x 2.56 s)
+//   * remaining 14.3 s yields ~5 WORN measurement windows (Kalman gets
+//     enough samples to behave as a low-pass average rather than just
+//     tracking the most recent reading).
+// At 15 s we only got 2 measurements -- the BPM was close to truth but
+// noisier than necessary.  22 s is a better noise/duty-cycle trade.
+#define SNAPSHOT_DURATION_MS              (22 * 1000)
 #define WORKOUT_VERIFY_MS                 (3 * 60 * 1000)  // 3 min motion confirmation
 #define WORKOUT_VERIFY_MOTION_RATIO_PCT   70               // >=70% of windows in motion
 #define WORKOUT_EXIT_STATIONARY_WINDOWS   117              // ~5 min at 2.56s/window
