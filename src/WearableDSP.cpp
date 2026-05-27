@@ -390,19 +390,26 @@ float WearableDSP::runFFT(float* ppg, int stride_bin) {
     int min_idx = (int)(0.6f * BUFFER_SIZE / SAMPLE_RATE);
     int max_idx = (int)(3.33f * BUFFER_SIZE / SAMPLE_RATE);
 
-    // Spectral exclusion (data-driven from v0.3 jogging trace).  NLMS
-    // does linear cancellation of IMU-correlated motion, but it cannot
-    // remove non-linear / breathing-driven optical artifacts.  Those
-    // showed up as two false poles in the PPG spectrum:
-    //   * the stride fundamental (bin 13 = 2.54 Hz in the trace, 6/31 picks)
-    //   * the stride 3rd sub-harmonic (bin 4 = 0.85 Hz, 9/31 picks)
-    // The cardiac peak sits between them (bin 9-10) and gets shouted
-    // down.  Shadow both poles +/-1 bin (the +/-1 absorbs spectral
-    // leakage from rectangular windowing) and the FFT is forced to
-    // pick from the remaining bins.
+    // Spectral exclusion (data-driven across two jogging traces).
+    // NLMS does linear cancellation of IMU-correlated motion but
+    // cannot fully suppress nonlinear / harmonic residuals, which
+    // show up as three poles in the PPG spectrum we need to shadow:
+    //
+    //   * stride fundamental (bin = stride_bin) -- partial NLMS leak
+    //   * stride / 3 sub-harmonic -- breathing / nonlinear pickup
+    //     (first jogging trace: stride bin 13, 1/3 = bin 4, 9/31 picks)
+    //   * 2 x stride harmonic -- THIS WAS THE REGRESSION SOURCE in the
+    //     second sprint trace.  PPG FFT kept picking bins 14-17 during
+    //     cooldown (stride detected at bin 7-8; 2x = bin 14-16), which
+    //     pushed Kalman to 152 BPM while the user's Apple Watch read
+    //     95-100.  The 2x harmonic of an asymmetric motion (foot
+    //     strikes are sharper than the air phase) is real, strong,
+    //     and the chained NLMS only partially cancels it.  Shadow it.
     //
     // Pass stride_bin <= 0 to disable exclusion.
+    // +/-1 absorbs spectral leakage from rectangular windowing.
     int sub_stride_bin = (stride_bin > 0) ? (stride_bin / 3) : -1;
+    int x2_stride_bin  = (stride_bin > 0) ? (stride_bin * 2) : -1;
 
     float max_val = 0;
     int max_idx_found = 0;
@@ -415,6 +422,10 @@ float WearableDSP::runFFT(float* ppg, int stride_bin) {
         if (sub_stride_bin > 0 &&
             i >= sub_stride_bin - 1 && i <= sub_stride_bin + 1) {
             continue;  // shadow stride/3 sub-harmonic +/-1 bin
+        }
+        if (x2_stride_bin > 0 &&
+            i >= x2_stride_bin - 1 && i <= x2_stride_bin + 1) {
+            continue;  // shadow 2 x stride harmonic +/-1 bin
         }
         if (fft_magnitudes[i] > max_val) {
             max_val = fft_magnitudes[i];
