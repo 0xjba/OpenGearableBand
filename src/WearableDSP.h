@@ -29,37 +29,45 @@ enum WearState {
 // Typical worn signal: 30k-80k.  Ambient / no contact: < 2k.
 #define WEAR_PPG_THRESHOLD       10000.0f
 
-// Asymmetric slew-rate limiter on raw_bpm vs. current Kalman state.
+// Symmetric slew-rate limiter on raw_bpm vs. current Kalman state.
 //
-// Heart-rate physiology is fundamentally asymmetric: HR can rise fast
-// during exercise onset (60+ BPM/min) but drops slowly during recovery
-// (HRR is 20-30 BPM in the first full minute even for fit adults).  A
-// symmetric gate breaks the onset case because Kalman state can be
-// stale (a 60-second gap between a resting snapshot at HR=70 and the
-// start of a sprint at HR=130 makes the first onset raw look like a
-// 60 BPM "jump" -- legitimate change, not artifact).  Symmetric gate
-// was tried and regressed: kalman stuck at 68 through a 30 s sprint
-// while Apple Watch climbed to 120-130.
+// History of this gate:
+//   * Symmetric +/-50 first tried with broken stride detection ->
+//     FFT picking 175-199 every window -> kalman stuck at 68.
+//   * Asymmetric (rises free, drops gated) tried as a fix ->
+//     kalman ratcheted UPWARD to 152 because unshadowed 2x stride
+//     harmonics (164-199 BPM bins) passed the rise gate freely while
+//     legitimate cardiac drops back to truth were rejected.  This is
+//     the "mathematical ratchet" failure mode.
+//   * The asymmetric design was philosophically right (HRR is real)
+//     but tactically wrong: a one-sided gate cannot distinguish
+//     "user's HR is genuinely rising" from "FFT picked a noise bin"
+//     and the Kalman gain alone can't repair the bias because the
+//     gated drops can't undo the un-gated rises.
 //
-// Asymmetric design:
-//   * RISES (raw > kalman) are accepted regardless of magnitude.  HR
-//     climbs are always physiologically possible; if motion artifact
-//     causes a spurious rise, the Kalman gain (small per update) limits
-//     the damage to a few BPM per window.
-//   * DROPS (raw < kalman) are gated.  A genuine 50+ BPM drop in one
-//     2.56 s window is biologically impossible -- a heart cannot
-//     decelerate that fast.  Such raws are motion-artifact spikes
-//     (sub-stride, breathing residuals) and rejecting them keeps
-//     Kalman "sticky" during cooldown the way Apple Watch behaves.
+// Current design: SYMMETRIC.  Both directions gated identically.  No
+// ratchet.  Combined with the 2x stride harmonic exclusion in runFFT,
+// the gate's job is purely to reject extreme outliers; the spectral
+// path does most of the heavy lifting.
 //
-// Drop bounds are an order of magnitude above true HRR, so legitimate
-// recovery tracks fully; bounds only fire on artifact spikes.
+// Bound calibration from the trace:
+//   * Apple Watch peak HR ~120-130 during exercise.
+//   * Kalman state can be stale (snapshot at rest = 80-90) when
+//     workout begins -- the first cardiac-correct FFT pick then
+//     differs from kalman by 30-50 BPM.  This is LEGITIMATE
+//     convergence, not artifact.
+//   * Therefore HEAVY bound must be at LEAST 50 to let stale-state
+//     onset find the truth.  +/-12 (as initially proposed) would
+//     reject every cardiac-correct raw in the trace's onset window.
+//   * MICRO is tighter because by the time motion is light, kalman
+//     has been tracking through HEAVY and is close to truth -- the
+//     legit deltas should be small, and a tighter gate rejects more
+//     transition-window noise.
 //
-// STATIONARY (autocorr) is NOT gated -- the autocorr path is +/-1 BPM
-// accurate independently, and we want it to converge fast once the
-// wrist is still.
-#define MAX_DROP_MICRO_BPM       30.0f
-#define MAX_DROP_HEAVY_BPM       50.0f
+// STATIONARY (autocorr) is NOT gated -- that path is +/-1 BPM
+// accurate independently and we want it to converge fast.
+#define MAX_DELTA_MICRO_BPM      25.0f
+#define MAX_DELTA_HEAVY_BPM      50.0f
 // Number of consecutive passing windows required for WORN.  Buffer is
 // BUFFER_SIZE samples = 2 overlap-windows long, so 2 passes guarantees
 // the entire buffer is post-wear data.  Bumped from 3 to 4 to give the

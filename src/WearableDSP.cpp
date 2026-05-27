@@ -335,19 +335,23 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
 
     bool bpm_in_range = (raw_bpm >= MIN_BPM && raw_bpm <= MAX_BPM);
 
-    // Asymmetric slew-rate limiter.  Reject NLMS raws that imply a
-    // biologically impossible per-window DROP.  Rises are accepted
-    // unconditionally (HR onset can be fast; Kalman gain limits the
-    // per-update damage if a rise is actually a motion artifact).
-    // STATIONARY/autocorr is exempt either way.
+    // Symmetric slew-rate limiter.  Reject NLMS raws whose absolute
+    // delta from current Kalman state implies either an impossible
+    // jump or an impossible drop.  Symmetric rather than asymmetric
+    // to avoid the "mathematical ratchet" failure mode: a one-sided
+    // gate lets noise spikes pull Kalman one way without allowing the
+    // legitimate counter-correction back, biasing the filter.  With
+    // the 2x stride harmonic now spectrally excluded in runFFT, the
+    // raws that reach this gate are mostly cardiac-cluster anyway --
+    // the gate is here to catch the residual artifacts that slip
+    // through.  STATIONARY/autocorr is exempt either way.
+    float delta_abs = raw_bpm - kalman.x;
+    if (delta_abs < 0.0f) delta_abs = -delta_abs;
     bool delta_ok = true;
-    if (raw_bpm < kalman.x) {
-        float drop = kalman.x - raw_bpm;
-        if (motion == MICRO_MOTION) {
-            delta_ok = (drop <= MAX_DROP_MICRO_BPM);
-        } else if (motion == HEAVY_MOTION) {
-            delta_ok = (drop <= MAX_DROP_HEAVY_BPM);
-        }
+    if (motion == MICRO_MOTION) {
+        delta_ok = (delta_abs <= MAX_DELTA_MICRO_BPM);
+    } else if (motion == HEAVY_MOTION) {
+        delta_ok = (delta_abs <= MAX_DELTA_HEAVY_BPM);
     }
 
     // 7. One diagnostic line per window: every gate's verdict + the raw BPM
