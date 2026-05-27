@@ -29,13 +29,21 @@ enum WearState {
 // Typical worn signal: 30k-80k.  Ambient / no contact: < 2k.
 #define WEAR_PPG_THRESHOLD       10000.0f
 
-// Physiological rate-of-change gate on raw_bpm vs. current Kalman state.
+// Slew-rate limiter on raw_bpm vs. current Kalman state.
+//
 // Without this, the v0.3 jogging trace showed Kalman dropping 119 -> 95
 // in ~25 s after the user stopped running -- pulled down by noisy NLMS
 // raws (single-window values of 46, 58, 70 BPM) while the user's actual
 // HR was decaying gradually.  Apple Watch's "sticky" post-workout
-// behavior is exactly this gate: reject raws that imply biologically
-// impossible per-window changes.
+// behavior is exactly this construct: reject raws that imply
+// biologically impossible per-window changes.
+//
+// Cardiology calibration: Heart Rate Recovery (HRR) for a fit adult is
+// 20-30 BPM in the FIRST FULL MINUTE after stopping exercise.  Per
+// 2.56 s window that's ~1.0-1.3 BPM.  Our 30 / 50 BPM bounds are an
+// order of magnitude above true HRR, so legitimate recovery is fully
+// trackable; the bounds only fire on motion-artifact spikes (the
+// observed bad raws were 25-70 BPM step changes in a single window).
 //
 // 50 BPM in 2.5 s = 1200 BPM/min rate of change.  Real exercise onset
 // peaks at maybe 60 BPM/min, so 50 in a single window is the edge of
