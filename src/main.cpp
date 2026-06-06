@@ -363,10 +363,10 @@ void dsp_thread_entry(void *, void *, void *) {
 K_THREAD_DEFINE(dsp_thread_id, 4096, dsp_thread_entry, NULL, NULL, NULL, 7, 0, 0);
 
 // --- Serial reset thread ---
-// Polls the console UART (USB CDC ACM on the Xiao Sense) for single-char
-// commands and reacts.  Useful when you can't easily double-tap the
-// reset button (e.g. wrist-strapped, or you want to restart cleanly
-// without re-entering the bootloader).
+// Listens on the console UART (USB CDC ACM on the Xiao Sense) for
+// single-char commands and reacts.  Useful when you can't easily
+// double-tap the reset button (e.g. wrist-strapped, or you want to
+// restart cleanly without re-entering the bootloader).
 //
 // Commands:
 //   'r' / 'R' -> sys_reboot(SYS_REBOOT_COLD): full chip reset.  The
@@ -383,39 +383,90 @@ K_THREAD_DEFINE(dsp_thread_id, 4096, dsp_thread_entry, NULL, NULL, NULL, 7, 0, 0
 //                button.  Saves the wrist-off step when iterating.
 //                Magic value verified against the Adafruit nrf52
 //                bootloader source: DFU_MAGIC_UF2_RESET == 0x57.
+//
+// Implementation note (the v0.3 fix): the first cut used
+// uart_poll_in() in a loop.  That works on a hardware UART but not
+// reliably on USB CDC ACM: the Zephyr cdc_acm driver fills its RX ring
+// buffer from the IRQ handler, and on this NCS version uart_poll_in
+// returns -1 forever in pure-poll mode (host bytes never make it into
+// the buffer the polling API drains).  Symptom was "logs flow out,
+// typed commands have no effect" -- reproduced in screen too, which
+// rules out Arduino IDE DTR quirks.
+//
+// Fix: enable RX interrupt + callback.  The callback drains the FIFO
+// into a single-byte "pending command" slot which the thread polls and
+// then acts on.  We deliberately do NOT call sys_reboot() from the ISR
+// context -- it's allowed on Cortex-M but mixing it with USB CDC
+// teardown invites a hang.
 static const struct device *console_uart =
     DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+
+// Set by uart_rx_cb (ISR context).  0 = no pending command, otherwise
+// the ASCII byte of the command.  volatile because main-thread reads
+// must observe ISR writes immediately; no memory-ordering hazard
+// because a stray "old" value just delays the action by one poll cycle.
+static volatile uint8_t pending_cmd = 0;
+
+static void uart_rx_cb(const struct device *dev, void *user_data) {
+    ARG_UNUSED(user_data);
+    if (!uart_irq_update(dev)) {
+        return;
+    }
+    if (!uart_irq_rx_ready(dev)) {
+        return;
+    }
+    uint8_t c;
+    while (uart_fifo_read(dev, &c, 1) == 1) {
+        if (c == 'r' || c == 'R') {
+            pending_cmd = 'r';
+        } else if (c == 'b' || c == 'B') {
+            pending_cmd = 'b';
+        }
+        // Other chars are intentionally ignored -- silently dropping
+        // newlines / CR / unknown chars keeps the listener unbothered
+        // by terminal line-ending settings.
+    }
+}
 
 void reset_thread_entry(void *, void *, void *) {
     if (!device_is_ready(console_uart)) {
         LOG_WRN("Console UART not ready; serial-reset disabled");
         return;
     }
+
+    int err = uart_irq_callback_user_data_set(console_uart,
+                                              uart_rx_cb, NULL);
+    if (err < 0) {
+        LOG_WRN("uart_irq_callback_user_data_set failed (%d); "
+                "serial-reset disabled", err);
+        return;
+    }
+    uart_irq_rx_enable(console_uart);
+
     LOG_INF("Serial console armed: 'r'=reboot, 'b'=enter UF2 bootloader");
 
-    uint8_t c;
     while (1) {
-        if (uart_poll_in(console_uart, &c) == 0) {
-            if (c == 'r' || c == 'R') {
-                LOG_INF("Serial reset requested -- rebooting");
-                k_sleep(K_MSEC(50));  // let the log line drain over USB
-                sys_reboot(SYS_REBOOT_COLD);
-                // not reached
-            } else if (c == 'b' || c == 'B') {
-                LOG_INF("Bootloader jump requested -- entering UF2 mode");
-                k_sleep(K_MSEC(50));  // let the log line drain over USB
-                // Adafruit nRF52 UF2 bootloader checks GPREGRET on boot
-                // and stays in flash-mode when it sees 0x57.  Direct
-                // register access -- the HAL header gives us NRF_POWER
-                // but the field is a plain volatile uint32_t so this
-                // is the least-version-fragile way to set it.
-                NRF_POWER->GPREGRET = 0x57;
-                sys_reboot(SYS_REBOOT_COLD);
-                // not reached
-            }
-        } else {
-            k_sleep(K_MSEC(50));
+        uint8_t cmd = pending_cmd;
+        if (cmd == 'r') {
+            pending_cmd = 0;
+            LOG_INF("Serial reset requested -- rebooting");
+            k_sleep(K_MSEC(50));  // let the log line drain over USB
+            sys_reboot(SYS_REBOOT_COLD);
+            // not reached
+        } else if (cmd == 'b') {
+            pending_cmd = 0;
+            LOG_INF("Bootloader jump requested -- entering UF2 mode");
+            k_sleep(K_MSEC(50));  // let the log line drain over USB
+            // Adafruit nRF52 UF2 bootloader checks GPREGRET on boot
+            // and stays in flash-mode when it sees 0x57.  Direct
+            // register access -- the HAL header gives us NRF_POWER
+            // but the field is a plain volatile uint32_t so this
+            // is the least-version-fragile way to set it.
+            NRF_POWER->GPREGRET = 0x57;
+            sys_reboot(SYS_REBOOT_COLD);
+            // not reached
         }
+        k_sleep(K_MSEC(50));
     }
 }
 
