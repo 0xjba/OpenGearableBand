@@ -147,11 +147,13 @@ public:
     float processHeartRate(float* ppg_buffer, float* imu_smv);
     WearState getWearState() const { return wear_state; }
     MotionState getMotionState() const { return last_motion; }
-    // True when the last processed window detected motion (MICRO or
-    // HEAVY) on a worn device.  Callers signalling the user to hold
-    // still (e.g. the BLE layer suppressing HR notifications) check
-    // this after every processHeartRate() call.
+    // True when the last processed window detected HEAVY motion on a
+    // worn device.  MICRO motion (desk / typing / light gestures) now
+    // runs through the dual-method pipeline -- it does NOT trip
+    // needsSteady().  See processHeartRate() comments for the research
+    // grounding the MICRO relaxation.  HEAVY (running) still suppresses
+    // HR notifications via this signal.
     bool needsSteady() const {
-        return wear_state == WEAR_WORN && last_motion != STATIONARY;
+        return wear_state == WEAR_WORN && last_motion == HEAVY_MOTION;
     }
 };

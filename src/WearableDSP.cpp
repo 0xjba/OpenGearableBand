@@ -212,18 +212,28 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_smv) {
     }
     last_motion = motion;
 
-    // 6. Extract a raw BPM.  Production build only processes the
-    //    STATIONARY path (autocorr + stationary FFT with dual-method
-    //    cross-validation and harmonic-sum check).  MICRO and HEAVY
-    //    paths hold Kalman -- the caller is expected to signal the
-    //    user to hold still via needsSteady().  See the feature/
-    //    motion-path-experiments branch for the chained-NLMS work.
+    // 6. Extract a raw BPM.
+    //
+    //    Dual-method runs on BOTH stationary AND micro-motion windows.
+    //    Research grounded (Duke, JMIR validation, npj Digital Medicine):
+    //    non-periodic micro motion (typing, desk gestures) doesn't
+    //    create cardiac-mimicking harmonics the way running's periodic
+    //    stride does.  Light wrist motion blasts brief impulses through
+    //    the band-pass; those impulses lack cardiac harmonic structure
+    //    and are rejected by applyHarmonicCheck (Apple-patent harmonic-
+    //    sum metric).  Commercial bands track HR through typing with
+    //    ~2-4 BPM degraded accuracy vs ~1-2 at rest -- not catastrophic
+    //    like HEAVY's stride-leak failure.
+    //
+    //    HEAVY (running) still holds Kalman + signals stay-steady --
+    //    the chained-NLMS / hybrid-mask work needed to handle that
+    //    properly lives on feature/motion-path-experiments.
     float raw_bpm = 0.0f;
     float ac_bpm = 0.0f;
     float fft_bpm = 0.0f;
     float stat_conf = 0.0f;
     const char *path = "skip";
-    if (sqi_passed && motion == STATIONARY) {
+    if (sqi_passed && motion != HEAVY_MOTION) {
         ac_bpm  = runAutocorrelation(ppg_buffer);
         fft_bpm = runStationaryFFT(ppg_buffer);
         raw_bpm = reconcileStationary(ac_bpm, fft_bpm, &stat_conf);
@@ -255,10 +265,11 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_smv) {
             raw_bpm = 0.0f;
             path = "stat-hold";
         }
-    } else if (sqi_passed && motion != STATIONARY) {
-        // Motion detected -- caller (main / BLE layer) signals user
-        // to hold still.  Kalman not updated this window.
-        path = (motion == HEAVY_MOTION) ? "motion-heavy" : "motion-micro";
+    } else if (sqi_passed && motion == HEAVY_MOTION) {
+        // Heavy motion (running etc.) -- caller signals user to hold
+        // still.  Kalman not updated this window.  Real solution for
+        // this path lives on feature/motion-path-experiments.
+        path = "motion-heavy";
     }
     // (sqi_passed = 0 falls through with path = "skip")
 
