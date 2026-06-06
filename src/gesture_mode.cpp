@@ -136,6 +136,18 @@ static int exit_dwell = 0;           /* non-UP_RAISED dwell while in AIR_MOUSE *
  * Decremented every accel sample. */
 static int air_mouse_cooldown_remaining = 0;
 
+/* Acquisition-request callback registered by main.cpp. */
+static gesture_acq_request_cb_t s_acq_request_cb = NULL;
+
+/* Was the previous mode a "needs IMU continuously" mode?  Tracks the
+ * acq-request edges so we only call the callback on transitions. */
+static bool s_prev_needs_acq = false;
+
+static inline bool _mode_needs_continuous_imu(GestureMode m)
+{
+    return (m == MODE_AIR_MOUSE) || (m == MODE_SURFACE);
+}
+
 /* Wrist-flick state. */
 static int flick_burst_samples_remaining = 0;
 static float flick_burst_sign = 0.0f;
@@ -255,6 +267,15 @@ static void _transition_to(GestureMode new_mode)
     raise_dwell = 0;
     flat_dwell = 0;
     exit_dwell = 0;
+
+    /* Notify the acquisition-request callback on edges between
+     * "needs continuous IMU" and "doesn't."  Only fires on real edges
+     * so the callback doesn't get spammed on every transition. */
+    bool now_needs = _mode_needs_continuous_imu(new_mode);
+    if (s_acq_request_cb && now_needs != s_prev_needs_acq) {
+        s_acq_request_cb(now_needs);
+        s_prev_needs_acq = now_needs;
+    }
 }
 
 /*
@@ -502,4 +523,9 @@ void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz)
 int gesture_mode_get_air_mouse_cooldown_remaining(void)
 {
     return air_mouse_cooldown_remaining;
+}
+
+void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb)
+{
+    s_acq_request_cb = cb;
 }

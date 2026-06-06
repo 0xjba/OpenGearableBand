@@ -175,6 +175,31 @@ void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz);
  */
 int gesture_mode_get_air_mouse_cooldown_remaining(void);
 
+/*
+ * Acquisition-request callback signature.  Registered by main.cpp
+ * so gesture_mode can ask the power-state machine to keep the IMU
+ * sampling pipeline alive while AIR_MOUSE / SURFACE modes need it.
+ *
+ *   needs = true   -- gesture mode is entering a state that requires
+ *                     continuous IMU samples (cursor + orientation).
+ *                     Callback should ensure acq is running.
+ *   needs = false  -- gesture mode is leaving such a state.  Callback
+ *                     may stop acq if no other consumer needs it
+ *                     (typically: power state is IDLE).
+ *
+ * The callback is invoked from inside _transition_to (i.e. acq thread
+ * context or wherever gesture_mode_on_chip_double_tap was called from).
+ * Implementations should be quick and safe to call from those contexts.
+ */
+typedef void (*gesture_acq_request_cb_t)(bool needs);
+
+/*
+ * Register the acquisition-request callback.  Called once from main()
+ * at boot, after the acq pipeline is constructed.  Passing NULL clears
+ * the callback (used in unit tests / shutdown).
+ */
+void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb);
+
 #ifdef __cplusplus
 }
 #endif

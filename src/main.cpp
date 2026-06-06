@@ -78,6 +78,26 @@ K_SEM_DEFINE(motion_wake_sem, 0, 1);
 // no apparent caller of k_sem_give(acq_tick_sem)).  Also gives us a
 // clean per-burst sample counter for accurate Hz reporting.
 static volatile bool acq_active = false;
+
+// Set true by the gesture-mode callback when AIR_MOUSE / SURFACE is
+// active.  Controls two behaviours:
+//   1) When the power state machine wants to enter IDLE, stop_acquisition
+//      will only actually halt the timer if gesture_needs_acq is false;
+//      otherwise the timer keeps ticking on IMU samples for the gesture
+//      detector.
+//   2) When acq_thread runs a tick and gesture_needs_acq is true while
+//      MAX30102 is shut down (IDLE power), the thread takes a "gesture-
+//      only" fast path: read IMU + feed gesture_mode_update_accel, skip
+//      MAX fetch + HR pipeline entirely.
+static volatile bool gesture_needs_acq = false;
+
+// Tracks whether MAX30102 is currently awake.  Set to false by default
+// (max30102_shutdown() runs in transition_to_idle() at boot before any
+// other state is reached).  Maintained by the power state machine via
+// power_max_set_awake() below; checked by the acq thread to decide
+// whether the gesture-only fast path applies (MAX shut down -> no PPG,
+// only IMU + gesture mode).
+static volatile bool max_is_awake = false;
 static volatile uint32_t acq_burst_samples = 0;   // total ticks since burst start (incl. discards)
 static volatile uint32_t acq_burst_stored = 0;    // stored samples since burst start
 
@@ -231,7 +251,14 @@ void acq_thread_entry(void *, void *, void *) {
             continue;
         }
 
-        if (sample_index >= BUFFER_SIZE) {
+        // "Gesture-only" mode: MAX30102 is currently shut down but
+        // gesture_mode (AIR_MOUSE / SURFACE) wants continuous IMU
+        // samples to drive orientation + cursor.  In this path we
+        // skip MAX entirely -- the HR pipeline doesn't get any signal
+        // but the gesture detector keeps running.
+        bool gesture_only = !max_is_awake && gesture_needs_acq;
+
+        if (sample_index >= BUFFER_SIZE && !gesture_only) {
             continue;
         }
 
@@ -241,13 +268,8 @@ void acq_thread_entry(void *, void *, void *) {
         struct sensor_value accel_y = {0};
         struct sensor_value accel_z = {0};
 
-        if (sensor_sample_fetch(max30102_dev) != 0) {
-            LOG_ERR("MAX30102 fetch failed");
-            continue;
-        }
-        sensor_channel_get(max30102_dev, SENSOR_CHAN_RED, &red_val);
-        sensor_channel_get(max30102_dev, SENSOR_CHAN_IR, &ir_val);
-
+        // Read the IMU first so the gesture detector still gets fed
+        // even if MAX fetch is skipped / fails.
         if (sensor_sample_fetch(imu_dev) != 0) {
             LOG_ERR("IMU fetch failed");
             continue;
@@ -256,13 +278,6 @@ void acq_thread_entry(void *, void *, void *) {
         sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_Y, &accel_y);
         sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_Z, &accel_z);
 
-        // Reference for NLMS = Signal Magnitude Vector (SMV) of all three
-        // accelerometer axes.  Wrist gestures / typing are dominated by
-        // X- and Y-axis motion (flexion + rotation), so a Z-only reference
-        // misses most of the kinetic energy that's actually corrupting the
-        // PPG.  Gravity contributes a ~1 g DC offset to SMV; the DSP layer
-        // subtracts the per-window mean before NLMS, so only the AC kinetic
-        // component reaches the filter.
         float ax = (float)sensor_value_to_double(&accel_x);
         float ay = (float)sensor_value_to_double(&accel_y);
         float az = (float)sensor_value_to_double(&accel_z);
@@ -271,10 +286,24 @@ void acq_thread_entry(void *, void *, void *) {
         // Feed the gesture-mode detector at the sample rate.  Cheap
         // (1 IIR per axis + a classifier branch); does its own dwell
         // counting internally so we don't need to gate it ourselves.
-        // Runs on EVERY raw sample including warmup -- the detector
-        // does its own filter-seeding on the first call, and orientation
-        // tracking benefits from seeing all samples to converge faster.
         gesture_mode_update_accel(ax, ay, az);
+
+        // In gesture-only mode we're done with this tick -- no PPG to
+        // store, no DSP to drive.
+        if (gesture_only) {
+            continue;
+        }
+
+        // MAX30102 fetch -- only run on the HR pipeline (power state
+        // is in a sampling-active mode).  If it fails here something
+        // is wrong with the chip / bus state; keep the error level so
+        // we notice in traces.
+        if (sensor_sample_fetch(max30102_dev) != 0) {
+            LOG_ERR("MAX30102 fetch failed");
+            continue;
+        }
+        sensor_channel_get(max30102_dev, SENSOR_CHAN_RED, &red_val);
+        sensor_channel_get(max30102_dev, SENSOR_CHAN_IR, &ir_val);
 
         // HARDWARE FIX: discard the first ACQ_WARMUP_SAMPLES of every
         // burst to flush the MAX30102 wake-from-SHDN artifact (see the
@@ -615,15 +644,38 @@ void reset_thread_entry(void *, void *, void *) {
             LOG_INF("mouse test: scroll down");
         } else if (cmd == 'g') {
             pending_cmd = 0;
-            float gx, gy, gz;
-            gesture_mode_get_gravity(&gx, &gy, &gz);
-            LOG_INF("CALIBRATION g=[%.3f, %.3f, %.3f]  "
-                    "magnitudes=[%.2f %.2f %.2f]  "
+            // Do a FRESH IMU read here rather than reading the cached
+            // gx_filt / gy_filt / gz_filt -- if the acq pipeline isn't
+            // running (e.g. power state IDLE and no gesture active),
+            // the filter would be stale and the dump would be wrong.
+            // Direct sensor_sample_fetch always gives us the chip's
+            // latest data.
+            float gx_raw = 0.0f, gy_raw = 0.0f, gz_raw = 0.0f;
+            if (sensor_sample_fetch(imu_dev) == 0) {
+                struct sensor_value vx, vy, vz;
+                sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_X, &vx);
+                sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_Y, &vy);
+                sensor_channel_get(imu_dev, SENSOR_CHAN_ACCEL_Z, &vz);
+                gx_raw = (float)sensor_value_to_double(&vx);
+                gy_raw = (float)sensor_value_to_double(&vy);
+                gz_raw = (float)sensor_value_to_double(&vz);
+            } else {
+                LOG_WRN("CALIBRATION: IMU fetch failed");
+            }
+            // Also report the filtered gravity for comparison -- if
+            // it differs from the raw, the acq pipeline isn't keeping
+            // up with the current pose.
+            float gx_f, gy_f, gz_f;
+            gesture_mode_get_gravity(&gx_f, &gy_f, &gz_f);
+            LOG_INF("CALIBRATION raw_g=[%.3f, %.3f, %.3f]  "
+                    "filt_g=[%.3f, %.3f, %.3f]",
+                    (double)gx_raw, (double)gy_raw, (double)gz_raw,
+                    (double)gx_f, (double)gy_f, (double)gz_f);
+            LOG_INF("CALIBRATION raw magnitudes=[%.2f %.2f %.2f]  "
                     "orientation=%s  mode=%s  cooldown=%d ms",
-                    (double)gx, (double)gy, (double)gz,
-                    (double)(gx >= 0 ? gx : -gx),
-                    (double)(gy >= 0 ? gy : -gy),
-                    (double)(gz >= 0 ? gz : -gz),
+                    (double)(gx_raw >= 0 ? gx_raw : -gx_raw),
+                    (double)(gy_raw >= 0 ? gy_raw : -gy_raw),
+                    (double)(gz_raw >= 0 ? gz_raw : -gz_raw),
                     wrist_orientation_str(gesture_mode_get_orientation()),
                     gesture_mode_str(gesture_mode_get()),
                     gesture_mode_get_air_mouse_cooldown_remaining() * 10);
@@ -760,6 +812,15 @@ static void start_acquisition(void) {
 }
 
 static void stop_acquisition(void) {
+    // If gesture_mode (AIR_MOUSE / SURFACE) still needs the IMU
+    // sampling pipeline running, don't actually stop -- just let
+    // the power-state side go to IDLE while gesture keeps using the
+    // tick.  acq_thread's gesture_only path skips MAX entirely so
+    // PPG power stays off.
+    if (gesture_needs_acq) {
+        LOG_DBG("stop_acquisition deferred: gesture mode still active");
+        return;
+    }
     // Clear the gate BEFORE stopping the timer so any tick already in
     // flight on the way to acq_thread will be dropped at the gate check
     // rather than processed in some weird half-state.
@@ -768,6 +829,41 @@ static void stop_acquisition(void) {
     // Drain any pending tick semaphore so the next start_acquisition()
     // doesn't process a stale tick before the timer's first new fire.
     k_sem_reset(&acq_tick_sem);
+}
+
+// Acquisition-request callback for gesture_mode.  See the comment on
+// gesture_needs_acq above.  Wired in main() via
+// gesture_mode_set_acq_request_cb().
+static void gesture_acq_request_handler(bool needs) {
+    gesture_needs_acq = needs;
+    if (needs) {
+        // Make sure the timer is running.  If acq is already active
+        // (e.g. during SNAPSHOT), this is a no-op; the timer was
+        // already ticking and we just flipped the flag.
+        if (!acq_active) {
+            LOG_INF("gesture mode: starting gesture-only acquisition");
+            start_acquisition();
+        } else {
+            LOG_INF("gesture mode: piggybacking on existing acquisition");
+        }
+    } else {
+        // Gesture mode no longer needs the timer.  If we're in an HR
+        // sampling state (SNAPSHOT / WORKOUT), leave it running -- it
+        // was going anyway.  If we're in IDLE, the timer was kept
+        // alive purely for gesture; stop it now to restore the IDLE
+        // power profile.
+        if (power_state == PS_IDLE) {
+            LOG_INF("gesture mode: ending gesture-only acquisition");
+            // Call the actual stop directly here -- stop_acquisition()
+            // would short-circuit because we haven't cleared
+            // gesture_needs_acq yet from its perspective.  But we
+            // just did clear it above.  Belt-and-braces re-clear:
+            gesture_needs_acq = false;
+            acq_active = false;
+            k_timer_stop(&acq_timer);
+            k_sem_reset(&acq_tick_sem);
+        }
+    }
 }
 
 // State transitions -----------------------------------------------------
@@ -779,6 +875,7 @@ static void transition_to_idle(void) {
     LOG_INF("PowerState: %s -> IDLE", power_state_str(power_state));
     stop_acquisition();
     max30102_shutdown();
+    max_is_awake = false;
     lsm6dsl_enable_sign_motion();       // re-arm (clears + enables)
     k_sem_reset(&motion_wake_sem);      // drop any stale edge
 
@@ -802,6 +899,7 @@ static void transition_to_snapshot(void) {
     LOG_INF("PowerState: %s -> SNAPSHOT", power_state_str(power_state));
     k_timer_stop(&snapshot_tick);
     max30102_wake();
+    max_is_awake = true;
     start_acquisition();
     power_state = PS_SNAPSHOT;
 }
@@ -811,6 +909,7 @@ static void transition_to_workout_verify(void) {
     k_timer_stop(&snapshot_tick);
     lsm6dsl_disable_sign_motion();      // we're tracking motion ourselves now
     max30102_wake();
+    max_is_awake = true;
     start_acquisition();
     power_state = PS_WORKOUT_VERIFY;
 }
@@ -1040,6 +1139,10 @@ int main(void) {
     // itself runs from the acquisition thread once samples start
     // flowing.
     gesture_mode_init();
+    // Wire gesture_mode -> acquisition request callback so
+    // AIR_MOUSE / SURFACE modes can keep the IMU sampling pipeline
+    // alive even when the HR power state is IDLE.
+    gesture_mode_set_acq_request_cb(gesture_acq_request_handler);
 
     init_xiao_pins();
 
