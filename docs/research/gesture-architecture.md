@@ -36,6 +36,33 @@ during build-out.
 >   brightness / youtube / music / presentation) is a starting
 >   point.  Real vocabulary will depend on which apps the phone-
 >   side team prioritizes and what users actually want.
+> - END-OF-SESSION UX for the air-mouse pose: the current Item 0
+>   build exits AIR_MOUSE on orientation-drop (wrist below armrest
+>   level) with a 3 s cooldown re-engage window.  Long-term UX
+>   needs deeper thought: how do we handle session boundaries
+>   when the user is briefly distracted vs genuinely done?  Does
+>   a long cursor-inactivity timer make sense as an additional
+>   exit path?  Should the cooldown window vary based on recent
+>   activity (e.g. shorter cooldown if user just air-moused for
+>   30 s straight, longer if they were mid-gesture)?  Defer this
+>   investigation until we have hands-on user testing data;
+>   document the eventual design here when it lands.
+> - OPTION C STAGE TRIGGERS to watch for (see section 8.5):
+>     * C1 (chip-embedded double-tap as entry): start when FSM
+>       design is settled in field testing AND pose calibration
+>       is locked in.  Replaces the serial 't' simulation with
+>       real LSM6DSL hardware events.  Maps to roadmap Item 1.
+>     * C2 (chip 6D orientation for AIR_MOUSE exit): start when
+>       real battery measurements show AIR_MOUSE active draw is
+>       the dominant load AND chip's 6D classes align with the
+>       user's calibrated poses.  ~1 week of work; takes
+>       AIR_MOUSE active draw from ~5 mA to ~150 µA.
+>     * C3 (chip ML core for gesture classification): blocked by
+>       hardware -- LSM6DS3TR-C has no MLC.  Defer to v2 hardware
+>       planning if the product moves that direction.
+>   The point of writing these triggers down here is so the next
+>   build-out session sees the criteria and decides on evidence
+>   rather than guess.
 
 ---
 
@@ -717,6 +744,148 @@ suspended, LSM6 chip-embedded events still firing INT1, MCU wakes
 only on event.  This is similar to our existing SNAPSHOT-IDLE state-
 machine architecture and reuses the same power-control primitives
 (`max30102_shutdown` etc.).
+
+---
+
+## 8.5 Chip-embedded events roadmap (Option C path)
+
+This section captures the multi-stage plan for moving more of the
+gesture pipeline from MCU-side polling into LSM6DSL-side hardware
+events.  Each stage trades development time for a meaningful power
+reduction, but only at certain points in the product lifecycle.
+**Don't do any of these prematurely** -- they optimize for the wrong
+thing if the FSM design isn't settled or if we don't have battery
+measurements proving they're needed.
+
+### What we ALREADY have from Option C
+
+The Significant Motion engine is pure Option C and already shipping:
+- LSM6DSL chip watches continuously for sustained motion
+- MCU sleeps in IDLE (~150 µA)
+- Chip fires INT1 -> MCU wakes -> enters WORKOUT_VERIFY
+- Zero MCU compute while waiting
+
+This proves the pattern works on our hardware.  The remaining stages
+extend the same architecture to more event types.
+
+### C1: Chip-embedded double-tap as AIR_MOUSE entry trigger
+
+**What:** Configure LSM6DSL `TAP_CFG` + `WAKE_UP_THS` + `MD1_CFG`
+(or `MD2_CFG`) for double-tap detection.  Route to INT1, disambiguate
+from sig-motion in the GPIO callback.  Replace serial `t` simulation
+with real hardware double-tap.
+
+**Effort:** 2-3 days.
+
+**Power win:** Modest.  AIR_MOUSE entry no longer requires the MCU
+polling for the serial `t` command (which it wasn't really anyway,
+but conceptually).  More importantly, this is the first user-visible
+"this is a real product" moment -- no demo lands without it.
+
+**Trigger to start:** FSM logic is validated in field testing AND
+the orientation classification has been calibrated to the user's
+actual physical poses.
+
+**Maps to roadmap Item 1** ("Chip-embedded gestures") -- this IS that
+work for the double-tap event specifically.  Other chip-embedded
+events (single-tap, free-fall, wake-up) are part of the same
+implementation pass.
+
+### C2: Chip 6D orientation for the AIR_MOUSE exit path
+
+**What:** LSM6DSL has a `D6D_SRC` register that classifies the device
+orientation into 6 face positions (XL+, XL-, YL+, YL-, ZL+, ZL-)
+in hardware.  Route 6D orientation changes to an INT pin.  In
+AIR_MOUSE mode, MCU sleeps; chip fires INT on orientation change
+-> MCU wakes -> re-evaluates and exits if needed.
+
+**Effort:** ~1 week.  The chip's 6D detection thresholds are fixed
+-- less flexible than our software classifier.  Implementation must
+verify the chip's 6D classes match the user's empirically-calibrated
+poses.  If they don't, fall back to software classification (Option A
+remains the safety net).
+
+**Power win:** Large.  AIR_MOUSE active draw drops from ~5 mA
+(continuous IMU at 100 Hz + cursor publish thread + MCU polling) to
+~150 µA waiting + transient spikes on orientation-change events.
+This is the move that makes AIR_MOUSE viable as a "leave on all day"
+feature on coin-cell-class batteries.
+
+**Trigger to start:** Real battery measurements show that
+AIR_MOUSE active draw is the dominant power load on the device, AND
+the user's calibrated poses align with the chip's fixed 6D classes
+(or are close enough that the software override only fires
+occasionally).
+
+### C3: Chip-embedded gesture classification (chip Machine Learning Core)
+
+**What:** Move pinch / click / advanced-gesture detection itself
+into chip-embedded hardware.
+
+**Blocker:** LSM6DS3TR-C **does NOT have a Machine Learning Core**
+(MLC).  That capability lives on LSM6DSOX, LSM6DSV, and newer ST
+parts.  Implementing C3 on current hardware would require either:
+- Hardware revision swapping LSM6DS3TR-C for LSM6DSOX/DSV
+- OR accepting much cruder rule-based detection that the
+  LSM6DS3TR-C's simpler FSM can express (single-pattern matching,
+  not multi-gesture classification)
+
+**Effort:** months of work + a hardware change.
+
+**Trigger to start:** Considering v2 hardware revision, AND the
+gesture pipeline is mature enough that we know exactly what events
+to put in chip silicon, AND there's a clear product reason
+(e.g. shipping a battery profile that the current MCU-side
+approach can't meet).
+
+**Realistic assessment:** Probably never on current hardware.
+Defer to v2 hardware planning if the product moves that direction.
+
+### Why we're NOT doing any of these right now
+
+Option A (continuous MCU-side IMU sampling when AIR_MOUSE / SURFACE
+is active) is the correct answer **at this stage** because:
+
+1. **The FSM design isn't fully settled.**  We're still iterating
+   on entry triggers (double-tap vs orientation), exit semantics
+   (lower-to-dismiss vs explicit), and cooldown behaviour.  Each
+   FSM change is a 1-hour C edit in Option A; the same change in
+   Option C is days of chip-config rework.
+2. **We don't have battery measurements showing power matters yet.**
+   Without numbers we'd be optimizing in the dark.  When we measure
+   real consumption and the C1/C2 power wins become quantifiable,
+   the trigger to invest is automatic.
+3. **The chip's 6D class boundaries may not match our poses.**
+   The user's air-mouse pose is "raised hand, palm facing display"
+   -- which the chip's 6D detection may classify as Z+ or YL- or
+   something else entirely.  Until we have empirical calibration
+   data, we don't know if C2 would even classify correctly.
+4. **C1 is on the roadmap as Item 1.**  We're already going to do
+   it -- just at the right time (after FSM design is locked in).
+
+### Triggers summary (when to invest)
+
+| Move | Trigger condition |
+|---|---|
+| **C1** -- chip double-tap as entry | FSM validated in field testing AND pose calibration locked in AND ready to demo |
+| **C2** -- chip 6D orientation for exit | Battery measurements show AIR_MOUSE draw is dominant AND chip's 6D classes match calibrated user poses |
+| **C3** -- chip ML core for gestures | Considering v2 hardware revision AND gesture pipeline mature enough to know what to commit to silicon |
+
+### Option A and Option C are NOT competing
+
+The architecture is layered so the transition is non-disruptive:
+- Option A feeds gesture-mode state machine via
+  `gesture_mode_update_accel()` from the acq thread
+- Option C feeds gesture-mode state machine via
+  `gesture_mode_on_chip_double_tap()` and (future) orientation-change
+  callbacks
+- **Same downstream code path** -- only the trigger source changes
+
+When C1 lands, we keep Option A as a fallback (e.g. if user pairs
+the band but the chip event misfires).  When C2 lands, we keep
+software classification as a backup for poses the chip's 6D
+detection doesn't recognize cleanly.  Each Option C layer is
+additive, not replacing.
 
 ---
 
