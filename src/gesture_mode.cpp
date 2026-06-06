@@ -85,6 +85,25 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 #define AIR_MOUSE_EXIT_DWELL        50
 
 /*
+ * Entry-grace window after AIR_MOUSE is entered while NOT already in
+ * the raised pose.  The user has this many samples to raise their
+ * wrist; if they don't, the FSM bounces back to IDLE without ever
+ * having armed exit detection.
+ *
+ * Sized to accommodate the natural human reaction time + orientation
+ * dwell:
+ *   - Press double-tap: ~0 ms
+ *   - Initiate arm raise: 200-400 ms
+ *   - Arm reaches raised position: 500-1000 ms
+ *   - Orientation classifier dwell to register UP_RAISED: 250 ms
+ *   - Plus margin for slow movements / hesitation
+ *
+ * 300 samples = 3 s at 100 Hz.  Felt right in design discussion;
+ * tune empirically once we have field-test data on user latency.
+ */
+#define AIR_MOUSE_ENTRY_GRACE       300
+
+/*
  * Flat-to-surface trigger: keep the original orientation-driven path
  * since SURFACE mode wasn't part of the double-tap-only discussion.
  * Subject to revision once the user calibrates real gravity vectors
@@ -147,10 +166,21 @@ static int air_mouse_cooldown_remaining = 0;
  * exits before the user has had a chance to raise their arm.
  *
  * With this flag, exit detection only arms after we've SEEN the
- * raised pose at least once -- the user has unlimited time to get
- * into pose after pressing the entry trigger.  If they never raise,
- * the mode stays AIR_MOUSE until explicitly cancelled. */
+ * raised pose at least once.  If the user never raises within the
+ * AIR_MOUSE_ENTRY_GRACE window (see entry_grace_remaining), the FSM
+ * bounces back to IDLE without ever having armed the exit dwell --
+ * prevents the band sitting in AIR_MOUSE indefinitely if the user
+ * pressed the entry trigger and got distracted. */
 static bool air_mouse_has_been_raised = false;
+
+/* Counts down from AIR_MOUSE_ENTRY_GRACE on every accel sample while
+ * we're in AIR_MOUSE AND haven't yet reached the raised pose.  Hits
+ * zero -> the FSM bounces back to IDLE (no cooldown -- the user
+ * never actually engaged, no point allowing quick re-engage).
+ *
+ * Loaded with AIR_MOUSE_ENTRY_GRACE on entry-from-non-raised; loaded
+ * with 0 on entry-from-already-raised (no grace needed). */
+static int entry_grace_remaining = 0;
 
 /* Acquisition-request callback registered by main.cpp. */
 static gesture_acq_request_cb_t s_acq_request_cb = NULL;
@@ -284,24 +314,41 @@ static void _transition_to(GestureMode new_mode)
     flat_dwell = 0;
     exit_dwell = 0;
 
-    /* Manage the "have we reached raised pose since entering AIR_MOUSE"
-     * latch.  Entering AIR_MOUSE while already in UP_RAISED -> set
-     * immediately (no grace needed).  Entering from any other
-     * orientation -> false; the per-sample update will set it the
-     * first time orientation becomes UP_RAISED.  Leaving AIR_MOUSE
-     * always clears it. */
+    /* Manage the AIR_MOUSE entry-grace state machine.
+     *
+     * Entering AIR_MOUSE while already in UP_RAISED:
+     *   - has_been_raised set TRUE immediately (no grace needed)
+     *   - entry_grace_remaining = 0 (never counts down)
+     *   - exit detection armed right away
+     *
+     * Entering AIR_MOUSE from any other orientation (desk, hanging,
+     * etc.):
+     *   - has_been_raised FALSE; will be set the first time the user
+     *     actually raises into the pose
+     *   - entry_grace_remaining loaded with AIR_MOUSE_ENTRY_GRACE;
+     *     if it counts down to zero without the user raising, the
+     *     FSM bounces back to IDLE
+     *
+     * Leaving AIR_MOUSE (any cause):
+     *   - has_been_raised cleared
+     *   - entry_grace_remaining cleared (irrelevant outside AIR_MOUSE)
+     */
     if (new_mode == MODE_AIR_MOUSE) {
         air_mouse_has_been_raised =
             (orientation_current == WRIST_UP_RAISED);
         if (air_mouse_has_been_raised) {
+            entry_grace_remaining = 0;
             LOG_INF("AIR_MOUSE entered while already raised -- "
                     "exit detection armed immediately");
         } else {
-            LOG_INF("AIR_MOUSE entered -- waiting for first raise to "
-                    "arm exit detection (raise your wrist now)");
+            entry_grace_remaining = AIR_MOUSE_ENTRY_GRACE;
+            LOG_INF("AIR_MOUSE entered -- raise your wrist within %d ms "
+                    "to engage, or it auto-exits to IDLE",
+                    AIR_MOUSE_ENTRY_GRACE * 10);
         }
     } else {
         air_mouse_has_been_raised = false;
+        entry_grace_remaining = 0;
     }
 
     /* Notify the acquisition-request callback on edges between
@@ -333,6 +380,7 @@ void gesture_mode_init(void)
     exit_dwell = 0;
     air_mouse_cooldown_remaining = 0;
     air_mouse_has_been_raised = false;
+    entry_grace_remaining = 0;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -419,15 +467,33 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     }
 
     /* Arm the "has been raised" latch the first time orientation
-     * actually becomes UP_RAISED while in AIR_MOUSE.  Below, the
-     * exit-dwell check only runs when this latch is true so the
-     * user has unlimited time after pressing the entry trigger to
-     * raise their arm. */
+     * actually becomes UP_RAISED while in AIR_MOUSE.  The exit-dwell
+     * check below only runs when this latch is true -- the user has
+     * the entry_grace_remaining window to raise their wrist before
+     * the FSM concludes they're not engaging and bounces back to
+     * IDLE. */
     if (current_mode == MODE_AIR_MOUSE &&
         orientation_current == WRIST_UP_RAISED &&
         !air_mouse_has_been_raised) {
         air_mouse_has_been_raised = true;
+        entry_grace_remaining = 0;  /* engaged -- stop the timeout */
         LOG_INF("AIR_MOUSE: raised pose reached -- exit detection armed");
+    }
+
+    /* Entry-grace timeout: counts down while we're in AIR_MOUSE and
+     * the user hasn't yet reached the raised pose.  Hits zero -> the
+     * user pressed the entry trigger then got distracted / forgot;
+     * bounce back to IDLE so the band doesn't sit in AIR_MOUSE
+     * indefinitely.  No cooldown started because the user never
+     * actually engaged; they have to press double-tap again to retry. */
+    if (current_mode == MODE_AIR_MOUSE && !air_mouse_has_been_raised &&
+        entry_grace_remaining > 0) {
+        entry_grace_remaining--;
+        if (entry_grace_remaining == 0) {
+            LOG_INF("AIR_MOUSE entry grace expired -- user never "
+                    "raised, exiting to IDLE");
+            _transition_to(MODE_IDLE);
+        }
     }
 
     /* AIR_MOUSE exit via orientation drop:
@@ -514,28 +580,28 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
 void gesture_mode_on_chip_double_tap(void)
 {
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
-    /* Toggle semantics:
-     *   IDLE -> AIR_MOUSE       (primary intentional entry)
-     *   AIR_MOUSE -> IDLE       (intentional exit, clears cooldown)
-     *   SURFACE -> IDLE         (same -- band returns to neutral)
-     *   GESTURE_AMBIENT -> IDLE (future-proofing)
+    /* Double-tap is the AIR_MOUSE ENTRY trigger ONLY.  Per design
+     * discussion: exit is by lowering the wrist, not by re-tapping.
+     * Double-tap while already in a non-IDLE mode is a no-op (logged
+     * for visibility so accidental taps during cursor use show up in
+     * the trace).
      *
-     * The user picked double-tap as the deliberate trigger because
-     * the air-mouse pose, while distinctive, can occur in normal
-     * activities (drawing on a whiteboard, pointing at a screen,
-     * etc.) and shouldn't accidentally hijack their device.
+     * Why entry-only:
+     *   - The user defined the model: tap to engage, lower to
+     *     disengage, raise within cooldown to re-engage
+     *   - Toggle-on-tap would let an accidental tap mid-cursor-use
+     *     yank the user out of AIR_MOUSE mid-action
+     *   - There's no benefit to having a redundant exit path that
+     *     bypasses the natural orientation-based one
      */
     if (current_mode == MODE_IDLE) {
         LOG_INF("Chip double-tap from IDLE -- entering AIR_MOUSE");
         _transition_to(MODE_AIR_MOUSE);
         air_mouse_cooldown_remaining = 0;  /* explicit entry skips cooldown */
     } else {
-        LOG_INF("Chip double-tap from %s -- exiting to IDLE (no cooldown)",
+        LOG_INF("Chip double-tap from %s -- ignored (double-tap is "
+                "entry-only; exit by lowering the wrist)",
                 _mode_str(current_mode));
-        _transition_to(MODE_IDLE);
-        /* Explicit exit -- no cooldown.  User wanted out, give them
-         * out.  They can re-enter via a fresh double-tap. */
-        air_mouse_cooldown_remaining = 0;
     }
 }
 
