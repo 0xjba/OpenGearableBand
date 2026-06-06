@@ -284,30 +284,54 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
     //    Only run this path if SQI passed -- otherwise raw_bpm stays 0 and
     //    the diagnostic log makes that explicit.
     float raw_bpm = 0.0f;
+    float ac_bpm = 0.0f;          // dual-method log: autocorr pick
+    float fft_bpm = 0.0f;         // dual-method log: stationary-FFT pick
+    float stat_conf = 0.0f;       // dual-method log: reconciliation confidence
     const char *path = "skip";
     if (sqi_passed) {
         switch (motion) {
             case STATIONARY:
-                // Contact-settling gate.  When the wrist is still, a
-                // well-settled signal has ppg_var ~1000-2000 (steady-
-                // state autocorr trace).  If ppg_var is much higher
-                // while motion is STATIONARY, the optical contact is
-                // unstable -- user adjusting the strap, finger tapping
-                // the sensor, or a fresh-on transient.  Autocorr's
-                // peak-finding becomes unreliable here (observed: lag-
-                // 100+ peaks that translate to fake ~50 BPM readings),
-                // so hold the Kalman state rather than commit garbage
-                // to it.  5000 puts the threshold comfortably above
-                // the settled range and well below the observed
-                // settling range (8000-20000 in the v0.2 boot snapshot).
+                // Contact-settling gate (unchanged).  When the wrist is
+                // still, a well-settled signal has ppg_var ~1000-2000
+                // (steady-state autocorr trace).  If ppg_var is much
+                // higher while motion is STATIONARY, the optical contact
+                // is unstable -- user adjusting the strap, finger tapping
+                // the sensor, or a fresh-on transient.  Both autocorr AND
+                // FFT become unreliable here; gate them together.
                 if (ppg_var > 5000.0f) {
                     path = "autocorr-settling";
-                    // raw_bpm stays 0 -- the in-range gate below will
-                    // reject it and the function returns kalman.x.
+                    // raw_bpm stays 0 -- the in-range gate below rejects
+                    // and the function returns kalman.x.
                 } else {
-                    raw_bpm = runAutocorrelation(ppg_buffer);
-                    kalman.r = 0.5f;
-                    path = "autocorr";
+                    // STAGE-2 dual-method.  Compute BOTH autocorr (time
+                    // domain) and FFT (frequency domain) on the same
+                    // band-passed buffer; reconcile via
+                    // reconcileStationary().  Eliminates the sub-harmonic
+                    // failure mode observed in field traces: autocorr
+                    // alone can lock onto the 2T peak when the cardiac
+                    // T-peak is below 50 % of the in-band global max
+                    // (weak resting cardiac SNR).  FFT shows a clear peak
+                    // at the true cardiac fundamental in that case; the
+                    // 2:1 ratio between the two methods' picks
+                    // disambiguates.  See WearableDSP.h for the full
+                    // confidence-reconciliation contract.
+                    ac_bpm  = runAutocorrelation(ppg_buffer);
+                    fft_bpm = runStationaryFFT(ppg_buffer);
+                    raw_bpm = reconcileStationary(ac_bpm, fft_bpm, &stat_conf);
+
+                    if (stat_conf >= 0.99f) {
+                        kalman.r = 0.5f;      // high confidence
+                        path = "stat-agree";
+                    } else if (stat_conf >= 0.4f) {
+                        kalman.r = 2.0f;      // medium (one silent, or
+                                              // harmonic-resolved)
+                        path = "stat-harm";
+                    } else {
+                        // raw_bpm is 0 here; range gate will reject and
+                        // Kalman holds.  We log the path so we can see
+                        // *why* in the trace.
+                        path = "stat-hold";
+                    }
                 }
                 break;
             case MICRO_MOTION:
@@ -359,9 +383,11 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
     //    SQI rejection, peak-finder returning 0, out-of-range BPM, or the
     //    new delta gate rejecting a physiologically-impossible jump.
     LOG_INF("dsp: ppg_dc=%.0f ppg_var=%.0f imu_var=%.3f motion=%d sqi=%d "
-            "path=%s stride=%d raw=%.2f in_range=%d delta_ok=%d kalman=%.2f",
+            "path=%s stride=%d ac=%.2f fft=%.2f conf=%.2f raw=%.2f "
+            "in_range=%d delta_ok=%d kalman=%.2f",
             (double)ac_mean, (double)ppg_var, (double)imu_var,
             (int)motion, (int)sqi_passed, path, stride_bin,
+            (double)ac_bpm, (double)fft_bpm, (double)stat_conf,
             (double)raw_bpm, (int)bpm_in_range, (int)delta_ok, (double)kalman.x);
 
     if (!sqi_passed)    return kalman.x;
@@ -459,6 +485,88 @@ float WearableDSP::runFFT(float* ppg, int stride_bin) {
         }
     }
     return ((float)max_idx_found * SAMPLE_RATE / (float)BUFFER_SIZE) * 60.0f;
+}
+
+float WearableDSP::runStationaryFFT(float* ppg) {
+    // Dual-method companion to runAutocorrelation().  Same band-passed
+    // PPG buffer, no NLMS, no stride masking -- we're stationary so
+    // there's no motion content to subtract or shadow.
+    //
+    // The IIR transient (first ~70 samples of impulse response) lands
+    // around 0.6 Hz, i.e. bin 3.  Our cardiac search range starts at
+    // bin 3 and the MIN_BPM=40 range-check rejects anything below
+    // bin 3.4 anyway, so any transient pollution at bin 3 falls out
+    // of the candidate set automatically.
+    arm_rfft_fast_f32(&fft_inst, ppg, fft_output, 0);
+    arm_cmplx_mag_f32(fft_output, fft_magnitudes, BUFFER_SIZE / 2);
+
+    int min_idx = (int)(0.6f * BUFFER_SIZE / SAMPLE_RATE);
+    int max_idx = (int)(3.33f * BUFFER_SIZE / SAMPLE_RATE);
+
+    float max_val = 0;
+    int max_idx_found = 0;
+    for (int i = min_idx; i <= max_idx; i++) {
+        if (fft_magnitudes[i] > max_val) {
+            max_val = fft_magnitudes[i];
+            max_idx_found = i;
+        }
+    }
+    return ((float)max_idx_found * SAMPLE_RATE / (float)BUFFER_SIZE) * 60.0f;
+}
+
+float WearableDSP::reconcileStationary(float bpm_ac, float bpm_fft,
+                                       float *out_confidence) {
+    // Dual-method reconciliation per the industry-standard pattern
+    // (Apple US patent 9,826,940 "weighted combination" + Analog Devices
+    // reference design + the harmonic-pair search documented across the
+    // PPG HR estimation patent corpus).  We compute both autocorr and
+    // FFT, then resolve:
+    //
+    //   Agree within +/-5 BPM    -> high confidence, return average
+    //   One returned 0           -> medium confidence, trust the other
+    //   2:1 ratio between them   -> medium confidence, return the LARGER
+    //                               (the smaller is the 2T sub-harmonic;
+    //                               this is the textbook failure mode
+    //                               we saw in field traces at rest with
+    //                               weak cardiac SNR)
+    //   Disagree without 2:1     -> low confidence, return 0 (caller
+    //                               should hold Kalman -- something
+    //                               unexplained is going on, refuse
+    //                               to commit a guess to state)
+    //
+    // The 2:1 ratio is checked within [1.85, 2.15] to tolerate spectral-
+    // leakage bin rounding (autocorr lag at 71 corresponds to FFT bin
+    // 7.04; both methods can round their picks +/- 1 bin / 1 sample).
+
+    if (bpm_ac <= 0.0f && bpm_fft <= 0.0f) {
+        *out_confidence = 0.0f;
+        return 0.0f;
+    }
+    if (bpm_ac <= 0.0f) {
+        *out_confidence = 0.5f;
+        return bpm_fft;
+    }
+    if (bpm_fft <= 0.0f) {
+        *out_confidence = 0.5f;
+        return bpm_ac;
+    }
+
+    float delta = bpm_ac - bpm_fft;
+    if (delta < 0.0f) delta = -delta;
+    if (delta <= 5.0f) {
+        *out_confidence = 1.0f;
+        return 0.5f * (bpm_ac + bpm_fft);
+    }
+
+    float ratio = (bpm_ac > bpm_fft) ? (bpm_ac / bpm_fft)
+                                     : (bpm_fft / bpm_ac);
+    if (ratio >= 1.85f && ratio <= 2.15f) {
+        *out_confidence = 0.5f;
+        return (bpm_ac > bpm_fft) ? bpm_ac : bpm_fft;
+    }
+
+    *out_confidence = 0.0f;
+    return 0.0f;
 }
 
 int WearableDSP::findStrideBin(float* imu_x, float* imu_y, float* imu_z) {

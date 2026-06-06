@@ -179,6 +179,20 @@ private:
     bool checkSQI(float* ppg_data);
     MotionState getMotionState(float* imu_data);
     float runAutocorrelation(float* ppg);
+    // Stationary-only FFT.  Runs on the band-passed PPG buffer (no NLMS,
+    // no stride masking).  Returns the BPM at the strongest bin in the
+    // cardiac band [0.6, 3.33 Hz].  Used by the STATIONARY path as a
+    // second opinion to cross-validate runAutocorrelation() and catch
+    // the sub-harmonic failure mode (autocorr can lock onto the 2T peak
+    // when the cardiac T-peak is below 50% of the in-band global max).
+    float runStationaryFFT(float* ppg);
+    // Reconcile autocorr and FFT picks for the STATIONARY path.
+    // Returns the chosen BPM (or 0 to signal "hold Kalman") and writes
+    // a confidence in [0, 1] to *out_confidence:
+    //   1.0  -- both methods agreed within +/-5 BPM (average returned)
+    //   0.5  -- one method silent / 2:1 ratio resolved (sub-harmonic case)
+    //   0.0  -- disagree without explanation (caller should hold Kalman)
+    float reconcileStationary(float bpm_ac, float bpm_fft, float *out_confidence);
     // runFFT performs HYBRID spectral exclusion:
     //   * dynamic imu_shadow_mask (populated by findStrideBin) shadows
     //     any bin where IMU FFT magnitude >= 3x in-band mean (+/-1),
