@@ -286,26 +286,38 @@ static WristOrientation _classify_orientation(float gx, float gy, float gz)
 
     /* Classify based on which axis dominates + its sign.
      *
-     * NOTE on the X/Y/Z conventions:
-     *   - These mappings depend on how the XIAO board sits on the
-     *     wrist.  Default mapping below is a *starting hypothesis*;
-     *     it needs empirical calibration against the user's actual
-     *     wrist mounting.  See gesture-architecture.md TODOs.
-     *   - The procedure is documented in the field: hold the band in
-     *     each intended pose, read the filtered gravity vector from
-     *     the orientation transition log line, and update this
-     *     classifier with the empirical mapping. */
+     * Empirical mapping from field calibration (this user, this
+     * board mounting):
+     *   - X+ dominant ~ 6.2 m/s^2  ==> AIR_MOUSE raised pose
+     *     (captured during two test attempts at g=[6.18,-4.23,3.66]
+     *     and g=[6.23,-3.98,3.24])
+     *   - Z+ dominant ~ 8.3 m/s^2  ==> band flat / surface
+     *     (captured during snapshot windows when band was sitting
+     *     on desk: accel=(0.47,-5.04,8.27) etc.)
+     *   - Y axis dominance: no current empirical mapping; was a
+     *     placeholder guess for raised pose in earlier code, now
+     *     stripped.  Will need re-test if the user adopts a third
+     *     distinct gesture pose where Y dominates.
+     *
+     * If the user's board mounting changes (e.g. switching wrists
+     * or rotating the band on the strap), these mappings will need
+     * to be re-captured.  Procedure: hold the band in each intended
+     * pose, run 'g' over serial, read raw_g and update the
+     * conditions below to match. */
     switch (largest_axis) {
     case 0:  /* X-axis dominant */
-        /* Positive X dominant -> palm-down flat on a desk */
-        return (largest_signed > 0.0f) ? WRIST_DOWN_FLAT : WRIST_NEUTRAL;
+        /* Positive X dominant -> wrist raised in AIR_MOUSE pose. */
+        return (largest_signed > 0.0f) ? WRIST_UP_RAISED : WRIST_NEUTRAL;
     case 1:  /* Y-axis dominant */
-        /* Negative Y dominant -> forearm raised in air-mouse pose */
-        return (largest_signed < 0.0f) ? WRIST_UP_RAISED : WRIST_NEUTRAL;
-    case 2:  /* Z-axis dominant */
-        /* Forearm vertical / wrist hanging.  Not a cursor-bearing
-         * pose -- treat as NEUTRAL for now. */
+        /* No mapping yet -- not enough field data.  Stay NEUTRAL so
+         * the FSM doesn't fire on poses we don't recognize. */
         return WRIST_NEUTRAL;
+    case 2:  /* Z-axis dominant */
+        /* Positive Z dominant -> band flat (palm-down on surface
+         * or armrest level).  Used as the disengage zone for
+         * AIR_MOUSE exit and as the entry condition for SURFACE
+         * mode. */
+        return (largest_signed > 0.0f) ? WRIST_DOWN_FLAT : WRIST_NEUTRAL;
     default:
         return WRIST_NEUTRAL;
     }
