@@ -334,14 +334,21 @@ void dsp_thread_entry(void *, void *, void *) {
         k_sem_take(&dsp_process_sem, K_FOREVER);
 
         float final_bpm = dsp.processHeartRate(dsp_ppg_buffer,
-                                               dsp_imu_smv,
-                                               dsp_imu_x,
-                                               dsp_imu_y,
-                                               dsp_imu_z);
+                                               dsp_imu_smv);
         WearState ws = dsp.getWearState();
         MotionState ms = dsp.getMotionState();
+        bool steady_needed = dsp.needsSteady();
 
-        LOG_INF("Wear=%s  BPM=%.2f", wear_state_str(ws), (double)final_bpm);
+        if (steady_needed) {
+            // Motion detected on a worn device.  The MICRO / HEAVY DSP
+            // paths are parked on feature/motion-path-experiments until
+            // they reach production quality; in this build we hold
+            // Kalman and tell the app to prompt the user to hold still.
+            LOG_INF("Wear=%s  BPM=%.2f  STAY_STEADY (motion=%d)",
+                    wear_state_str(ws), (double)final_bpm, (int)ms);
+        } else {
+            LOG_INF("Wear=%s  BPM=%.2f", wear_state_str(ws), (double)final_bpm);
+        }
 
         // Publish motion + wear state + window sequence for the power
         // state machine to observe.  Sequence increments unconditionally
@@ -350,10 +357,14 @@ void dsp_thread_entry(void *, void *, void *) {
         atomic_set(&latest_wear_state, (atomic_val_t)ws);
         atomic_inc(&latest_window_seq);
 
-        // Only push HRS notifications when the device is actually worn.
-        // During NOT_WORN / STABILIZING the BPM is meaningless, and pushing
-        // 0 would just confuse any connected client.
-        if (ws == WEAR_WORN) {
+        // Push HRS notifications only when:
+        //   (a) the device is actually worn, AND
+        //   (b) the wrist is stationary (Kalman just got updated with a
+        //       trusted reading).
+        // Suppressing during motion gives the phone-side app a clear
+        // signal -- the absence of recent HR notifications is the
+        // "stay steady" prompt.  See needsSteady() in WearableDSP.h.
+        if (ws == WEAR_WORN && !steady_needed) {
             bt_hrs_notify((uint16_t)final_bpm);
         }
     }
