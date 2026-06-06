@@ -63,11 +63,20 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
  * auto-re-engages without requiring another double-tap.  Outside
  * this window, an explicit double-tap is required.
  *
- * 300 samples = 3 s at 100 Hz acquisition rate.  Long enough to
- * accommodate brief arm-down moments (sip of coffee, scratch nose);
- * short enough that "I'm done air-mousing" intent is respected.
+ * Sized for the realistic case of a user actively using AIR_MOUSE
+ * who lowers their arm to rest a fatigued deltoid / forearm, then
+ * comes back to keep using it.  Shoulder fatigue recovery during
+ * sustained sub-shoulder-height pointing is roughly 15-30 s; 2000
+ * samples = 20 s at 100 Hz lands in the middle of that range.
+ *
+ * Tradeoff: too short and a tired user has to re-double-tap to
+ * resume.  Too long and an unrelated wrist raise (typing, drinking
+ * coffee) accidentally re-engages.  The 500 ms raise-dwell on the
+ * cooldown re-engage path (COOLDOWN_REENGAGE_DWELL) protects
+ * against casual movements regardless of cooldown length, so we
+ * lean toward "longer" here.
  */
-#define AIR_MOUSE_COOLDOWN_SAMPLES  300
+#define AIR_MOUSE_COOLDOWN_SAMPLES  2000
 
 /*
  * Orientation dwell required during cooldown to re-engage.  Shorter
@@ -91,17 +100,20 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
  * having armed exit detection.
  *
  * Sized to accommodate the natural human reaction time + orientation
- * dwell:
+ * dwell + comfortable margin:
  *   - Press double-tap: ~0 ms
  *   - Initiate arm raise: 200-400 ms
  *   - Arm reaches raised position: 500-1000 ms
  *   - Orientation classifier dwell to register UP_RAISED: 250 ms
- *   - Plus margin for slow movements / hesitation
+ *   - Margin for slow / hesitant movement, getting comfortable in
+ *     the pose, etc.
  *
- * 300 samples = 3 s at 100 Hz.  Felt right in design discussion;
- * tune empirically once we have field-test data on user latency.
+ * 500 samples = 5 s at 100 Hz.  Generous enough that a user who
+ * needs to reposition their hand or adjust the band still makes it
+ * in; short enough that a forgotten double-tap doesn't pin the band
+ * in AIR_MOUSE.
  */
-#define AIR_MOUSE_ENTRY_GRACE       300
+#define AIR_MOUSE_ENTRY_GRACE       500
 
 /*
  * Flat-to-surface trigger: keep the original orientation-driven path
