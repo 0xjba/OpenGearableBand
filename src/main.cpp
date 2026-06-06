@@ -4,6 +4,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/sys/reboot.h>
+#include <hal/nrf_power.h>  // NRF_POWER->GPREGRET for UF2 bootloader entry
 #include <zephyr/logging/log.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -362,10 +363,26 @@ void dsp_thread_entry(void *, void *, void *) {
 K_THREAD_DEFINE(dsp_thread_id, 4096, dsp_thread_entry, NULL, NULL, NULL, 7, 0, 0);
 
 // --- Serial reset thread ---
-// Polls the console UART (USB CDC ACM on the Xiao Sense) for an 'r' or 'R'
-// character and triggers a full chip reboot via sys_reboot().  Useful when
-// you can't easily double-tap the reset button (e.g. wrist-strapped, or
-// you want to restart cleanly without re-entering the bootloader).
+// Polls the console UART (USB CDC ACM on the Xiao Sense) for single-char
+// commands and reacts.  Useful when you can't easily double-tap the
+// reset button (e.g. wrist-strapped, or you want to restart cleanly
+// without re-entering the bootloader).
+//
+// Commands:
+//   'r' / 'R' -> sys_reboot(SYS_REBOOT_COLD): full chip reset.  The
+//                bootloader runs, finds no magic in GPREGRET, jumps
+//                straight to the application.  Same behavior as a
+//                single physical RESET press.
+//   'b' / 'B' -> Enter UF2 flash mode without taking the band off.
+//                Writes the Adafruit nRF52 bootloader's "stay in UF2"
+//                magic (0x57) into GPREGRET, then soft-resets.  After
+//                the reset the bootloader reads GPREGRET, sees the
+//                magic, and stays in flash-mode (XIAO-SENSE volume
+//                appears on the host) instead of jumping to the app.
+//                Same behavior as a double-tap on the physical RESET
+//                button.  Saves the wrist-off step when iterating.
+//                Magic value verified against the Adafruit nrf52
+//                bootloader source: DFU_MAGIC_UF2_RESET == 0x57.
 static const struct device *console_uart =
     DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 
@@ -374,7 +391,7 @@ void reset_thread_entry(void *, void *, void *) {
         LOG_WRN("Console UART not ready; serial-reset disabled");
         return;
     }
-    LOG_INF("Serial-reset armed: press 'r' on the console to reboot");
+    LOG_INF("Serial console armed: 'r'=reboot, 'b'=enter UF2 bootloader");
 
     uint8_t c;
     while (1) {
@@ -382,6 +399,17 @@ void reset_thread_entry(void *, void *, void *) {
             if (c == 'r' || c == 'R') {
                 LOG_INF("Serial reset requested -- rebooting");
                 k_sleep(K_MSEC(50));  // let the log line drain over USB
+                sys_reboot(SYS_REBOOT_COLD);
+                // not reached
+            } else if (c == 'b' || c == 'B') {
+                LOG_INF("Bootloader jump requested -- entering UF2 mode");
+                k_sleep(K_MSEC(50));  // let the log line drain over USB
+                // Adafruit nRF52 UF2 bootloader checks GPREGRET on boot
+                // and stays in flash-mode when it sees 0x57.  Direct
+                // register access -- the HAL header gives us NRF_POWER
+                // but the field is a plain volatile uint32_t so this
+                // is the least-version-fragile way to set it.
+                NRF_POWER->GPREGRET = 0x57;
                 sys_reboot(SYS_REBOOT_COLD);
                 // not reached
             }
