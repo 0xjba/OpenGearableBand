@@ -136,6 +136,22 @@ static int exit_dwell = 0;           /* non-UP_RAISED dwell while in AIR_MOUSE *
  * Decremented every accel sample. */
 static int air_mouse_cooldown_remaining = 0;
 
+/* "Has the user actually reached the UP_RAISED pose since entering
+ * AIR_MOUSE?"  Reset on every transition INTO AIR_MOUSE; set the
+ * first time orientation becomes UP_RAISED after that.
+ *
+ * Purpose: the user's natural sequence is double-tap-then-raise, not
+ * raise-then-double-tap.  Without this flag, exit_dwell starts
+ * counting immediately on AIR_MOUSE entry while the wrist is still
+ * wherever it was (desk, by side, etc.).  500 ms later the FSM
+ * exits before the user has had a chance to raise their arm.
+ *
+ * With this flag, exit detection only arms after we've SEEN the
+ * raised pose at least once -- the user has unlimited time to get
+ * into pose after pressing the entry trigger.  If they never raise,
+ * the mode stays AIR_MOUSE until explicitly cancelled. */
+static bool air_mouse_has_been_raised = false;
+
 /* Acquisition-request callback registered by main.cpp. */
 static gesture_acq_request_cb_t s_acq_request_cb = NULL;
 
@@ -268,6 +284,26 @@ static void _transition_to(GestureMode new_mode)
     flat_dwell = 0;
     exit_dwell = 0;
 
+    /* Manage the "have we reached raised pose since entering AIR_MOUSE"
+     * latch.  Entering AIR_MOUSE while already in UP_RAISED -> set
+     * immediately (no grace needed).  Entering from any other
+     * orientation -> false; the per-sample update will set it the
+     * first time orientation becomes UP_RAISED.  Leaving AIR_MOUSE
+     * always clears it. */
+    if (new_mode == MODE_AIR_MOUSE) {
+        air_mouse_has_been_raised =
+            (orientation_current == WRIST_UP_RAISED);
+        if (air_mouse_has_been_raised) {
+            LOG_INF("AIR_MOUSE entered while already raised -- "
+                    "exit detection armed immediately");
+        } else {
+            LOG_INF("AIR_MOUSE entered -- waiting for first raise to "
+                    "arm exit detection (raise your wrist now)");
+        }
+    } else {
+        air_mouse_has_been_raised = false;
+    }
+
     /* Notify the acquisition-request callback on edges between
      * "needs continuous IMU" and "doesn't."  Only fires on real edges
      * so the callback doesn't get spammed on every transition. */
@@ -296,6 +332,7 @@ void gesture_mode_init(void)
     flat_dwell = 0;
     exit_dwell = 0;
     air_mouse_cooldown_remaining = 0;
+    air_mouse_has_been_raised = false;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -381,11 +418,25 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         raise_dwell = 0;
     }
 
+    /* Arm the "has been raised" latch the first time orientation
+     * actually becomes UP_RAISED while in AIR_MOUSE.  Below, the
+     * exit-dwell check only runs when this latch is true so the
+     * user has unlimited time after pressing the entry trigger to
+     * raise their arm. */
+    if (current_mode == MODE_AIR_MOUSE &&
+        orientation_current == WRIST_UP_RAISED &&
+        !air_mouse_has_been_raised) {
+        air_mouse_has_been_raised = true;
+        LOG_INF("AIR_MOUSE: raised pose reached -- exit detection armed");
+    }
+
     /* AIR_MOUSE exit via orientation drop:
      * Pose is no longer UP_RAISED for AIR_MOUSE_EXIT_DWELL samples
      * straight -> transition back to IDLE and start the cooldown
-     * window. */
+     * window.  Only runs after the user has been raised at least
+     * once -- prevents exiting before the user has assumed the pose. */
     if (current_mode == MODE_AIR_MOUSE &&
+        air_mouse_has_been_raised &&
         orientation_current != WRIST_UP_RAISED) {
         if (exit_dwell < AIR_MOUSE_EXIT_DWELL) {
             exit_dwell++;
