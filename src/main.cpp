@@ -17,6 +17,7 @@
 
 #include "WearableDSP.h"
 #include "power_ctrl.h"
+#include "gesture_mode.h"
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -234,6 +235,14 @@ void acq_thread_entry(void *, void *, void *) {
         float ay = (float)sensor_value_to_double(&accel_y);
         float az = (float)sensor_value_to_double(&accel_z);
         float smv = sqrtf(ax * ax + ay * ay + az * az);
+
+        // Feed the gesture-mode detector at the sample rate.  Cheap
+        // (1 IIR per axis + a classifier branch); does its own dwell
+        // counting internally so we don't need to gate it ourselves.
+        // Runs on EVERY raw sample including warmup -- the detector
+        // does its own filter-seeding on the first call, and orientation
+        // tracking benefits from seeing all samples to converge faster.
+        gesture_mode_update_accel(ax, ay, az);
 
         // HARDWARE FIX: discard the first ACQ_WARMUP_SAMPLES of every
         // burst to flush the MAX30102 wake-from-SHDN artifact (see the
@@ -879,7 +888,13 @@ static void init_xiao_pins() {
 
 int main(void) {
     LOG_INF("Starting Wearable HR Monitor");
-    
+
+    // Initialise the gesture-mode detector state machine up front so
+    // its first sample lands in well-defined memory.  The detector
+    // itself runs from the acquisition thread once samples start
+    // flowing.
+    gesture_mode_init();
+
     init_xiao_pins();
 
     // The IMU regulator (regulator-boot-on) has already powered the LSM6DSL
