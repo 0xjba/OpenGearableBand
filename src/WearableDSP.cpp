@@ -291,47 +291,56 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
     if (sqi_passed) {
         switch (motion) {
             case STATIONARY:
-                // Contact-settling gate (unchanged).  When the wrist is
-                // still, a well-settled signal has ppg_var ~1000-2000
-                // (steady-state autocorr trace).  If ppg_var is much
-                // higher while motion is STATIONARY, the optical contact
-                // is unstable -- user adjusting the strap, finger tapping
-                // the sensor, or a fresh-on transient.  Both autocorr AND
-                // FFT become unreliable here; gate them together.
-                if (ppg_var > 5000.0f) {
-                    path = "autocorr-settling";
-                    // raw_bpm stays 0 -- the in-range gate below rejects
-                    // and the function returns kalman.x.
-                } else {
-                    // STAGE-2 dual-method.  Compute BOTH autocorr (time
-                    // domain) and FFT (frequency domain) on the same
-                    // band-passed buffer; reconcile via
-                    // reconcileStationary().  Eliminates the sub-harmonic
-                    // failure mode observed in field traces: autocorr
-                    // alone can lock onto the 2T peak when the cardiac
-                    // T-peak is below 50 % of the in-band global max
-                    // (weak resting cardiac SNR).  FFT shows a clear peak
-                    // at the true cardiac fundamental in that case; the
-                    // 2:1 ratio between the two methods' picks
-                    // disambiguates.  See WearableDSP.h for the full
-                    // confidence-reconciliation contract.
-                    ac_bpm  = runAutocorrelation(ppg_buffer);
-                    fft_bpm = runStationaryFFT(ppg_buffer);
-                    raw_bpm = reconcileStationary(ac_bpm, fft_bpm, &stat_conf);
+                // STAGE-2 dual-method.  Run autocorr + stationary FFT on
+                // every STATIONARY window, including high-ppg_var ones.
+                //
+                // The previous (pre-Stage-2) settling gate refused to run
+                // the DSP at all when ppg_var > 5000, on the theory that
+                // high variance meant unstable contact and any single-
+                // method estimate would be garbage (lag-100+ peaks ->
+                // fake ~50 BPM).  With dual-method, the original failure
+                // mode is caught structurally: if autocorr and FFT
+                // disagree, we hold; if they agree, the agreement itself
+                // is evidence the signal is real regardless of variance.
+                //
+                // First trace post-Stage-2 confirmed this -- post-workout
+                // ppg_var stayed in the 5000-19000 range for 90 s while
+                // perfusion recovered, freezing Kalman at 123.55 while
+                // Apple Watch dropped from 124 to 101.  Cardiac signal
+                // was demonstrably present (FFT and autocorr both could
+                // see it) but the variance gate refused to look.
+                //
+                // New behavior:
+                //   stat_conf == 1.0 (agree)   -> update Kalman, r=0.5
+                //   stat_conf == 0.5 (partial) -> update Kalman, r=2.0
+                //   stat_conf == 0.0 AND ppg_var > 5000  -> "settling"
+                //                                            (high noise
+                //                                            AND no
+                //                                            agreement)
+                //   stat_conf == 0.0 AND ppg_var <= 5000 -> "stat-hold"
+                //                                            (low noise
+                //                                            but methods
+                //                                            disagreed)
+                ac_bpm  = runAutocorrelation(ppg_buffer);
+                fft_bpm = runStationaryFFT(ppg_buffer);
+                raw_bpm = reconcileStationary(ac_bpm, fft_bpm, &stat_conf);
 
-                    if (stat_conf >= 0.99f) {
-                        kalman.r = 0.5f;      // high confidence
-                        path = "stat-agree";
-                    } else if (stat_conf >= 0.4f) {
-                        kalman.r = 2.0f;      // medium (one silent, or
-                                              // harmonic-resolved)
-                        path = "stat-harm";
-                    } else {
-                        // raw_bpm is 0 here; range gate will reject and
-                        // Kalman holds.  We log the path so we can see
-                        // *why* in the trace.
-                        path = "stat-hold";
-                    }
+                if (stat_conf >= 0.99f) {
+                    kalman.r = 0.5f;          // high confidence
+                    path = "stat-agree";
+                } else if (stat_conf >= 0.4f) {
+                    kalman.r = 2.0f;          // medium
+                    path = "stat-harm";
+                } else if (ppg_var > 5000.0f) {
+                    // Both methods unconvinced AND signal is noisy.
+                    // This is the original "settling" case -- hold.
+                    raw_bpm = 0.0f;
+                    path = "autocorr-settling";
+                } else {
+                    // Clean signal, methods still disagreed without a
+                    // 2:1 explanation.  Hold; log so we see why.
+                    raw_bpm = 0.0f;
+                    path = "stat-hold";
                 }
                 break;
             case MICRO_MOTION:
@@ -551,9 +560,24 @@ float WearableDSP::reconcileStationary(float bpm_ac, float bpm_fft,
         return bpm_ac;
     }
 
+    // Agreement tolerance must absorb the inherent resolution mismatch
+    // between the two methods:
+    //   FFT bin width = SAMPLE_RATE / BUFFER_SIZE * 60 = 100/512*60
+    //                 = 11.72 BPM, constant across the cardiac band
+    //   Autocorr lag width = N - (N/(1 + 1/N)) varies with HR.  At lag
+    //   41 (= 146.34 BPM) adjacent lags are 142.86 / 150.00 / 139.53,
+    //   i.e. 3-7 BPM apart at typical heavy-exercise HR.
+    // Combined uncertainty at HR=140 is ~12 BPM; the methods *cannot*
+    // round to within 5 BPM of each other at high cardiac rates even
+    // when they are pointing at the same physiological frequency.
+    // First trace with the 5 BPM gate showed seven "false hold" windows
+    // where both methods reported essentially the same answer but
+    // differed by 5-9 BPM and got rejected (e.g. ac=122.45 / fft=128.91
+    // both = bin 11 territory).  Bump to 10 BPM, which still keeps the
+    // sub-harmonic case clearly distinct (|T - 2T| = T, far above 10).
     float delta = bpm_ac - bpm_fft;
     if (delta < 0.0f) delta = -delta;
-    if (delta <= 5.0f) {
+    if (delta <= 10.0f) {
         *out_confidence = 1.0f;
         return 0.5f * (bpm_ac + bpm_fft);
     }
