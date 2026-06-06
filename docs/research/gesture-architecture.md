@@ -24,27 +24,40 @@ during build-out.
 >   chip is M4F.
 > - Specific feature-engineering choices for PPG gesture features
 >   (Zhao 2018 details, windowing, derivative orders) to be locked
->   down before Stage 5 model training.
+>   down before item 6 model training.
+> - PDM driver bring-up on Zephyr for XIAO BLE Sense: confirm the
+>   `nrfx_pdm` or `zephyr,pdm` binding works with our existing
+>   board overlay; verify the MSM261D3526H1CPM is wired the way the
+>   Seeed wiki expects.
+> - Push-to-talk vs wake-word architecture decision: v1 will be
+>   push-to-talk per the power analysis, but reconsider once we
+>   have real battery measurements with PDM duty-cycled.
+> - Final keyword vocabulary -- the section 6.5 list (volume /
+>   brightness / youtube / music / presentation) is a starting
+>   point.  Real vocabulary will depend on which apps the phone-
+>   side team prioritizes and what users actually want.
 
 ---
 
 ## TL;DR
 
 Three product use cases (surface touchpad, air mouse, advanced
-gestures) appear independent but share the same underlying engine.
-Build one **unified gesture pipeline** with mode-aware output routing
-rather than three separate implementations.
+gestures) plus a cross-cutting voice-context capability share the
+same underlying engine.  Build one **unified gesture + voice pipeline**
+with mode-aware and context-aware output routing rather than separate
+implementations.
 
 **Implementation order:** foundation (mode detector + HID profile +
 cursor scaffolding) → chip-embedded gestures → air mouse v1 (IMU-only
-pinch via Edge Impulse) → surface mode → custom macro gestures → PPG-
-fused pinch (Apple-tier) → broader gesture vocabulary.  **Total to
-ship all three use cases at usable quality: 8-12 weeks** with Claude
-writing code + Edge Impulse handling the ML pipeline.
+pinch via Edge Impulse) → surface mode → custom macro gestures →
+**voice-activated context state machine (KWS)** → PPG-fused pinch
+(Apple-tier) → broader gesture vocabulary.  **Total to ship all three
+use cases + voice context at usable quality: 11-15 weeks** with
+Claude writing code + Edge Impulse handling the ML pipeline.
 
-**Long pole:** labelled gesture data collection (Edge Impulse mobile
-recorder, ~30 min per gesture for a usable model).  Not code, not
-infrastructure.
+**Long poles:** labelled gesture data collection AND labelled keyword
+data collection (both via Edge Impulse's mobile recorder, ~30 min per
+gesture or keyword for usable models).  Not code, not infrastructure.
 
 ---
 
@@ -70,6 +83,26 @@ as ambient input.  Pinch, double pinch, clench, flick, finger-specific
 taps detected via PPG-perceived tendon perturbations + IMU micro-
 movements.  Each gesture maps to a phone-side action.
 
+### Cross-cutting: Voice-activated context state machine
+
+A capability that **multiplies the power of all three use cases above
+without changing them**.  The user speaks a context keyword
+("volume", "brightness", "youtube", etc.) and the band enters that
+context for the next N seconds.  Subsequent gestures execute within
+that context rather than their default binding.
+
+**Examples of the product feel:**
+
+- Say "volume" → pinch up/down adjusts system volume
+- Say "brightness" → pinch up/down adjusts display brightness
+- Say "youtube" → tap seeks, double-tap toggles captions, pinch zooms
+- Say nothing → gestures perform their default binding (mouse click etc.)
+
+Context is set per-app on the phone-side configuration UI, so the
+same gestures mean different things in different apps within different
+contexts.  This turns the band from "input device" into "intent-aware
+remote."
+
 ---
 
 ## 2. The unification insight
@@ -80,44 +113,52 @@ three output bindings.
 
 ### Shared building blocks
 
-| Primitive | Surface mode | Air mouse | Advanced gestures |
-|---|---|---|---|
-| Mode / orientation detector | enters surface mode | enters air mode | enters always-on |
-| Trigger gesture (wake) | ✓ | ✓ | optional |
-| Chip-embedded tap engine | retuned for desk impact | for fallback | for tap-on-band |
-| Cursor pipeline (gyro integration + drift correction + HID) | ✓ surface tracking | ✓ air tracking | — |
-| Wrist-roll → scroll | ✓ | ✓ | optional |
-| Pinch classifier (ML on IMU + PPG) | optional disambiguation | ✓ click events | ✓ primary input |
-| PPG-derived gesture features | optional | improves pinch | required |
+| Primitive | Surface mode | Air mouse | Advanced gestures | Voice context |
+|---|---|---|---|---|
+| Mode / orientation detector | enters surface mode | enters air mode | enters always-on | n/a |
+| Trigger gesture (wake) | ✓ | ✓ | optional | activates voice listen window |
+| Chip-embedded tap engine | retuned for desk impact | for fallback | for tap-on-band | push-to-talk trigger |
+| Cursor pipeline (gyro integration + drift correction + HID) | ✓ surface tracking | ✓ air tracking | — | n/a |
+| Wrist-roll → scroll | ✓ | ✓ | optional | bound per active context |
+| Pinch classifier (ML on IMU + PPG) | optional disambiguation | ✓ click events | ✓ primary input | bound per active context |
+| PPG-derived gesture features | optional | improves pinch | required | n/a |
+| **Audio pipeline (PDM + MFCC + KWS model)** | — | — | — | ✓ context-keyword detection |
+| **Active-context state** (timed, per active context) | ✓ alters tap mapping | ✓ alters click mapping | ✓ alters gesture binding | sets / clears the context |
+| **Phone-side context-gesture binding table** | ✓ per app config | ✓ per app config | ✓ per app config | ✓ defines available contexts |
 
 ### Architecture diagram
 
 ```
-                IMU 100Hz + PPG 100Hz
-                          |
-                COMMON FEATURE EXTRACTION
-              (windows, peaks, AC amplitude,
-                  chip-embedded events)
-                          |
-              +-----------+----------+
-              |                      |
-         MODE DETECTOR          GESTURE CLASSIFIER
-       (wrist orientation)      (Edge Impulse model,
-                                  multi-class output)
-              |                      |
-              +-----------+----------+
+       IMU 100Hz + PPG 100Hz       PDM Mic (push-to-talk gated)
+              |                                |
+   COMMON FEATURE EXTRACTION              MFCC + KWS MODEL
+   (windows, peaks, AC amplitude,        (Edge Impulse,
+       chip-embedded events)              MFCC frontend +
+              |                            small CNN)
+              |                                |
+  +-----------+----------+               KEYWORD DETECTED
+  |                      |                     |
+ MODE DETECTOR     GESTURE CLASSIFIER          v
+(wrist orient.)   (Edge Impulse model,    ACTIVE CONTEXT STATE
+   |               multi-class output)   (timed; auto-clears
+   |                      |               after N seconds)
+   |                      |                     |
+   +----------------------+---------------------+
                           |
                     ACTION ROUTER
-       (mode-dependent binding of gesture events
-        to BLE HID / BLE custom char / app msg)
+       (mode + context aware binding of gesture
+        events to BLE HID / custom char / app msg)
                           |
               +-----------+----------+
               |           |           |
         CURSOR HID    CLICK HID   GESTURE EVT
-       (mouse move)  (mouse btn)  (custom char)
+       (mouse move)  (mouse btn)  (custom char,
+                                 includes context)
 ```
 
-**Build the foundation once.  Each use case is one output binding.**
+**Build the foundation once.  Each use case is one output binding.
+The voice context layer multiplies the meaning of each gesture
+without changing the gesture detection path.**
 
 ---
 
@@ -208,6 +249,72 @@ headroom.  A 50 KB model + feature buffers + classifier scaffolding
 fits comfortably with room for at least 2 more major subsystems.
 
 **Verdict:** ML deployment is feasible.  No hardware blocker.
+
+### Xiao BLE Sense PDM microphone
+
+**Hardware:**
+
+- **MSM261D3526H1CPM** (NOT MP34DT05 -- that's the Arduino Nano BLE
+  33 Sense; the XIAO BLE Sense uses a different mic IC, verified
+  against Seeed's wiki).
+- Pulse Density Modulation (PDM) digital microphone.
+- Connected to nRF52840's built-in PDM peripheral.
+- Sampling rate typically 16 kHz for keyword spotting use cases
+  (down from the chip's native PDM rate of 1.024 MHz after
+  decimation, which the nRF52840 PDM peripheral does in hardware).
+
+**Verified Edge Impulse path:**
+
+Seeed has an official tutorial: *"Speech Recognition based on Edge
+Impulse"* for the XIAO BLE Sense -- proven workflow for training
+custom wake-words / keywords on this exact hardware.  Edge Impulse
+also has a generic *"Keyword spotting"* end-to-end tutorial that
+matches our deployment target (Cortex-M4 + PDM).
+
+**Benchmark performance on Cortex-M4 (from TinyML literature):**
+
+- DS-CNN model, **~20 KB**, achieves **90.5 % accuracy** at 15 ms
+  per-inference latency, 0.3 mJ per inference
+- Optimized variants: **5 ms latency**, 0.05 mJ (6x better)
+- Standard architecture: MFCC features → small CNN → softmax
+- Typical input: 1-second sliding windows, 500 ms stride
+
+**For our use case (5-15 context keywords):**
+
+- ~30-50 KB flash for the model + MFCC frontend code
+- ~5-10 KB RAM for audio buffers + inference working set
+- **Expected accuracy: 88-95 %** for a closed vocabulary of 5-15
+  context keywords + a "negative" class for everything else
+
+**Power impact -- the architectural decision:**
+
+PDM mic continuous listening + KWS inference is **expensive on
+battery** (~1-3 mA combined).  Continuous always-on voice listening
+is impractical on wearable batteries.
+
+Three architectural patterns considered:
+
+| Pattern | Power | UX | Recommendation |
+|---|---|---|---|
+| Always-on KWS | ~1-3 mA continuous | Most natural | Skip -- battery cost too high for wrist |
+| Push-to-talk via gesture | Mic off until triggered | Requires deliberate user action | **Recommended for v1** |
+| Wake-word + KWS | Low-power VAD always on, KWS gated | Hands-free, good UX | v2 -- requires VAD model in addition |
+
+**Push-to-talk v1 flow:**
+
+1. User taps the band (chip-embedded tap event, ~zero cost)
+2. Band enables PDM + KWS pipeline for ~3-5 seconds
+3. User speaks a context keyword ("volume" / "youtube" / etc.)
+4. KWS classifies, publishes context state, mic disables
+5. Context times out after ~10 seconds of gesture inactivity, or
+   immediately on next tap
+
+This gives near-Apple feel (just tap-and-speak) at a fraction of the
+power cost of always-on listening.
+
+**Verdict:** PDM + KWS via Edge Impulse is a verified path on this
+exact hardware.  Power is the only constraint; addressed by push-to-
+talk gating.
 
 ### Power budget
 
@@ -378,6 +485,138 @@ hardware changes.
 
 ---
 
+## 6.5 Voice-activated context state machine detail
+
+### Concept
+
+Voice doesn't replace gestures; it **adds context that changes what
+each gesture means**.  Apple Watch's Siri equivalent is "do
+something specific via voice."  Our model is different: "tell the
+band what app/context you're in, then do it with a gesture."
+
+The pattern in multimodal-interaction research is well-established
+(see CHI 2023 *Voice-Accompanying Hand-to-Face Gesture Recognition*,
+US patents on transmodal input fusion for wearables): **voice sets
+intent, gesture executes action**.  Voice is good at categorical
+labels ("youtube", "volume", "brightness"); gesture is good at
+continuous / spatial actions (move cursor, adjust value, tap).
+Each plays to its strength.
+
+### How the state machine works
+
+```
+   Default state: NO ACTIVE CONTEXT
+            |
+            | (user taps band, says keyword)
+            v
+     CONTEXT = "volume"
+     timer = N seconds
+            |
+            | (user performs gesture)
+            v
+   gesture is bound through CURRENT CONTEXT
+   to "volume up" / "volume down" / etc.
+            |
+            | (timer expires OR user taps again)
+            v
+   Returns to NO ACTIVE CONTEXT
+   (gestures revert to default mouse / cursor binding)
+```
+
+State transitions:
+
+- **Push-to-talk trigger** (tap on band) opens a ~3-5 second voice
+  listening window
+- **Keyword recognized** sets the active context with a ~10 s
+  inactivity timeout
+- **Gesture performed** resets the inactivity timer and routes
+  through the context's binding table
+- **Inactivity timeout** OR **explicit cancel gesture** clears the
+  active context, gestures revert to default
+
+### Context vocabulary (initial v1 targets)
+
+Five high-leverage contexts that pair well with our gesture set:
+
+| Context keyword | Pairs with | Example bindings |
+|---|---|---|
+| "volume" | scroll / pinch / tap | scroll = volume +/-, tap = mute toggle |
+| "brightness" | scroll / pinch | scroll = brightness +/- |
+| "youtube" | tap / double-tap / pinch | tap = seek, double-tap = caption toggle, pinch = zoom |
+| "music" | tap / pinch / scroll | tap = play/pause, scroll = next/prev track |
+| "presentation" | flick / tap | flick = next/prev slide, tap = laser pointer |
+
+Phone-side app holds the binding table.  User configures per-app
+gesture meanings via the app UI.  Band just reports the active
+context + gesture event to the app over BLE; app applies the
+binding.
+
+### What the band sends over BLE
+
+When a context+gesture event fires:
+
+```
+struct GestureEvent {
+    uint8_t context_id;        // 0 = no context, 1+ = keyword index
+    uint8_t gesture_id;         // tap / pinch / flick / etc.
+    uint8_t modifier;           // up / down / direction
+    uint16_t confidence;        // 0-1000 for app-side gating
+    uint32_t timestamp_ms;
+};
+```
+
+Published over a **custom GATT characteristic** (this part requires
+the app, unlike the standard HID mouse path which works app-less).
+HID mouse path remains available when no context is active --
+context aware gestures route through the custom char.
+
+### Accuracy realistic for our setup
+
+Edge Impulse KWS on Cortex-M4 with custom training data, vocabulary
+of 5-15 keywords:
+
+- **Push-to-talk path (no VAD challenges):** ~92-96 % keyword
+  accuracy in quiet environments, ~85-90 % in moderate noise (cafe,
+  office)
+- **Always-on with VAD (v2 future):** ~85-92 % accuracy depending on
+  noise and false-wake rate
+- **Per-user training:** lifts accuracy 5-10 % at the cost of an
+  onboarding flow
+
+### Effort estimate
+
+- PDM driver integration (Zephyr has it native, Seeed has tutorial):
+  ~2-3 days
+- Audio capture pipeline + MFCC frontend (Edge Impulse generated):
+  ~2-3 days
+- KWS model training: ~3-5 days of data collection across keywords
+  + user accents (Edge Impulse mobile recorder collects samples
+  with cloud training)
+- Context state machine in firmware: ~2-3 days
+- BLE custom characteristic + GATT extension: ~1-2 days
+- Phone-app binding table + UX (app-side, separate from band):
+  parallel work
+- Testing and tuning across environments: ~5-7 days
+
+**Total band-side: ~2-3 weeks.**
+
+### Honest limitations
+
+- **Wakeword false positives** -- "volume" might fire when watching
+  TV news (mention of "volume"); push-to-talk gating mostly avoids
+  this by requiring a band-tap first
+- **Background noise** -- KWS accuracy drops in noisy environments;
+  per-user training and increased confidence threshold help
+- **Multi-keyword conflict** -- if two contexts have similar-sounding
+  keywords, classifier may confuse them; vocabulary design matters
+- **Onboarding friction** -- user has to learn the keyword set; this
+  is a UX challenge more than a technical one
+- **Privacy perception** -- a "listening wearable" raises concerns
+  even if listening is gated to short windows; clearly communicate
+  push-to-talk model to users
+
+---
+
 ## 7. Implementation roadmap
 
 Cumulative effort assumes each row builds on every row above.
@@ -392,10 +631,12 @@ mobile recorder.
 | **2** | **Air mouse cursor + IMU-only pinch click** (Doublepoint-class) | MEDIUM | **+2-3 weeks** | Gyro integration + Edge Impulse pinch model | Cursor smooth <30 s; pinch 82-88 % |
 | **3** | **Surface touchpad mode** (wrist on desk + LSM6 retuned tap + cursor reuse) | LOW-MEDIUM | **+3-5 days** | Reuses #0 cursor + retuned tap thresholds | Cursor jittery; clicks reliable |
 | **4** | **Custom macro gestures** (wrist flick, twist, shake) | LOW-MEDIUM | **+3-5 days** | MCU-side threshold + duration classifier | ~90 % with tuning |
-| **5** | **PPG-fused pinch** (Apple-tier approach) | MEDIUM-HIGH | **+2-3 weeks** | Add PPG features to Edge Impulse model + retrain | 88-94 % pinch (lift from #2) |
-| **6** | **Multi-gesture vocabulary** (clench, double-pinch, finger flick, ...) | HIGH | **+3-6 weeks** | Edge Impulse broader gesture set + per-user fine-tune | 75-92 % varies by gesture |
+| **5** | **Voice-activated context state machine** (push-to-talk KWS + context binding) | MEDIUM-HIGH | **+2-3 weeks** | nRF52840 PDM peripheral + Edge Impulse KWS model + custom GATT char | KWS 88-95 % closed vocabulary; mode router gates voice power |
+| **6** | **PPG-fused pinch** (Apple-tier approach) | MEDIUM-HIGH | **+2-3 weeks** | Add PPG features to Edge Impulse model + retrain | 88-94 % pinch (lift from #2) |
+| **7** | **Multi-gesture vocabulary** (clench, double-pinch, finger flick, ...) | HIGH | **+3-6 weeks** | Edge Impulse broader gesture set + per-user fine-tune | 75-92 % varies by gesture |
 
-**Total to ship all three use cases at usable quality: 8-12 weeks.**
+**Total to ship all three use cases + voice context at usable
+quality: 11-15 weeks.**
 
 ### Phase milestones
 
@@ -404,23 +645,39 @@ mobile recorder.
 - **End of Week 3**: items 0-3 shipping.  All three use cases have v1
   functionality at usable-but-not-great quality.  This is the
   earliest "demoable" point.
-- **End of Week 5**: items 4-5 shipping.  Pinch accuracy at Apple-
-  tier numbers via PPG fusion.  Macro gestures available.
-- **End of Week 12**: item 6 shipping.  Broader gesture vocabulary
+- **End of Week 5**: items 4 shipping.  Custom macro gestures
+  available.
+- **End of Week 7-8**: item 5 shipping.  Voice context layer
+  live -- band feels intent-aware ("say a word + do a gesture").
+  This is the **defining product moment** that distinguishes us
+  from any IMU-only gesture band on the market.
+- **End of Week 10**: item 6 shipping.  Pinch accuracy at
+  Apple-tier numbers via PPG fusion.
+- **End of Week 15**: item 7 shipping.  Broader gesture vocabulary
   trained against real user data.
 
 ### Long pole: data collection
 
 The technical work is fast.  The bottleneck is **labelled training
-data**.  Realistic minimums:
+data**, for both gestures (items 2, 5/PPG, 6) and keywords (item 5/
+voice).  Realistic minimums:
 
-- **Per gesture, basic model:** ~200-500 samples, ~30 min collection
-- **Per gesture, excellent model:** ~1000-2000 samples, ~2 hours
-- **Multi-user generalization:** multiply by user count
+**For gestures:**
+- Per gesture, basic model: ~200-500 samples, ~30 min collection
+- Per gesture, excellent model: ~1000-2000 samples, ~2 hours
+- Multi-user generalization: multiply by user count
 
-Edge Impulse's mobile recorder app collects + labels samples by
-having the user perform the gesture on cue.  No special equipment.
-Plan for ~30 minutes of focused data collection per gesture per phase.
+**For keywords (KWS):**
+- Per keyword, basic model: ~50-100 utterances per speaker, ~10-15
+  minutes collection per speaker
+- Per keyword, multi-speaker model: ~50 utterances × 10+ speakers
+  = 500+ samples per keyword
+- Background "negative class": ~30 minutes of varied ambient audio
+
+Edge Impulse's mobile recorder app collects + labels samples for
+both modalities (IMU on the band, audio via phone mic / band mic).
+No special equipment.  Plan for ~30 minutes per gesture per phase
+and ~15 minutes per keyword per speaker.
 
 ---
 
@@ -436,6 +693,8 @@ Plan for ~30 minutes of focused data collection per gesture per phase.
 | **Gesture mode active (continuous)** | ~5-7 mA | ~30 hours | ~75 hours |
 | **Gesture mode triggered (5 min sessions)** | ~150-300 µA avg | weeks | weeks |
 | **Gesture-chip-only (waiting for trigger)** | ~150 µA | months | months |
+| **Voice mode active (3-5 s push-to-talk windows)** | adds ~1-3 mA during window only | minimal averaged impact | minimal averaged impact |
+| **Voice always-on (NOT recommended)** | adds ~1-3 mA continuous | <2 days | ~3-5 days |
 
 ### Implications
 
@@ -468,24 +727,32 @@ machine architecture and reuses the same power-control primitives
       |
       +-> [1] Chip gestures
       |
-      +-> [2] Air mouse + IMU pinch ---> [5] PPG-fused pinch
-      |                                       |
+      +-> [2] Air mouse + IMU pinch ---> [6] PPG-fused pinch
+      |                                        |
       +-> [3] Surface mode (reuses [0] cursor + [1] tap)
       |
       +-> [4] Macro gestures (reuses [0] mode FSM)
-                                              |
-                                              v
-                                  [6] Broader gesture set
+      |
+      +-> [5] Voice context (needs [0] action router + custom GATT)
+                                                 |
+                                                 v
+                                    [7] Broader gesture set
 ```
 
 Dependencies:
 
 - **Item 0 unblocks everything else.**  Build it first.
 - **Items 1, 2, 3, 4 are parallelizable** after item 0.
-- **Item 5 needs item 2 working** (extends the same model).
-- **Item 6 needs items 2 + 5** (extends the same model further).
+- **Item 5 (voice) needs only item 0** -- the action router and
+  custom GATT characteristic.  Can be built in parallel with
+  items 2-4.  Most product impact for the effort.
+- **Item 6 needs item 2 working** (extends the same gesture model).
+- **Item 7 needs items 2 + 6** (extends the same gesture model
+  further).
 
 Items 1, 3, 4 are each days of work and can be batched with item 0.
+Item 5 (voice) is the next-biggest product lever after item 2 and
+can run in parallel with item 6.
 
 ---
 
@@ -568,6 +835,28 @@ meaningful inference speedup.
 - [BLE Peripheral HIDS mouse -- nRF52840 MDK USB Dongle](https://wiki.makerdiary.com/nrf52840-mdk-usb-dongle/guides/ncs/samples/ble/peripheral_hids_mouse/)
 - [BLE mouse example for NRF52840 (denisgav GitHub)](https://github.com/denisgav/nrf52840_ble_mouse)
 - [Nordic Q&A: HID mouse functionality with iOS on nRF52840 Dongle](https://devzone.nordicsemi.com/f/nordic-q-a/115855/inquiry-on-hid-mouse-functionality-with-ios-on-nordic-nrf52840-dongle)
+
+### Voice-activated context / Keyword spotting (KWS)
+
+- [PDM Usage for XIAO nRF52840 Sense (Seeed Studio Wiki)](https://wiki.seeedstudio.com/XIAO-BLE-Sense-PDM-Usage/)
+- [Speech Recognition based on Edge Impulse (Seeed Studio Wiki)](https://wiki.seeedstudio.com/XIAO-BLE-PDM-EI/)
+- [XIAO nRF52840 Sense Speech Recognition with Edge Impulse (Bruno Santos / Medium)](https://medium.com/@feiticeir0/xiao-nrf52840-sense-speech-recognition-with-edge-impulse-cc1d9911109)
+- [Edge Impulse end-to-end keyword spotting tutorial](https://docs.edgeimpulse.com/tutorials/end-to-end/keyword-spotting)
+- [TinyML Made Easy: KeyWord Spotting (Hackster.io)](https://www.hackster.io/mjrobot/tinyml-made-easy-keyword-spotting-kws-5fa6e7)
+- [TinyML: Wake Word Detection (Hackster.io)](https://www.hackster.io/zy43/tinyml-wake-word-detection-c28b82)
+- [Wake Word Detection technical overview (Arun Baby)](https://www.arunbaby.com/speech-tech/0040-wake-word-detection/)
+- [Keyword Spotting and Voice Wake Word (SiliconWit Edge AI / TinyML)](https://siliconwit.com/education/edge-ai-tinyml/keyword-spotting-voice-wake-word/)
+- [TinyML Platforms Benchmarking (arXiv 2112.01319)](https://arxiv.org/pdf/2112.01319)
+
+### Multimodal voice + gesture interaction (research / patents)
+
+- [Enabling Voice-Accompanying Hand-to-Face Gesture Recognition with Cross-Device Sensing (CHI 2023)](https://dl.acm.org/doi/10.1145/3544548.3581008)
+- [GazePointAR: A Context-Aware Multimodal Voice Assistant (CHI 2024)](https://dl.acm.org/doi/10.1145/3613904.3642230)
+- [Transmodal input fusion for a wearable system (US patent 11,983,823)](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/11983823)
+- [Transmodal input fusion for a wearable system (US patent 10,861,242)](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10861242)
+- [Multimodal task execution and text editing for a wearable system (US patent 11,960,636)](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/11960636)
+- [Providing a context related view with a wearable apparatus (US patent 10,409,464)](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10409464)
+- [Designing Multimodal AI Interfaces: Voice, Vision & Gestures (Fuselab Creative)](https://fuselabcreative.com/designing-multimodal-ai-interfaces-interactive/)
 
 ### Edge Impulse / TinyML on Cortex-M4
 
