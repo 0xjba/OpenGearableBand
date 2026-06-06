@@ -19,6 +19,7 @@
 #include "power_ctrl.h"
 #include "gesture_mode.h"
 #include "ble_hid.h"
+#include "cursor_pipeline.h"
 #include <zephyr/settings/settings.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -458,6 +459,13 @@ static const struct device *console_uart =
 // because a stray "old" value just delays the action by one poll cycle.
 static volatile uint8_t pending_cmd = 0;
 
+// Serial-console "mouse test mode" -- set by the 'm' command.  While
+// active, WASD inject cursor deltas, 1/2 generate clicks, comma/period
+// scroll.  Lets us prove the cursor pipeline + HID + host integration
+// end-to-end before Item 2 wires gyro tracking.  Any unrecognized char
+// in this mode exits back to normal command parsing.
+static volatile bool mouse_test_active = false;
+
 static void uart_rx_cb(const struct device *dev, void *user_data) {
     ARG_UNUSED(user_data);
     if (!uart_irq_update(dev)) {
@@ -468,10 +476,32 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
     }
     uint8_t c;
     while (uart_fifo_read(dev, &c, 1) == 1) {
+        // Mouse-test commands intercept the byte stream when active.
+        // We do the injections directly here at ISR context because
+        // cursor_pipeline_inject_* takes a mutex and the mutex is
+        // safe-but-not-recommended from ISRs.  Use a small "pending
+        // motion command" code that the reset thread will consume in
+        // thread context.
+        if (mouse_test_active) {
+            switch (c) {
+            case 'w': case 'W': pending_cmd = 'w'; continue;
+            case 'a': case 'A': pending_cmd = 'a'; continue;
+            case 's': case 'S': pending_cmd = 's'; continue;
+            case 'd': case 'D': pending_cmd = 'd'; continue;
+            case '1':           pending_cmd = '1'; continue;
+            case '2':           pending_cmd = '2'; continue;
+            case ',':           pending_cmd = ','; continue;
+            case '.':           pending_cmd = '.'; continue;
+            case 'm': case 'M': pending_cmd = 'M'; continue;  // exit
+            default: continue;  // ignore newlines / unknown
+            }
+        }
         if (c == 'r' || c == 'R') {
             pending_cmd = 'r';
         } else if (c == 'b' || c == 'B') {
             pending_cmd = 'b';
+        } else if (c == 'm' || c == 'M') {
+            pending_cmd = 'm';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -494,7 +524,12 @@ void reset_thread_entry(void *, void *, void *) {
     }
     uart_irq_rx_enable(console_uart);
 
-    LOG_INF("Serial console armed: 'r'=reboot, 'b'=enter UF2 bootloader");
+    LOG_INF("Serial console armed: 'r'=reboot, 'b'=enter UF2 bootloader, "
+            "'m'=mouse test (wasd=move, 1/2=click, ,/.=scroll, m again to exit)");
+
+    /* Per-step cursor delta for the mouse-test injects.  10 pixels
+     * per press gives a clearly visible cursor jump on the host. */
+    const float MOUSE_TEST_STEP = 10.0f;
 
     while (1) {
         uint8_t cmd = pending_cmd;
@@ -516,6 +551,53 @@ void reset_thread_entry(void *, void *, void *) {
             NRF_POWER->GPREGRET = 0x57;
             sys_reboot(SYS_REBOOT_COLD);
             // not reached
+        } else if (cmd == 'm') {
+            pending_cmd = 0;
+            mouse_test_active = true;
+            // Force mode to AIR_MOUSE so the cursor pipeline accepts
+            // and publishes our injected deltas regardless of wrist
+            // orientation.  Manual mode override is fine for testing.
+            gesture_mode_set(MODE_AIR_MOUSE);
+            LOG_INF("Mouse test ENABLED (mode forced AIR_MOUSE).  "
+                    "wasd=move, 1=left, 2=right, ,=scroll up, "
+                    ".=scroll down, m=exit");
+        } else if (cmd == 'M') {
+            pending_cmd = 0;
+            mouse_test_active = false;
+            gesture_mode_set(MODE_IDLE);
+            LOG_INF("Mouse test DISABLED (mode -> IDLE)");
+        } else if (cmd == 'w') {
+            pending_cmd = 0;
+            cursor_pipeline_inject_motion(0.0f, -MOUSE_TEST_STEP);
+            LOG_INF("mouse test: up");
+        } else if (cmd == 's') {
+            pending_cmd = 0;
+            cursor_pipeline_inject_motion(0.0f, +MOUSE_TEST_STEP);
+            LOG_INF("mouse test: down");
+        } else if (cmd == 'a') {
+            pending_cmd = 0;
+            cursor_pipeline_inject_motion(-MOUSE_TEST_STEP, 0.0f);
+            LOG_INF("mouse test: left");
+        } else if (cmd == 'd') {
+            pending_cmd = 0;
+            cursor_pipeline_inject_motion(+MOUSE_TEST_STEP, 0.0f);
+            LOG_INF("mouse test: right");
+        } else if (cmd == '1') {
+            pending_cmd = 0;
+            LOG_INF("mouse test: LEFT click");
+            cursor_pipeline_click(BLE_HID_BTN_LEFT);
+        } else if (cmd == '2') {
+            pending_cmd = 0;
+            LOG_INF("mouse test: RIGHT click");
+            cursor_pipeline_click(BLE_HID_BTN_RIGHT);
+        } else if (cmd == ',') {
+            pending_cmd = 0;
+            cursor_pipeline_inject_scroll(+1.0f);
+            LOG_INF("mouse test: scroll up");
+        } else if (cmd == '.') {
+            pending_cmd = 0;
+            cursor_pipeline_inject_scroll(-1.0f);
+            LOG_INF("mouse test: scroll down");
         }
         k_sleep(K_MSEC(50));
     }
@@ -949,6 +1031,11 @@ int main(void) {
     // start, are owned by the power state machine (it transitions
     // into IDLE on boot, which configures both).
     motion_wake_init();
+
+    // Start the cursor publish thread.  Idle until the gesture mode
+    // transitions into a cursor-bearing mode (AIR_MOUSE or SURFACE),
+    // so this is safe to start unconditionally at boot.
+    cursor_pipeline_init();
 
     // From this point on, the power state machine thread (started
     // automatically by K_THREAD_DEFINE) drives all sensor power and
