@@ -58,18 +58,40 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 #define DOMINANCE_RATIO             1.3f
 
 /*
- * Raise-to-air trigger: orientation must transition NEUTRAL -> UP_RAISED
- * and dwell for RAISE_DWELL_SAMPLES before mode auto-changes.
+ * Cooldown window after exiting AIR_MOUSE via orientation-drop.
+ * During this window, raising the wrist back into AIR_MOUSE pose
+ * auto-re-engages without requiring another double-tap.  Outside
+ * this window, an explicit double-tap is required.
  *
- * 50 samples = 500 ms.  Short enough to feel responsive, long enough
- * that a casual wrist movement does not accidentally enter AIR_MOUSE.
+ * 300 samples = 3 s at 100 Hz acquisition rate.  Long enough to
+ * accommodate brief arm-down moments (sip of coffee, scratch nose);
+ * short enough that "I'm done air-mousing" intent is respected.
  */
-#define RAISE_DWELL_SAMPLES         50
+#define AIR_MOUSE_COOLDOWN_SAMPLES  300
 
 /*
- * Flat-to-surface trigger: same idea but longer dwell because we
- * don't want every "rest my hand on the desk" moment to enter
- * surface mode.  100 samples = 1 s.
+ * Orientation dwell required during cooldown to re-engage.  Shorter
+ * than the cold-start raise dwell because the user already signalled
+ * intent recently.  50 samples = 500 ms.
+ */
+#define COOLDOWN_REENGAGE_DWELL     50
+
+/*
+ * Dwell required for orientation-drop exit from AIR_MOUSE.  Pose
+ * must NOT be UP_RAISED for this many consecutive samples before we
+ * transition out.  50 samples = 500 ms tolerates brief unintentional
+ * tilts without bouncing out of the mode.
+ */
+#define AIR_MOUSE_EXIT_DWELL        50
+
+/*
+ * Flat-to-surface trigger: keep the original orientation-driven path
+ * since SURFACE mode wasn't part of the double-tap-only discussion.
+ * Subject to revision once the user calibrates real gravity vectors
+ * for "palm on desk" and the team decides if SURFACE should also be
+ * double-tap-gated for consistency.
+ *
+ * 100 samples = 1 s.
  */
 #define FLAT_DWELL_SAMPLES          100
 
@@ -105,8 +127,14 @@ static WristOrientation orientation_candidate = WRIST_NEUTRAL;
 static int orientation_candidate_dwell = 0;
 
 /* Trigger gesture dwell counters. */
-static int raise_dwell = 0;
+static int raise_dwell = 0;          /* used during cooldown re-engage */
 static int flat_dwell = 0;
+static int exit_dwell = 0;           /* non-UP_RAISED dwell while in AIR_MOUSE */
+
+/* AIR_MOUSE cooldown: after an orientation-drop exit, allow quick
+ * re-engage via raise-pose alone for AIR_MOUSE_COOLDOWN_SAMPLES.
+ * Decremented every accel sample. */
+static int air_mouse_cooldown_remaining = 0;
 
 /* Wrist-flick state. */
 static int flick_burst_samples_remaining = 0;
@@ -226,6 +254,7 @@ static void _transition_to(GestureMode new_mode)
      * starts cleanly. */
     raise_dwell = 0;
     flat_dwell = 0;
+    exit_dwell = 0;
 }
 
 /*
@@ -244,6 +273,8 @@ void gesture_mode_init(void)
     orientation_candidate_dwell = 0;
     raise_dwell = 0;
     flat_dwell = 0;
+    exit_dwell = 0;
+    air_mouse_cooldown_remaining = 0;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -291,24 +322,67 @@ void gesture_mode_update_accel(float ax, float ay, float az)
                 (double)gx_filt, (double)gy_filt, (double)gz_filt);
     }
 
-    /* --- Trigger gestures --- */
+    /* --- Mode-transition logic --- */
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
 
-    /* Raise-to-air-mouse: must be in IDLE, see UP_RAISED, dwell. */
+    /* Decrement AIR_MOUSE cooldown each sample.  Once it hits 0, the
+     * orientation-only re-engage path is closed and the user has to
+     * deliberately double-tap to re-enter AIR_MOUSE. */
+    if (air_mouse_cooldown_remaining > 0) {
+        air_mouse_cooldown_remaining--;
+    }
+
+    /* AIR_MOUSE entry from IDLE:
+     *   PRIMARY:   gesture_mode_on_chip_double_tap() (called from the
+     *              LSM6DSL chip-event GPIO callback, or the serial 't'
+     *              test command).  Pose-agnostic; explicit user intent.
+     *   SECONDARY: orientation goes to UP_RAISED + short dwell, but
+     *              ONLY when the cooldown window is open (i.e. we
+     *              recently left AIR_MOUSE due to an orientation drop
+     *              and the user is bringing the band back up).  This
+     *              avoids requiring a double-tap for brief tactical
+     *              "lowered for 1 s, raising again" sequences.
+     */
     if (current_mode == MODE_IDLE &&
+        air_mouse_cooldown_remaining > 0 &&
         orientation_current == WRIST_UP_RAISED) {
-        if (raise_dwell < RAISE_DWELL_SAMPLES) {
+        if (raise_dwell < COOLDOWN_REENGAGE_DWELL) {
             raise_dwell++;
-            if (raise_dwell == RAISE_DWELL_SAMPLES) {
+            if (raise_dwell == COOLDOWN_REENGAGE_DWELL) {
+                LOG_INF("Cooldown re-engage: %d ms remaining when fired",
+                        air_mouse_cooldown_remaining * 10);
                 _transition_to(MODE_AIR_MOUSE);
+                air_mouse_cooldown_remaining = 0;
             }
         }
     } else {
         raise_dwell = 0;
     }
 
-    /* Flat-to-surface: must be in IDLE, see DOWN_FLAT, dwell. */
+    /* AIR_MOUSE exit via orientation drop:
+     * Pose is no longer UP_RAISED for AIR_MOUSE_EXIT_DWELL samples
+     * straight -> transition back to IDLE and start the cooldown
+     * window. */
+    if (current_mode == MODE_AIR_MOUSE &&
+        orientation_current != WRIST_UP_RAISED) {
+        if (exit_dwell < AIR_MOUSE_EXIT_DWELL) {
+            exit_dwell++;
+            if (exit_dwell == AIR_MOUSE_EXIT_DWELL) {
+                LOG_INF("AIR_MOUSE exit: orientation dropped, "
+                        "starting %d ms re-engage cooldown",
+                        AIR_MOUSE_COOLDOWN_SAMPLES * 10);
+                _transition_to(MODE_IDLE);
+                air_mouse_cooldown_remaining = AIR_MOUSE_COOLDOWN_SAMPLES;
+            }
+        }
+    } else {
+        exit_dwell = 0;
+    }
+
+    /* SURFACE entry: keep the original DOWN_FLAT-dwell path for now.
+     * Subject to revision once we decide whether SURFACE should also
+     * require a double-tap for consistency with AIR_MOUSE. */
     if (current_mode == MODE_IDLE &&
         orientation_current == WRIST_DOWN_FLAT) {
         if (flat_dwell < FLAT_DWELL_SAMPLES) {
@@ -368,16 +442,28 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
 void gesture_mode_on_chip_double_tap(void)
 {
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
-    /* Semantics: double-tap from IDLE does nothing (the orientation
-     * triggers handle that).  Double-tap from any other mode cancels
-     * back to IDLE -- the user's "get me out of this" panic button.
-     * This is intentionally aggressive; users can re-enter modes
-     * with the orientation triggers easily. */
-    if (current_mode != MODE_IDLE) {
-        LOG_INF("Chip double-tap -- cancelling current mode to IDLE");
-        _transition_to(MODE_IDLE);
+    /* Toggle semantics:
+     *   IDLE -> AIR_MOUSE       (primary intentional entry)
+     *   AIR_MOUSE -> IDLE       (intentional exit, clears cooldown)
+     *   SURFACE -> IDLE         (same -- band returns to neutral)
+     *   GESTURE_AMBIENT -> IDLE (future-proofing)
+     *
+     * The user picked double-tap as the deliberate trigger because
+     * the air-mouse pose, while distinctive, can occur in normal
+     * activities (drawing on a whiteboard, pointing at a screen,
+     * etc.) and shouldn't accidentally hijack their device.
+     */
+    if (current_mode == MODE_IDLE) {
+        LOG_INF("Chip double-tap from IDLE -- entering AIR_MOUSE");
+        _transition_to(MODE_AIR_MOUSE);
+        air_mouse_cooldown_remaining = 0;  /* explicit entry skips cooldown */
     } else {
-        LOG_INF("Chip double-tap (in IDLE, no-op)");
+        LOG_INF("Chip double-tap from %s -- exiting to IDLE (no cooldown)",
+                _mode_str(current_mode));
+        _transition_to(MODE_IDLE);
+        /* Explicit exit -- no cooldown.  User wanted out, give them
+         * out.  They can re-enter via a fresh double-tap. */
+        air_mouse_cooldown_remaining = 0;
     }
 }
 
@@ -404,4 +490,16 @@ const char *gesture_mode_str(GestureMode mode)
 const char *wrist_orientation_str(WristOrientation o)
 {
     return _orientation_str(o);
+}
+
+void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz)
+{
+    if (out_gx) *out_gx = gx_filt;
+    if (out_gy) *out_gy = gy_filt;
+    if (out_gz) *out_gz = gz_filt;
+}
+
+int gesture_mode_get_air_mouse_cooldown_remaining(void)
+{
+    return air_mouse_cooldown_remaining;
 }

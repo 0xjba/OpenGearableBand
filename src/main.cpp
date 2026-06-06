@@ -502,6 +502,18 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             pending_cmd = 'b';
         } else if (c == 'm' || c == 'M') {
             pending_cmd = 'm';
+        } else if (c == 'g' || c == 'G') {
+            // Calibration helper: dump the current filtered gravity
+            // vector so the user can hold the band in a pose, type 'g',
+            // and capture the (gx, gy, gz) reading for orientation-
+            // classifier tuning.
+            pending_cmd = 'g';
+        } else if (c == 't' || c == 'T') {
+            // Stage 1 stand-in for the LSM6DSL chip-embedded double-
+            // tap event.  Lets us verify the FSM (entry, exit, cooldown
+            // re-engage) over serial before Stage 2 wires the real
+            // chip event into the GPIO callback.
+            pending_cmd = 't';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -524,8 +536,11 @@ void reset_thread_entry(void *, void *, void *) {
     }
     uart_irq_rx_enable(console_uart);
 
-    LOG_INF("Serial console armed: 'r'=reboot, 'b'=enter UF2 bootloader, "
-            "'m'=mouse test (wasd=move, 1/2=click, ,/.=scroll, m again to exit)");
+    LOG_INF("Serial console armed:");
+    LOG_INF("  'r'=reboot   'b'=UF2 bootloader");
+    LOG_INF("  'g'=dump current gravity vector (pose calibration)");
+    LOG_INF("  't'=simulate chip double-tap (toggle AIR_MOUSE / IDLE)");
+    LOG_INF("  'm'=force mouse test mode (wasd=move, 1/2=click, ,/.=scroll, m again exits)");
 
     /* Per-step cursor delta for the mouse-test injects.  10 pixels
      * per press gives a clearly visible cursor jump on the host. */
@@ -598,6 +613,24 @@ void reset_thread_entry(void *, void *, void *) {
             pending_cmd = 0;
             cursor_pipeline_inject_scroll(-1.0f);
             LOG_INF("mouse test: scroll down");
+        } else if (cmd == 'g') {
+            pending_cmd = 0;
+            float gx, gy, gz;
+            gesture_mode_get_gravity(&gx, &gy, &gz);
+            LOG_INF("CALIBRATION g=[%.3f, %.3f, %.3f]  "
+                    "magnitudes=[%.2f %.2f %.2f]  "
+                    "orientation=%s  mode=%s  cooldown=%d ms",
+                    (double)gx, (double)gy, (double)gz,
+                    (double)(gx >= 0 ? gx : -gx),
+                    (double)(gy >= 0 ? gy : -gy),
+                    (double)(gz >= 0 ? gz : -gz),
+                    wrist_orientation_str(gesture_mode_get_orientation()),
+                    gesture_mode_str(gesture_mode_get()),
+                    gesture_mode_get_air_mouse_cooldown_remaining() * 10);
+        } else if (cmd == 't') {
+            pending_cmd = 0;
+            LOG_INF("Simulating chip double-tap event");
+            gesture_mode_on_chip_double_tap();
         }
         k_sleep(K_MSEC(50));
     }

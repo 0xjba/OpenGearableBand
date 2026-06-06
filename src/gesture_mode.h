@@ -157,6 +157,24 @@ WristOrientation gesture_mode_get_orientation(void);
 const char *gesture_mode_str(GestureMode mode);
 const char *wrist_orientation_str(WristOrientation o);
 
+/*
+ * Calibration helper: read the current filtered gravity vector.
+ * Used by the serial 'g' test command to dump the live reading so
+ * the user can hold the band in their intended pose and capture the
+ * (gx, gy, gz) triplet to update the orientation classifier mapping.
+ *
+ * Values are in m/s^2.  Caller passes non-NULL out_* pointers.
+ */
+void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz);
+
+/*
+ * Diagnostic: cooldown samples remaining (each sample = 10 ms at
+ * 100 Hz acquisition).  Zero means cooldown is closed and the user
+ * must double-tap to re-enter AIR_MOUSE; nonzero means the
+ * orientation-only re-engage path is still open.
+ */
+int gesture_mode_get_air_mouse_cooldown_remaining(void);
+
 #ifdef __cplusplus
 }
 #endif

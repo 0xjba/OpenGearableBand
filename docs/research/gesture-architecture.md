@@ -36,6 +36,17 @@ during build-out.
 >   brightness / youtube / music / presentation) is a starting
 >   point.  Real vocabulary will depend on which apps the phone-
 >   side team prioritizes and what users actually want.
+> - END-OF-SESSION UX for the air-mouse pose: the current Item 0
+>   build exits AIR_MOUSE on orientation-drop (wrist below armrest
+>   level) with a 3 s cooldown re-engage window.  Long-term UX
+>   needs deeper thought: how do we handle session boundaries
+>   when the user is briefly distracted vs genuinely done?  Does
+>   a long cursor-inactivity timer make sense as an additional
+>   exit path?  Should the cooldown window vary based on recent
+>   activity (e.g. shorter cooldown if user just air-moused for
+>   30 s straight, longer if they were mid-gesture)?  Defer this
+>   investigation until we have hands-on user testing data;
+>   document the eventual design here when it lands.
 
 ---
 
