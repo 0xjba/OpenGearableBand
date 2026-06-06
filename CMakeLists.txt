@@ -9,4 +9,5 @@ target_sources(app PRIVATE
     src/WearableDSP.cpp
     src/power_ctrl.cpp
     src/gesture_mode.cpp
+    src/ble_hid.cpp
 )

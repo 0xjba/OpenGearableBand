@@ -18,6 +18,8 @@
 #include "WearableDSP.h"
 #include "power_ctrl.h"
 #include "gesture_mode.h"
+#include "ble_hid.h"
+#include <zephyr/settings/settings.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
@@ -156,11 +158,19 @@ static void acq_timer_handler(struct k_timer *) {
 K_TIMER_DEFINE(acq_timer, acq_timer_handler, NULL);
 
 // Bluetooth Advertisement Data
+//
+// Primary advertising payload lists the HRS, BAS, and HIDS service UUIDs
+// so hosts can filter on whichever they care about during discovery.
+// Fitness apps look for HRS (0x180D), hosts pairing as mouse look for
+// HIDS (0x1812).  We have 31 bytes of payload available; three 16-bit
+// UUIDs in BT_DATA_UUID16_ALL cost 8 bytes (1 type + 1 len + 3 x 2 UUID)
+// plus 3 bytes for the flags = 11 bytes total.  Plenty of room.
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA_BYTES(BT_DATA_UUID16_ALL,
                   BT_UUID_16_ENCODE(BT_UUID_HRS_VAL),
-                  BT_UUID_16_ENCODE(BT_UUID_BAS_VAL)),
+                  BT_UUID_16_ENCODE(BT_UUID_BAS_VAL),
+                  BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL)),
 };
 
 static const struct bt_data sd[] = {
@@ -174,12 +184,33 @@ static void bt_ready(int err) {
     }
     LOG_INF("Bluetooth initialized");
 
+    // Load any previously-stored bonded-host keys.  Required for the
+    // HID service (which insists on encrypted/bonded pairing); the
+    // existing HRS doesn't require it but doesn't object either.
+    if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+        int sl_err = settings_load();
+        if (sl_err) {
+            LOG_WRN("settings_load failed (err %d) -- continuing without "
+                    "persisted bonds", sl_err);
+        }
+    }
+
+    // Register the HID mouse service.  The GATT service definition is
+    // installed automatically by BT_GATT_SERVICE_DEFINE; this call
+    // gives the module a hook for future runtime state init and logs
+    // the registration so traces show the service came up.
+    int hid_err = ble_hid_init();
+    if (hid_err) {
+        LOG_ERR("HID init failed (err %d)", hid_err);
+        /* Continue anyway -- HRS still works without HID. */
+    }
+
     err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
     if (err) {
         LOG_ERR("Advertising failed to start (err %d)", err);
         return;
     }
-    LOG_INF("Advertising successfully started");
+    LOG_INF("Advertising successfully started (HRS + BAS + HIDS)");
 }
 
 // --- 100Hz Data Acquisition Thread --- //
