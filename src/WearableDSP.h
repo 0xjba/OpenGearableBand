@@ -179,11 +179,14 @@ private:
     bool checkSQI(float* ppg_data);
     MotionState getMotionState(float* imu_data);
     float runAutocorrelation(float* ppg);
-    // runFFT performs spectral exclusion via the dynamic imu_shadow_mask
-    // populated by the most recent findStrideBin() call (any bin >= 3x
-    // the IMU spectrum's in-band mean, widened by +/-1).  The stride_bin
-    // parameter is no longer used for shadowing; it's retained so the
-    // caller can log the detected stride alongside the FFT result.
+    // runFFT performs HYBRID spectral exclusion:
+    //   * dynamic imu_shadow_mask (populated by findStrideBin) shadows
+    //     any bin where IMU FFT magnitude >= 3x in-band mean (+/-1),
+    //   * AND predictive shadows at stride+/-1, stride/3+/-1, and
+    //     2*stride+/-2 -- catches the PPG's biomechanical 2x harmonic
+    //     which the IMU's own 2x doesn't strongly mirror.
+    // Pass stride_bin <= 0 to disable predictive shadowing (the
+    // dynamic mask still runs).
     float runFFT(float* ppg, int stride_bin);
     // Chained 3-stage NLMS: cleans X-, Y-, then Z-correlated motion
     // from the PPG and FFTs the residual.  imu_x / imu_y / imu_z must

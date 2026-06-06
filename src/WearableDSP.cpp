@@ -388,27 +388,69 @@ float WearableDSP::runAutocorrelation(float* ppg) {
 }
 
 float WearableDSP::runFFT(float* ppg, int stride_bin) {
-    (void)stride_bin;  // retained in signature for log-side diagnostics;
-                       // shadowing is now driven by imu_shadow_mask, which
-                       // findStrideBin populated from the IMU spectrum.
-
     arm_rfft_fast_f32(&fft_inst, ppg, fft_output, 0);
     arm_cmplx_mag_f32(fft_output, fft_magnitudes, BUFFER_SIZE / 2);
 
     int min_idx = (int)(0.6f * BUFFER_SIZE / SAMPLE_RATE);
     int max_idx = (int)(3.33f * BUFFER_SIZE / SAMPLE_RATE);
 
-    // Spectral exclusion: skip any bin that the IMU FFT flagged as a
-    // significant motion peak (>= 3x in-band mean, widened to +/-1).
-    // See the long comment in findStrideBin for the rationale; the
-    // shadow mask is rebuilt each window.  If findStrideBin wasn't
-    // called this window (autocorr path), runFFT also isn't called,
-    // so there's no stale-mask hazard.
+    // Hybrid spectral exclusion: dynamic IMU mask + predictive harmonic
+    // mask.  Each catches what the other misses.
+    //
+    // The dynamic mask (imu_shadow_mask, populated by findStrideBin)
+    // is REACTIVE -- it only shadows bins where the IMU FFT magnitude
+    // exceeded 3x the in-band mean.  Good for catching the stride
+    // fundamental and anything the IMU itself sees clearly.
+    //
+    // But the PPG has a strong 2x stride harmonic from biomechanical
+    // doubling -- foot strike asymmetry, wrist flexion at heel strike,
+    // and optical blood-volume doubling at each pulse-coupling event.
+    // The IMU's OWN 2x harmonic does NOT mirror this at comparable
+    // strength because the kinematic 2x is weaker than the optical 2x.
+    // Sprint trace in v0.3: stride=8 detected stably, but PPG FFT
+    // picked bins 14-17 (2x stride zone) every window while IMU 2x
+    // at bin 16 stayed below 3x mean and was NOT shadowed.  Kalman
+    // stuck at 85 while Apple Watch read 130-138 -- raws were
+    // 164/175/187/199 BPM, all in the 2x stride cluster.
+    //
+    // So we ALSO shadow predictively, regardless of what the IMU shows:
+    //   stride       +/-1  -- IMU fundamental + leakage skirt
+    //   stride/3     +/-1  -- sub-harmonic from breathing / nonlinear
+    //                         pickup (observed in earlier jogging trace
+    //                         with stride=13, picks at bin 4)
+    //   2*stride     +/-2  -- biomechanical 2x.  +/-2 because stride
+    //                         detection bounces +/-1 window-to-window
+    //                         AND rectangular-window leakage spreads
+    //                         each peak +/-1-2 bins; the product means
+    //                         2x of stride+/-1 already lives in +/-2
+    //                         of nominal.
+    //
+    // stride_bin <= 0 disables the predictive masks.  In practice
+    // runFFT is only called from the NLMS path, which always has a
+    // stride detected, so this is just defensive.
+    int sub_bin = (stride_bin > 0) ? (stride_bin / 3) : -1;
+    int x2_bin  = (stride_bin > 0) ? (stride_bin * 2) : -1;
+
     float max_val = 0;
     int max_idx_found = 0;
 
     for (int i = min_idx; i <= max_idx; i++) {
+        // Dynamic mask: whatever the IMU FFT lit up.
         if (imu_shadow_mask & (1U << i)) {
+            continue;
+        }
+        // Predictive masks: shadowed regardless of IMU strength
+        // because the PPG sees these even when the IMU doesn't.
+        if (stride_bin > 0 &&
+            i >= stride_bin - 1 && i <= stride_bin + 1) {
+            continue;
+        }
+        if (sub_bin > 0 &&
+            i >= sub_bin - 1 && i <= sub_bin + 1) {
+            continue;
+        }
+        if (x2_bin > 0 &&
+            i >= x2_bin - 2 && i <= x2_bin + 2) {
             continue;
         }
         if (fft_magnitudes[i] > max_val) {
