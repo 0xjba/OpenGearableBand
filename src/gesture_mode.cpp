@@ -37,28 +37,23 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 #define ORIENTATION_DWELL_SAMPLES   25
 
 /*
- * Threshold for declaring an axis "dominant" in the gravity vector.
- *
- * Gravity is ~9.81 m/s^2 total.  Requiring one axis to carry at
- * least 5.0 m/s^2 (~51 % of gravity) accommodates the natural tilt
- * of a wrist-mounted device -- the dominant axis rarely lines up
- * cleanly with gravity (the wrist is at an angle, not flat against
- * gravity).  Field bring-up showed values of 6.97-7.82 on the same
- * intentional pose, bouncing across a higher threshold; 5.0 is
- * permissive enough to absorb that variation.
- *
- * Combined with DOMINANCE_RATIO below so the "dominant" axis still
- * has to be meaningfully larger than its neighbours -- prevents
- * classifying ambiguous "wrist held vertical" poses incorrectly.
- */
-#define DOMINANT_AXIS_THRESHOLD_MS2 5.0f
-
-/*
  * The dominant axis must be at least this many times larger than the
  * next-largest axis to count as truly dominant.  1.3x ~ 30 % gap.
+ *
  * Without this, a pose like (4.5, 4.5, 6.0) would be classified as
  * Z-dominant; with it, three-axis-balanced poses correctly resolve
  * to NEUTRAL.
+ *
+ * NOTE on the lack of an absolute magnitude threshold:
+ *   Earlier versions also gated on the dominant axis's absolute
+ *   magnitude.  The threshold value (5.0 m/s^2) was a guess at "how
+ *   tilted does a pose have to be to count as intentional?" and
+ *   dropping it in favour of just the ratio is more principled --
+ *   the ratio answers the right question ("is one axis meaningfully
+ *   larger than the others?") without picking an arbitrary number.
+ *   Gravity always sums to ~9.81 m/s^2 in magnitude; the ratio
+ *   handles balanced poses correctly regardless of where along the
+ *   tilt-from-vertical spectrum the wrist is.
  */
 #define DOMINANCE_RATIO             1.3f
 
@@ -78,14 +73,6 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
  */
 #define FLAT_DWELL_SAMPLES          100
 
-/*
- * Auto-exit from cursor modes back to IDLE when the wrist returns
- * to a NEUTRAL orientation.  Same UX pattern as Apple Watch raise-
- * to-wake (raise to enter, lower to dismiss).  100 samples = 1 s
- * to give the user time to perform a click etc. before exiting just
- * because they tilted their wrist briefly.
- */
-#define RETURN_TO_NEUTRAL_SAMPLES   100
 
 /*
  * Wrist-flick cancel trigger: gyro magnitude burst followed by
@@ -120,7 +107,6 @@ static int orientation_candidate_dwell = 0;
 /* Trigger gesture dwell counters. */
 static int raise_dwell = 0;
 static int flat_dwell = 0;
-static int return_to_neutral_dwell = 0;
 
 /* Wrist-flick state. */
 static int flick_burst_samples_remaining = 0;
@@ -191,13 +177,11 @@ static WristOrientation _classify_orientation(float gx, float gy, float gz)
         second_mag = (ax >= ay) ? ax : ay;
     }
 
-    /* Largest axis below absolute threshold -> ambiguous tilt, NEUTRAL.
-     * Also NEUTRAL if no axis is clearly dominant over the others
+    /* NEUTRAL when no axis is clearly dominant over the others
      * (DOMINANCE_RATIO gate -- prevents 3-way-balanced poses from
-     * being mis-classified to whichever is fractionally largest). */
-    if (largest_mag < DOMINANT_AXIS_THRESHOLD_MS2) {
-        return WRIST_NEUTRAL;
-    }
+     * being mis-classified to whichever is fractionally largest).
+     * No absolute magnitude threshold by design -- see DOMINANCE_RATIO
+     * comment for rationale. */
     if (second_mag > 0.0f && largest_mag < DOMINANCE_RATIO * second_mag) {
         return WRIST_NEUTRAL;
     }
@@ -242,7 +226,6 @@ static void _transition_to(GestureMode new_mode)
      * starts cleanly. */
     raise_dwell = 0;
     flat_dwell = 0;
-    return_to_neutral_dwell = 0;
 }
 
 /*
@@ -261,7 +244,6 @@ void gesture_mode_init(void)
     orientation_candidate_dwell = 0;
     raise_dwell = 0;
     flat_dwell = 0;
-    return_to_neutral_dwell = 0;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -337,22 +319,6 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         }
     } else {
         flat_dwell = 0;
-    }
-
-    /* Auto-exit cursor modes when orientation returns to NEUTRAL and
-     * dwells.  Apple-Watch-style raise-to-wake -> lower-to-dismiss
-     * UX.  Does NOT apply to MODE_GESTURE_AMBIENT (no cursor) or
-     * MODE_IDLE (already there). */
-    if ((current_mode == MODE_AIR_MOUSE || current_mode == MODE_SURFACE) &&
-        orientation_current == WRIST_NEUTRAL) {
-        if (return_to_neutral_dwell < RETURN_TO_NEUTRAL_SAMPLES) {
-            return_to_neutral_dwell++;
-            if (return_to_neutral_dwell == RETURN_TO_NEUTRAL_SAMPLES) {
-                _transition_to(MODE_IDLE);
-            }
-        }
-    } else {
-        return_to_neutral_dwell = 0;
     }
 }
 
