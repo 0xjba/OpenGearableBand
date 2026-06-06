@@ -291,6 +291,90 @@ the next.
 
 ---
 
+---
+
+## Stage 5+ — non-HR features parked here for future work
+
+These aren't HR-pipeline optimizations but live on the same IMU
+acquisition path, share the same MCU budget, and need to be tracked
+somewhere.  Filed here so they don't get lost; promote to their own
+doc if/when they grow.
+
+### A. Step counting
+
+**What:** count user steps over time, publish via BLE.
+
+**Hardware:** LSM6DS3TR-C has a **built-in pedometer** that runs on
+the chip with effectively zero MCU cost.  Steps accumulate in
+internal registers; we just read them periodically.
+
+**Effort:** 3-5 days.  Enable the pedometer register, set up a
+periodic read, publish to BLE (could reuse battery service pattern
+or add a custom characteristic).
+
+**Accuracy:** chip-pedometer is typically ±2-5 % over a day for
+normal walking.  Less accurate during running or unusual gaits;
+adequate for casual fitness use.
+
+**Notes:** would NOT conflict with our existing significant-motion
+INT1 routing -- pedometer counter accumulates independently.  No
+algorithmic decisions to make here, it's pure integration work.
+
+### B. Activity classification
+
+**What:** classify user state as sitting / standing / walking /
+running / cycling / other.  Publish on transitions via BLE so the
+app can update context (workout type detection, sedentary alerts,
+sleep onset signal).
+
+**Approach:** IMU-side classifier on accel+gyro features.
+
+- **Option B1:** simple threshold-based classifier on accel variance
+  + frequency content (same SMV we already compute).  Distinguishes
+  stationary / walking / running cleanly.  Cycling is harder
+  (lower-amplitude periodic motion).  **Effort: 1-2 weeks.**
+
+- **Option B2:** Edge Impulse trained classifier with broader
+  activity set (sitting vs standing, biking, swimming-prep, etc.).
+  **Effort: 2-3 weeks** including data collection.
+
+**Hardware:** runs on Cortex-M4 in either option.  No chip-embedded
+activity classifier in LSM6DS3TR-C (that's newer LSM6DSOX with the
+ML core).  We classify in MCU.
+
+**Accuracy expectation:** Option B1 ~85-90 % on the common 3-4
+classes.  Option B2 ~90-95 % across a broader class set per
+published wrist-IMU classifier work.
+
+**Dependency:** would feed the gesture mode machine (Use Case 1/2/3
+from the gesture roadmap) -- knowing the user is walking vs sitting
+helps decide when gesture detection should be active vs muted.
+Build activity classification BEFORE shipping gesture v2 for this
+reason.
+
+### C. Posture detection (sub-feature of activity)
+
+**What:** standing / sitting / lying-down.  Useful for sleep
+detection and sedentary alerts.
+
+**Approach:** gravity vector orientation from accel + recent motion
+history.
+
+**Effort:** 3-5 days.
+
+**Accuracy:** ~90 % typical for the three classes.
+
+### D. Future IMU features (placeholder list)
+
+Tracked but not yet investigated:
+- Fall detection (LSM6 has free-fall interrupt; would need
+  follow-up confirmation logic)
+- Sleep onset / wake detection (HR + IMU stillness combined)
+- Posture-change alerts (long sit detection)
+- Hand-wash detection (motion pattern + duration heuristic)
+
+---
+
 ## Sources
 
 Listed by which stage they primarily support.
