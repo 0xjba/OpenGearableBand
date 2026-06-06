@@ -58,25 +58,25 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 #define DOMINANCE_RATIO             1.3f
 
 /*
- * Cooldown window after exiting AIR_MOUSE via orientation-drop.
- * During this window, raising the wrist back into AIR_MOUSE pose
- * auto-re-engages without requiring another double-tap.  Outside
- * this window, an explicit double-tap is required.
+ * Cooldown window after exiting a cursor mode via orientation-drop.
+ * During this window, returning to the same mode's pose auto-re-
+ * engages without requiring another tap trigger.  Outside this
+ * window, an explicit tap is required.
  *
- * Sized for the realistic case of a user actively using AIR_MOUSE
- * who lowers their arm to rest a fatigued deltoid / forearm, then
- * comes back to keep using it.  Shoulder fatigue recovery during
- * sustained sub-shoulder-height pointing is roughly 15-30 s; 2000
- * samples = 20 s at 100 Hz lands in the middle of that range.
+ * Sized for the realistic case of a user actively using a cursor
+ * mode who steps away briefly (rest a fatigued arm for AIR_MOUSE;
+ * lift hand off the desk for SURFACE) then comes back.  Shoulder
+ * fatigue recovery during sustained sub-shoulder-height pointing is
+ * roughly 15-30 s; 2000 samples = 20 s at 100 Hz lands in the middle
+ * of that range and works for both modes.
  *
- * Tradeoff: too short and a tired user has to re-double-tap to
- * resume.  Too long and an unrelated wrist raise (typing, drinking
- * coffee) accidentally re-engages.  The 500 ms raise-dwell on the
- * cooldown re-engage path (COOLDOWN_REENGAGE_DWELL) protects
- * against casual movements regardless of cooldown length, so we
- * lean toward "longer" here.
+ * Tradeoff: too short and a tired user has to re-tap to resume.
+ * Too long and an unrelated movement (lifting hand to drink coffee,
+ * etc.) accidentally re-engages.  The 500 ms re-engage dwell
+ * (COOLDOWN_REENGAGE_DWELL) protects against casual movements
+ * regardless of cooldown length, so we lean toward "longer" here.
  */
-#define AIR_MOUSE_COOLDOWN_SAMPLES  2000
+#define CURSOR_COOLDOWN_SAMPLES     2000
 
 /*
  * Orientation dwell required during cooldown to re-engage.  Shorter
@@ -86,45 +86,42 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 #define COOLDOWN_REENGAGE_DWELL     50
 
 /*
- * Dwell required for orientation-drop exit from AIR_MOUSE.  Pose
- * must NOT be UP_RAISED for this many consecutive samples before we
- * transition out.  50 samples = 500 ms tolerates brief unintentional
- * tilts without bouncing out of the mode.
+ * Dwell required for orientation-drop exit from a cursor mode.  Pose
+ * must NOT be the mode's expected one (UP_RAISED for AIR_MOUSE,
+ * DOWN_FLAT for SURFACE) for this many consecutive samples before
+ * the FSM transitions out.  50 samples = 500 ms tolerates brief
+ * unintentional tilts without bouncing out of the mode.
+ *
+ * Same value for both modes -- the tolerance for "did the user
+ * actually move out of pose" doesn't depend on which mode we're in.
  */
-#define AIR_MOUSE_EXIT_DWELL        50
+#define CURSOR_EXIT_DWELL           50
 
 /*
- * Entry-grace window after AIR_MOUSE is entered while NOT already in
- * the raised pose.  The user has this many samples to raise their
- * wrist; if they don't, the FSM bounces back to IDLE without ever
+ * Entry-grace window after a cursor mode is entered while NOT already
+ * in the expected pose.  The user has this many samples to assume
+ * the pose (raise into UP_RAISED for AIR_MOUSE, place wrist flat for
+ * SURFACE); if they don't, the FSM bounces back to IDLE without ever
  * having armed exit detection.
  *
  * Sized to accommodate the natural human reaction time + orientation
  * dwell + comfortable margin:
- *   - Press double-tap: ~0 ms
- *   - Initiate arm raise: 200-400 ms
- *   - Arm reaches raised position: 500-1000 ms
- *   - Orientation classifier dwell to register UP_RAISED: 250 ms
- *   - Margin for slow / hesitant movement, getting comfortable in
- *     the pose, etc.
+ *   - Press trigger: ~0 ms
+ *   - Initiate movement: 200-400 ms
+ *   - Reach pose: 500-1000 ms
+ *   - Orientation classifier dwell to register the new pose: 250 ms
+ *   - Margin for slow / hesitant movement
  *
- * 500 samples = 5 s at 100 Hz.  Generous enough that a user who
- * needs to reposition their hand or adjust the band still makes it
- * in; short enough that a forgotten double-tap doesn't pin the band
- * in AIR_MOUSE.
+ * 500 samples = 5 s at 100 Hz.  Same window for both modes -- both
+ * require comparable time for a user to deliberately assume the pose
+ * after pressing the entry trigger.
  */
-#define AIR_MOUSE_ENTRY_GRACE       500
+#define CURSOR_ENTRY_GRACE          500
 
-/*
- * Flat-to-surface trigger: keep the original orientation-driven path
- * since SURFACE mode wasn't part of the double-tap-only discussion.
- * Subject to revision once the user calibrates real gravity vectors
- * for "palm on desk" and the team decides if SURFACE should also be
- * double-tap-gated for consistency.
- *
- * 100 samples = 1 s.
- */
-#define FLAT_DWELL_SAMPLES          100
+/* (Previously: FLAT_DWELL_SAMPLES = 100 -- auto-triggered SURFACE
+ * mode from DOWN_FLAT pose dwell.  Removed: user feedback established
+ * SURFACE entry is explicit via triple-tap, matching the AIR_MOUSE
+ * double-tap entry pattern, so no orientation auto-trigger.) */
 
 
 /*
@@ -158,40 +155,53 @@ static WristOrientation orientation_candidate = WRIST_NEUTRAL;
 static int orientation_candidate_dwell = 0;
 
 /* Trigger gesture dwell counters. */
-static int raise_dwell = 0;          /* used during cooldown re-engage */
-static int flat_dwell = 0;
-static int exit_dwell = 0;           /* non-UP_RAISED dwell while in AIR_MOUSE */
+/* Re-engage-dwell counter used during the cursor-mode cooldown to
+ * detect the user holding the expected pose long enough to re-engage
+ * the previously-active cursor mode.  Counts up while orientation
+ * matches the cooldown's mode's expected pose. */
+static int reengage_dwell = 0;
 
-/* AIR_MOUSE cooldown: after an orientation-drop exit, allow quick
- * re-engage via raise-pose alone for AIR_MOUSE_COOLDOWN_SAMPLES.
- * Decremented every accel sample. */
-static int air_mouse_cooldown_remaining = 0;
+/* Counts non-expected-pose samples while in a cursor mode.  When it
+ * hits CURSOR_EXIT_DWELL, FSM exits to IDLE + starts cooldown. */
+static int cursor_exit_dwell = 0;
 
-/* "Has the user actually reached the UP_RAISED pose since entering
- * AIR_MOUSE?"  Reset on every transition INTO AIR_MOUSE; set the
- * first time orientation becomes UP_RAISED after that.
+/* Cooldown after a cursor mode exits via orientation-drop.  During
+ * the cooldown window, the user can return to the same mode by
+ * holding the expected pose for COOLDOWN_REENGAGE_DWELL samples --
+ * no fresh trigger required.  Outside the cooldown, an explicit
+ * double-tap (AIR_MOUSE) / triple-tap (SURFACE) is needed.
  *
- * Purpose: the user's natural sequence is double-tap-then-raise, not
- * raise-then-double-tap.  Without this flag, exit_dwell starts
- * counting immediately on AIR_MOUSE entry while the wrist is still
- * wherever it was (desk, by side, etc.).  500 ms later the FSM
- * exits before the user has had a chance to raise their arm.
- *
- * With this flag, exit detection only arms after we've SEEN the
- * raised pose at least once.  If the user never raises within the
- * AIR_MOUSE_ENTRY_GRACE window (see entry_grace_remaining), the FSM
- * bounces back to IDLE without ever having armed the exit dwell --
- * prevents the band sitting in AIR_MOUSE indefinitely if the user
- * pressed the entry trigger and got distracted. */
-static bool air_mouse_has_been_raised = false;
+ * cooldown_remaining: samples remaining; decremented every accel
+ *                     sample.  0 = window closed.
+ * cooldown_mode:      which mode to re-engage when the re-engage
+ *                     dwell completes.  Tracks the last cursor
+ *                     mode that exited via orientation drop. */
+static int cursor_cooldown_remaining = 0;
+static GestureMode cursor_cooldown_mode = MODE_IDLE;
 
-/* Counts down from AIR_MOUSE_ENTRY_GRACE on every accel sample while
- * we're in AIR_MOUSE AND haven't yet reached the raised pose.  Hits
- * zero -> the FSM bounces back to IDLE (no cooldown -- the user
- * never actually engaged, no point allowing quick re-engage).
+/* "Has the user actually reached the expected pose since entering
+ * the current cursor mode?"  Reset on every transition INTO a cursor
+ * mode; set the first time orientation matches the mode's expected
+ * pose after that.
  *
- * Loaded with AIR_MOUSE_ENTRY_GRACE on entry-from-non-raised; loaded
- * with 0 on entry-from-already-raised (no grace needed). */
+ * Purpose: the natural sequence is "press trigger -> assume pose,"
+ * not "be in pose -> press trigger."  Without this latch the exit
+ * dwell would start counting immediately on entry while the user
+ * is still in whatever pose they were in.  500 ms later the FSM
+ * exits before the user has had a chance to reach the pose.
+ *
+ * With this latch, exit detection only arms after we've SEEN the
+ * expected pose at least once.  If the user never reaches it
+ * within the CURSOR_ENTRY_GRACE window (see entry_grace_remaining),
+ * the FSM bounces back to IDLE without ever arming exit dwell --
+ * prevents the band sitting in a cursor mode indefinitely if the
+ * user pressed the entry trigger and got distracted. */
+static bool cursor_has_reached_pose = false;
+
+/* Counts down from CURSOR_ENTRY_GRACE on every accel sample while
+ * we're in a cursor mode AND haven't yet reached the expected pose.
+ * Hits zero -> the FSM bounces back to IDLE (no cooldown -- the user
+ * never engaged, no point allowing quick re-engage). */
 static int entry_grace_remaining = 0;
 
 /* Acquisition-request callback registered by main.cpp. */
@@ -334,44 +344,49 @@ static void _transition_to(GestureMode new_mode)
             _mode_str(old), _mode_str(new_mode));
     /* Reset dwell counters on every transition so the next trigger
      * starts cleanly. */
-    raise_dwell = 0;
-    flat_dwell = 0;
-    exit_dwell = 0;
+    reengage_dwell = 0;
+    cursor_exit_dwell = 0;
 
-    /* Manage the AIR_MOUSE entry-grace state machine.
+    /* Manage the cursor-mode entry-grace state machine.  Same logic
+     * for AIR_MOUSE and SURFACE -- only the "expected pose" varies.
      *
-     * Entering AIR_MOUSE while already in UP_RAISED:
-     *   - has_been_raised set TRUE immediately (no grace needed)
+     * Entering a cursor mode while already in the expected pose:
+     *   - cursor_has_reached_pose = TRUE immediately
      *   - entry_grace_remaining = 0 (never counts down)
      *   - exit detection armed right away
      *
-     * Entering AIR_MOUSE from any other orientation (desk, hanging,
-     * etc.):
-     *   - has_been_raised FALSE; will be set the first time the user
-     *     actually raises into the pose
-     *   - entry_grace_remaining loaded with AIR_MOUSE_ENTRY_GRACE;
-     *     if it counts down to zero without the user raising, the
-     *     FSM bounces back to IDLE
+     * Entering from any other orientation:
+     *   - cursor_has_reached_pose = FALSE; set when orientation matches
+     *   - entry_grace_remaining loaded with CURSOR_ENTRY_GRACE;
+     *     if it counts down to zero without the user reaching the pose,
+     *     the FSM bounces back to IDLE
      *
-     * Leaving AIR_MOUSE (any cause):
-     *   - has_been_raised cleared
-     *   - entry_grace_remaining cleared (irrelevant outside AIR_MOUSE)
+     * Leaving a cursor mode (any cause):
+     *   - cursor_has_reached_pose cleared
+     *   - entry_grace_remaining cleared
      */
-    if (new_mode == MODE_AIR_MOUSE) {
-        air_mouse_has_been_raised =
-            (orientation_current == WRIST_UP_RAISED);
-        if (air_mouse_has_been_raised) {
+    if (_mode_needs_continuous_imu(new_mode)) {
+        WristOrientation expected =
+            (new_mode == MODE_AIR_MOUSE) ? WRIST_UP_RAISED
+                                         : WRIST_DOWN_FLAT;
+        cursor_has_reached_pose = (orientation_current == expected);
+        const char *mode_str = _mode_str(new_mode);
+        const char *pose_str =
+            (new_mode == MODE_AIR_MOUSE) ? "raised wrist (palm-facing)"
+                                         : "flat wrist (palm-down)";
+        if (cursor_has_reached_pose) {
             entry_grace_remaining = 0;
-            LOG_INF("AIR_MOUSE entered while already raised -- "
-                    "exit detection armed immediately");
+            LOG_INF("%s entered while already in %s pose -- "
+                    "exit detection armed immediately",
+                    mode_str, pose_str);
         } else {
-            entry_grace_remaining = AIR_MOUSE_ENTRY_GRACE;
-            LOG_INF("AIR_MOUSE entered -- raise your wrist within %d ms "
-                    "to engage, or it auto-exits to IDLE",
-                    AIR_MOUSE_ENTRY_GRACE * 10);
+            entry_grace_remaining = CURSOR_ENTRY_GRACE;
+            LOG_INF("%s entered -- assume %s pose within %d ms to "
+                    "engage, or it auto-exits to IDLE",
+                    mode_str, pose_str, CURSOR_ENTRY_GRACE * 10);
         }
     } else {
-        air_mouse_has_been_raised = false;
+        cursor_has_reached_pose = false;
         entry_grace_remaining = 0;
     }
 
@@ -399,11 +414,11 @@ void gesture_mode_init(void)
     orientation_current = WRIST_NEUTRAL;
     orientation_candidate = WRIST_NEUTRAL;
     orientation_candidate_dwell = 0;
-    raise_dwell = 0;
-    flat_dwell = 0;
-    exit_dwell = 0;
-    air_mouse_cooldown_remaining = 0;
-    air_mouse_has_been_raised = false;
+    reengage_dwell = 0;
+    cursor_exit_dwell = 0;
+    cursor_cooldown_remaining = 0;
+    cursor_cooldown_mode = MODE_IDLE;
+    cursor_has_reached_pose = false;
     entry_grace_remaining = 0;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
@@ -459,102 +474,95 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     /* Decrement AIR_MOUSE cooldown each sample.  Once it hits 0, the
      * orientation-only re-engage path is closed and the user has to
      * deliberately double-tap to re-enter AIR_MOUSE. */
-    if (air_mouse_cooldown_remaining > 0) {
-        air_mouse_cooldown_remaining--;
+    if (cursor_cooldown_remaining > 0) {
+        cursor_cooldown_remaining--;
     }
 
-    /* AIR_MOUSE entry from IDLE:
-     *   PRIMARY:   gesture_mode_on_chip_double_tap() (called from the
-     *              LSM6DSL chip-event GPIO callback, or the serial 't'
-     *              test command).  Pose-agnostic; explicit user intent.
-     *   SECONDARY: orientation goes to UP_RAISED + short dwell, but
-     *              ONLY when the cooldown window is open (i.e. we
-     *              recently left AIR_MOUSE due to an orientation drop
-     *              and the user is bringing the band back up).  This
-     *              avoids requiring a double-tap for brief tactical
-     *              "lowered for 1 s, raising again" sequences.
-     */
+    /* Helper: which orientation does the given cursor mode expect? */
+    auto expected_pose_for = [](GestureMode m) -> WristOrientation {
+        return (m == MODE_AIR_MOUSE) ? WRIST_UP_RAISED : WRIST_DOWN_FLAT;
+    };
+
+    /* Cooldown re-engage: in IDLE with cooldown open, the user
+     * holding the previously-active mode's expected pose for
+     * COOLDOWN_REENGAGE_DWELL re-enters that mode without a fresh
+     * trigger.  This covers "I was using AIR_MOUSE, briefly lowered
+     * to rest, raising again" and the analogous SURFACE case. */
     if (current_mode == MODE_IDLE &&
-        air_mouse_cooldown_remaining > 0 &&
-        orientation_current == WRIST_UP_RAISED) {
-        if (raise_dwell < COOLDOWN_REENGAGE_DWELL) {
-            raise_dwell++;
-            if (raise_dwell == COOLDOWN_REENGAGE_DWELL) {
-                LOG_INF("Cooldown re-engage: %d ms remaining when fired",
-                        air_mouse_cooldown_remaining * 10);
-                _transition_to(MODE_AIR_MOUSE);
-                air_mouse_cooldown_remaining = 0;
+        cursor_cooldown_remaining > 0 &&
+        cursor_cooldown_mode != MODE_IDLE &&
+        orientation_current == expected_pose_for(cursor_cooldown_mode)) {
+        if (reengage_dwell < COOLDOWN_REENGAGE_DWELL) {
+            reengage_dwell++;
+            if (reengage_dwell == COOLDOWN_REENGAGE_DWELL) {
+                LOG_INF("Cooldown re-engage (%s): %d ms remaining when fired",
+                        _mode_str(cursor_cooldown_mode),
+                        cursor_cooldown_remaining * 10);
+                GestureMode target = cursor_cooldown_mode;
+                cursor_cooldown_remaining = 0;
+                _transition_to(target);
             }
         }
     } else {
-        raise_dwell = 0;
+        reengage_dwell = 0;
     }
 
-    /* Arm the "has been raised" latch the first time orientation
-     * actually becomes UP_RAISED while in AIR_MOUSE.  The exit-dwell
-     * check below only runs when this latch is true -- the user has
-     * the entry_grace_remaining window to raise their wrist before
-     * the FSM concludes they're not engaging and bounces back to
-     * IDLE. */
-    if (current_mode == MODE_AIR_MOUSE &&
-        orientation_current == WRIST_UP_RAISED &&
-        !air_mouse_has_been_raised) {
-        air_mouse_has_been_raised = true;
+    /* The remaining per-sample logic only matters while we're in a
+     * cursor mode.  Compute "what pose does the current mode expect"
+     * once and use it below. */
+    bool in_cursor_mode = (current_mode == MODE_AIR_MOUSE ||
+                           current_mode == MODE_SURFACE);
+    WristOrientation expected = in_cursor_mode
+        ? expected_pose_for(current_mode)
+        : WRIST_NEUTRAL;
+
+    /* Arm "has reached pose" latch the first time orientation matches
+     * the expected pose for the current cursor mode.  Exit detection
+     * below only runs when the latch is true -- the user has the
+     * entry_grace_remaining window to assume the pose. */
+    if (in_cursor_mode && !cursor_has_reached_pose &&
+        orientation_current == expected) {
+        cursor_has_reached_pose = true;
         entry_grace_remaining = 0;  /* engaged -- stop the timeout */
-        LOG_INF("AIR_MOUSE: raised pose reached -- exit detection armed");
+        LOG_INF("%s: expected pose reached -- exit detection armed",
+                _mode_str(current_mode));
     }
 
-    /* Entry-grace timeout: counts down while we're in AIR_MOUSE and
-     * the user hasn't yet reached the raised pose.  Hits zero -> the
-     * user pressed the entry trigger then got distracted / forgot;
-     * bounce back to IDLE so the band doesn't sit in AIR_MOUSE
-     * indefinitely.  No cooldown started because the user never
-     * actually engaged; they have to press double-tap again to retry. */
-    if (current_mode == MODE_AIR_MOUSE && !air_mouse_has_been_raised &&
+    /* Entry-grace timeout: counts down while in a cursor mode and
+     * the user hasn't reached the pose.  Hits zero -> bounce back to
+     * IDLE so the band doesn't sit in a cursor mode indefinitely.
+     * No cooldown started -- the user never actually engaged. */
+    if (in_cursor_mode && !cursor_has_reached_pose &&
         entry_grace_remaining > 0) {
         entry_grace_remaining--;
         if (entry_grace_remaining == 0) {
-            LOG_INF("AIR_MOUSE entry grace expired -- user never "
-                    "raised, exiting to IDLE");
+            LOG_INF("%s entry grace expired -- user never assumed "
+                    "pose, exiting to IDLE", _mode_str(current_mode));
             _transition_to(MODE_IDLE);
+            /* No cooldown -- explicit re-tap required */
         }
     }
 
-    /* AIR_MOUSE exit via orientation drop:
-     * Pose is no longer UP_RAISED for AIR_MOUSE_EXIT_DWELL samples
-     * straight -> transition back to IDLE and start the cooldown
-     * window.  Only runs after the user has been raised at least
-     * once -- prevents exiting before the user has assumed the pose. */
-    if (current_mode == MODE_AIR_MOUSE &&
-        air_mouse_has_been_raised &&
-        orientation_current != WRIST_UP_RAISED) {
-        if (exit_dwell < AIR_MOUSE_EXIT_DWELL) {
-            exit_dwell++;
-            if (exit_dwell == AIR_MOUSE_EXIT_DWELL) {
-                LOG_INF("AIR_MOUSE exit: orientation dropped, "
-                        "starting %d ms re-engage cooldown",
-                        AIR_MOUSE_COOLDOWN_SAMPLES * 10);
+    /* Exit via orientation drop: pose is no longer the expected one
+     * for CURSOR_EXIT_DWELL samples -> exit to IDLE and start the
+     * cooldown.  Only runs after the user has assumed the pose at
+     * least once. */
+    if (in_cursor_mode && cursor_has_reached_pose &&
+        orientation_current != expected) {
+        if (cursor_exit_dwell < CURSOR_EXIT_DWELL) {
+            cursor_exit_dwell++;
+            if (cursor_exit_dwell == CURSOR_EXIT_DWELL) {
+                LOG_INF("%s exit: orientation dropped, starting %d ms "
+                        "re-engage cooldown",
+                        _mode_str(current_mode),
+                        CURSOR_COOLDOWN_SAMPLES * 10);
+                cursor_cooldown_mode = current_mode;
+                cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
                 _transition_to(MODE_IDLE);
-                air_mouse_cooldown_remaining = AIR_MOUSE_COOLDOWN_SAMPLES;
             }
         }
     } else {
-        exit_dwell = 0;
-    }
-
-    /* SURFACE entry: keep the original DOWN_FLAT-dwell path for now.
-     * Subject to revision once we decide whether SURFACE should also
-     * require a double-tap for consistency with AIR_MOUSE. */
-    if (current_mode == MODE_IDLE &&
-        orientation_current == WRIST_DOWN_FLAT) {
-        if (flat_dwell < FLAT_DWELL_SAMPLES) {
-            flat_dwell++;
-            if (flat_dwell == FLAT_DWELL_SAMPLES) {
-                _transition_to(MODE_SURFACE);
-            }
-        }
-    } else {
-        flat_dwell = 0;
+        cursor_exit_dwell = 0;
     }
 }
 
@@ -620,11 +628,30 @@ void gesture_mode_on_chip_double_tap(void)
      */
     if (current_mode == MODE_IDLE) {
         LOG_INF("Chip double-tap from IDLE -- entering AIR_MOUSE");
+        cursor_cooldown_remaining = 0;  /* explicit entry skips cooldown */
+        cursor_cooldown_mode = MODE_IDLE;
         _transition_to(MODE_AIR_MOUSE);
-        air_mouse_cooldown_remaining = 0;  /* explicit entry skips cooldown */
     } else {
         LOG_INF("Chip double-tap from %s -- ignored (double-tap is "
                 "entry-only; exit by lowering the wrist)",
+                _mode_str(current_mode));
+    }
+}
+
+void gesture_mode_on_chip_triple_tap(void)
+{
+    GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
+    /* Triple-tap is the SURFACE ENTRY trigger ONLY.  Symmetric to
+     * double-tap: explicit, entry-only, exit by orientation.  Triple-
+     * tap while in any non-IDLE mode is a no-op (logged). */
+    if (current_mode == MODE_IDLE) {
+        LOG_INF("Chip triple-tap from IDLE -- entering SURFACE");
+        cursor_cooldown_remaining = 0;  /* explicit entry skips cooldown */
+        cursor_cooldown_mode = MODE_IDLE;
+        _transition_to(MODE_SURFACE);
+    } else {
+        LOG_INF("Chip triple-tap from %s -- ignored (triple-tap is "
+                "entry-only; exit by lifting the wrist off the surface)",
                 _mode_str(current_mode));
     }
 }
@@ -661,9 +688,9 @@ void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz)
     if (out_gz) *out_gz = gz_filt;
 }
 
-int gesture_mode_get_air_mouse_cooldown_remaining(void)
+int gesture_mode_get_cursor_cooldown_remaining(void)
 {
-    return air_mouse_cooldown_remaining;
+    return cursor_cooldown_remaining;
 }
 
 void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb)

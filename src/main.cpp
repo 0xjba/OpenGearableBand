@@ -543,6 +543,10 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // re-engage) over serial before Stage 2 wires the real
             // chip event into the GPIO callback.
             pending_cmd = 't';
+        } else if (c == 'y' || c == 'Y') {
+            // Stage 1 stand-in for triple-tap -- the SURFACE entry
+            // trigger.  Same Stage 2 deferral story as 't'.
+            pending_cmd = 'y';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -568,7 +572,8 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("Serial console armed:");
     LOG_INF("  'r'=reboot   'b'=UF2 bootloader");
     LOG_INF("  'g'=dump current gravity vector (pose calibration)");
-    LOG_INF("  't'=simulate chip double-tap (toggle AIR_MOUSE / IDLE)");
+    LOG_INF("  't'=simulate chip double-tap (AIR_MOUSE entry)");
+    LOG_INF("  'y'=simulate chip triple-tap (SURFACE entry)");
     LOG_INF("  'm'=force mouse test mode (wasd=move, 1/2=click, ,/.=scroll, m again exits)");
 
     /* Per-step cursor delta for the mouse-test injects.  10 pixels
@@ -678,11 +683,15 @@ void reset_thread_entry(void *, void *, void *) {
                     (double)(gz_raw >= 0 ? gz_raw : -gz_raw),
                     wrist_orientation_str(gesture_mode_get_orientation()),
                     gesture_mode_str(gesture_mode_get()),
-                    gesture_mode_get_air_mouse_cooldown_remaining() * 10);
+                    gesture_mode_get_cursor_cooldown_remaining() * 10);
         } else if (cmd == 't') {
             pending_cmd = 0;
             LOG_INF("Simulating chip double-tap event");
             gesture_mode_on_chip_double_tap();
+        } else if (cmd == 'y') {
+            pending_cmd = 0;
+            LOG_INF("Simulating chip triple-tap event");
+            gesture_mode_on_chip_triple_tap();
         }
         k_sleep(K_MSEC(50));
     }

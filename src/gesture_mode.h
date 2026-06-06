@@ -121,14 +121,27 @@ void gesture_mode_update_gyro(float gx, float gy, float gz);
 
 /*
  * Inform the mode detector that the LSM6DSL chip-embedded double-tap
- * interrupt fired.  Used to cycle modes or cancel current mode --
- * exact semantics defined in the .cpp implementation (typically:
- * double-tap from IDLE arms the next-trigger gesture; double-tap
- * from a cursor mode returns to IDLE).
+ * interrupt fired.  Double-tap is the AIR_MOUSE entry trigger -- the
+ * raised "drawing on whiteboard" pose.  Called from IDLE -> enters
+ * AIR_MOUSE.  Called from any non-IDLE state -> ignored (logged).
  *
- * Called from the GPIO INT1 callback in main.cpp.
+ * Called from the GPIO INT1 callback in main.cpp once Stage 2 wires
+ * the chip-embedded tap engine.  Stage 1 wires it to the serial 't'
+ * test command.
  */
 void gesture_mode_on_chip_double_tap(void);
+
+/*
+ * Inform the mode detector that a triple-tap was detected.  Triple-tap
+ * is the SURFACE entry trigger -- the wrist-on-desk "touchpad" pose.
+ * Called from IDLE -> enters SURFACE.  Called from any non-IDLE state
+ * -> ignored (logged).
+ *
+ * Once Stage 2 wires the chip-embedded tap engine, this fires from
+ * the GPIO INT callback in main.cpp.  Stage 1 wires it to the serial
+ * 'y' test command for FSM validation without the register work.
+ */
+void gesture_mode_on_chip_triple_tap(void);
 
 /*
  * Read the current mode.  Thread-safe (uses atomic_t internally).
@@ -173,7 +186,7 @@ void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz);
  * must double-tap to re-enter AIR_MOUSE; nonzero means the
  * orientation-only re-engage path is still open.
  */
-int gesture_mode_get_air_mouse_cooldown_remaining(void);
+int gesture_mode_get_cursor_cooldown_remaining(void);
 
 /*
  * Acquisition-request callback signature.  Registered by main.cpp
