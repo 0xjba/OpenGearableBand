@@ -189,10 +189,34 @@ private:
     // Reconcile autocorr and FFT picks for the STATIONARY path.
     // Returns the chosen BPM (or 0 to signal "hold Kalman") and writes
     // a confidence in [0, 1] to *out_confidence:
-    //   1.0  -- both methods agreed within +/-5 BPM (average returned)
+    //   1.0  -- both methods agreed within +/-10 BPM (average returned)
     //   0.5  -- one method silent / 2:1 ratio resolved (sub-harmonic case)
     //   0.0  -- disagree without explanation (caller should hold Kalman)
     float reconcileStationary(float bpm_ac, float bpm_fft, float *out_confidence);
+    // Harmonic-sum score for FFT bin K: fft_magnitudes[K] + [2K] + [3K].
+    // Out-of-range harmonic terms are omitted from the sum.  Real cardiac
+    // peaks show rich harmonic structure (2nd harmonic typically 30-70 %
+    // of fundamental in wrist PPG, 3rd often visible); IIR-ring artifacts
+    // and sub-harmonic peaks do not.  Required state: fft_magnitudes
+    // must hold the current window's FFT (populated by runStationaryFFT).
+    float harmonicScore(int K);
+    // Harmonic-structure post-check applied after reconcileStationary
+    // agrees on a candidate BPM.  Computes the harmonic-sum score for
+    // the bin matching the candidate vs the bin at 2x the candidate.
+    // If 2K's score is higher, the candidate was a sub-harmonic (cardiac
+    // is actually at 2K) -- return 2K's BPM.  Otherwise return the
+    // candidate unchanged.
+    //
+    // This is the documented commercial pattern (Apple US patents
+    // 10,736,575 / 11,744,520 / 10,123,746 -- "the metric is the sum of
+    // fundamental spectral peak, second harmonic peak and third harmonic
+    // peak").  Also the academic state-of-the-art (TROIKA / JOSS
+    // spectral peak tracking).  Catches the failure mode where BOTH
+    // autocorr and FFT agree on the sub-harmonic during the optical-
+    // baseline transient at the start of each snapshot -- the IIR rings
+    // at ~0.6 Hz creating coherent low-frequency content visible to
+    // both methods, but lacking the harmonic structure of real cardiac.
+    float applyHarmonicCheck(float candidate_bpm);
     // runFFT performs HYBRID spectral exclusion:
     //   * dynamic imu_shadow_mask (populated by findStrideBin) shadows
     //     any bin where IMU FFT magnitude >= 3x in-band mean (+/-1),

@@ -321,16 +321,34 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
                 //                                            (low noise
                 //                                            but methods
                 //                                            disagreed)
+            {
                 ac_bpm  = runAutocorrelation(ppg_buffer);
                 fft_bpm = runStationaryFFT(ppg_buffer);
                 raw_bpm = reconcileStationary(ac_bpm, fft_bpm, &stat_conf);
 
+                // STAGE-2 polish: harmonic-structure check.  Catches the
+                // case where BOTH methods agreed on the sub-harmonic --
+                // observed in snapshot-start traces where the optical
+                // baseline transient causes the IIR to ring at ~0.6 Hz,
+                // creating coherent low-frequency content visible to both
+                // autocorr and FFT but lacking real cardiac harmonic
+                // structure.  applyHarmonicCheck switches the pick to 2K
+                // if 2K shows richer harmonic content.  No-op otherwise.
+                // Only run when we'd actually commit the value (conf >=
+                // 0.4) -- pointless on hold-Kalman windows.
+                float adjusted_bpm = raw_bpm;
+                if (stat_conf >= 0.4f && raw_bpm > 0.0f) {
+                    adjusted_bpm = applyHarmonicCheck(raw_bpm);
+                }
+                bool harmonic_switched = (adjusted_bpm != raw_bpm);
+                raw_bpm = adjusted_bpm;
+
                 if (stat_conf >= 0.99f) {
                     kalman.r = 0.5f;          // high confidence
-                    path = "stat-agree";
+                    path = harmonic_switched ? "stat-h3" : "stat-agree";
                 } else if (stat_conf >= 0.4f) {
                     kalman.r = 2.0f;          // medium
-                    path = "stat-harm";
+                    path = harmonic_switched ? "stat-h3" : "stat-harm";
                 } else if (ppg_var > 5000.0f) {
                     // Both methods unconvinced AND signal is noisy.
                     // This is the original "settling" case -- hold.
@@ -343,6 +361,7 @@ float WearableDSP::processHeartRate(float* ppg_buffer,
                     path = "stat-hold";
                 }
                 break;
+            }
             case MICRO_MOTION:
                 // Plain FFT used to live here, but with the 0.6-3.3 Hz
                 // band-pass, any wrist motion at 1-3 Hz lands inside the
@@ -591,6 +610,55 @@ float WearableDSP::reconcileStationary(float bpm_ac, float bpm_fft,
 
     *out_confidence = 0.0f;
     return 0.0f;
+}
+
+float WearableDSP::harmonicScore(int K) {
+    int max_bin = BUFFER_SIZE / 2 - 1;
+    if (K < 1 || K > max_bin) return 0.0f;
+    float sum = fft_magnitudes[K];
+    int b2 = 2 * K;
+    int b3 = 3 * K;
+    if (b2 <= max_bin) sum += fft_magnitudes[b2];
+    if (b3 <= max_bin) sum += fft_magnitudes[b3];
+    return sum;
+}
+
+float WearableDSP::applyHarmonicCheck(float candidate_bpm) {
+    // Compute bin index from BPM (round to nearest).  bin * SR/N * 60 = BPM
+    // -> bin = BPM * N / (SR * 60).  Round via +0.5 trick.
+    int K = (int)(candidate_bpm * (float)BUFFER_SIZE
+                  / (SAMPLE_RATE * 60.0f) + 0.5f);
+
+    int min_idx = (int)(0.6f * BUFFER_SIZE / SAMPLE_RATE);
+    int max_idx = (int)(3.33f * BUFFER_SIZE / SAMPLE_RATE);
+
+    // If the candidate falls outside the cardiac search band, don't
+    // touch it (range gate downstream will reject it anyway).
+    if (K < min_idx || K > max_idx) return candidate_bpm;
+
+    // We only check upward (2K).  Checking K/2 would risk false-
+    // downgrading a real fundamental to its sub-harmonic and is rarely
+    // useful in the STATIONARY path -- our reconcileStationary already
+    // handles the "ac picked 2T while FFT picked T" case via the 2:1
+    // ratio rule.  The remaining failure mode is "both methods agreed
+    // on the sub-harmonic", which is unidirectional and what this check
+    // catches.
+    int bin_2K = 2 * K;
+    if (bin_2K < min_idx || bin_2K > max_idx) {
+        // 2K is out of cardiac band -> K must be the fundamental
+        return candidate_bpm;
+    }
+
+    float score_K  = harmonicScore(K);
+    float score_2K = harmonicScore(bin_2K);
+
+    if (score_2K > score_K) {
+        // Sub-harmonic detected: 2K has richer harmonic structure than K,
+        // so the real cardiac fundamental is at 2K and our candidate was
+        // the 2T peak.  Snap to 2K's BPM.
+        return (float)bin_2K * SAMPLE_RATE / (float)BUFFER_SIZE * 60.0f;
+    }
+    return candidate_bpm;
 }
 
 int WearableDSP::findStrideBin(float* imu_x, float* imu_y, float* imu_z) {
