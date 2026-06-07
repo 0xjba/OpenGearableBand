@@ -412,6 +412,56 @@ than "real touchpad."  Optimize for **discrete gestures** (taps,
 wrist-flick directions) rather than continuous cursor control.  This
 fits the hardware much better and avoids user-expectation mismatch.
 
+### SURFACE engagement model: imitate a real mouse
+
+The SURFACE mode FSM is engineered to behave the way a desktop mouse
+does, *not* the way an orientation-mode switch does.  The user's
+mental model when using a wrist on a desk is "I'm using a mouse",
+not "I'm activating a posture-mode."  The FSM therefore follows
+exactly the same sequence as a physical optical mouse:
+
+| Physical mouse phase | Our FSM equivalent |
+|---|---|
+| User intends to use the mouse | Triple-tap → `MODE_SURFACE` (intent signal) |
+| User places hand on mouse on desk | Wrist reaches DOWN_FLAT inside entry-grace → `cursor_has_reached_pose = true` + reference plane captured |
+| Hand moves left/right/forward/back on desk | Cursor pipeline (Item 2) publishes HID delta relative to captured reference plane |
+| User lifts mouse 1-2 cm to reposition | Wrist leaves DOWN_FLAT → exit dwell (~250 ms total) → exit to IDLE + 20 s cooldown |
+| User sets mouse back down within seconds | Wrist returns to DOWN_FLAT inside cooldown → re-engage SURFACE (no fresh triple-tap needed) |
+| User walks away from desk | Cooldown expires with no return → must triple-tap to re-enter |
+
+Three engineering choices fall out of this model:
+
+1. **Exit dwell is 0** (`SURFACE_EXIT_DWELL = 0` in `gesture_mode.cpp`).
+   The only delay between "wrist lifted" and "FSM exited" is the
+   inherent 250 ms orientation-classifier dwell.  Compare AIR_MOUSE
+   exit dwell of 500 ms: there, lowering the wrist is a deliberate
+   slow motion, so we add extra dwell to tolerate brief wobbles.
+   SURFACE lift, by contrast, must feel like an optical sensor
+   losing surface contact — instant.
+
+2. **Either lift OR drop counts as exit.**  The orientation classifier
+   only distinguishes DOWN_FLAT / UP_RAISED / NEUTRAL.  After
+   prolonged mouse use, a user might LOWER their hand to their lap
+   rather than LIFT it off the desk.  Both transitions land in
+   NEUTRAL and both trigger the same exit-and-cooldown path.  This
+   matches mouse-physical semantics: losing surface contact pauses
+   tracking, period — direction doesn't matter.
+
+3. **Reference plane captured at engagement.**  At the instant
+   `cursor_has_reached_pose` becomes true, the filtered gravity
+   vector is recorded as `cursor_reference_g[xyz]`.  Item 2's cursor
+   pipeline will compute deltas relative to this reference, so the
+   cursor responds to wrist motion *at desk level* rather than to
+   absolute angles.  Lifting then registers as "gravity vector left
+   the reference plane" — the mathematical version of the optical
+   sensor's binary surface-contact signal.  Item 0 captures the
+   reference but does not yet consume it.
+
+The cooldown is 20 s for both cursor modes.  That's the "stepped
+away briefly" window — long enough that the user can fetch coffee or
+glance at the door without losing context, short enough that drifting
+into other activities forces a deliberate re-engagement.
+
 ---
 
 ## 5. Use Case 2 detail -- air mouse
@@ -658,12 +708,21 @@ mobile recorder.
 | **2** | **Air mouse cursor + IMU-only pinch click** (Doublepoint-class) | MEDIUM | **+2-3 weeks** | Gyro integration + Edge Impulse pinch model | Cursor smooth <30 s; pinch 82-88 % |
 | **3** | **Surface touchpad mode** (wrist on desk + LSM6 retuned tap + cursor reuse) | LOW-MEDIUM | **+3-5 days** | Reuses #0 cursor + retuned tap thresholds | Cursor jittery; clicks reliable |
 | **4** | **Custom macro gestures** (wrist flick, twist, shake) | LOW-MEDIUM | **+3-5 days** | MCU-side threshold + duration classifier | ~90 % with tuning |
-| **5** | **Voice-activated context state machine** (push-to-talk KWS + context binding) | MEDIUM-HIGH | **+2-3 weeks** | nRF52840 PDM peripheral + Edge Impulse KWS model + custom GATT char | KWS 88-95 % closed vocabulary; mode router gates voice power |
-| **6** | **PPG-fused pinch** (Apple-tier approach) | MEDIUM-HIGH | **+2-3 weeks** | Add PPG features to Edge Impulse model + retrain | 88-94 % pinch (lift from #2) |
-| **7** | **Multi-gesture vocabulary** (clench, double-pinch, finger flick, ...) | HIGH | **+3-6 weeks** | Edge Impulse broader gesture set + per-user fine-tune | 75-92 % varies by gesture |
+| **5** | **Gesture-triggered live dictation** ("keyboard replacement" — snap + wrist-at-face pose → live STT → text injected at Mac cursor) | MEDIUM | **+2-3 weeks** | Omi-borrowed PDM + Opus + BLE audio GATT (firmware) + Voquill-forked Mac app + streaming STT (Deepgram Nova-3 BYOK in v0) | Transcription = vendor quality (~95 % clean audio); compound trigger false-positive target <1 % |
+| **6** | **Voice-activated context state machine** (push-to-talk KWS + context binding) | MEDIUM-HIGH | **+2-3 weeks** | nRF52840 PDM peripheral + Edge Impulse KWS model + custom GATT char | KWS 88-95 % closed vocabulary; mode router gates voice power |
+| **7** | **PPG-fused pinch** (Apple-tier approach) | MEDIUM-HIGH | **+2-3 weeks** | Add PPG features to Edge Impulse model + retrain | 88-94 % pinch (lift from #2) |
+| **8** | **Multi-gesture vocabulary** (clench, double-pinch, finger flick, ...) | HIGH | **+3-6 weeks** | Edge Impulse broader gesture set + per-user fine-tune | 75-92 % varies by gesture |
 
-**Total to ship all three use cases + voice context at usable
-quality: 11-15 weeks.**
+**Total to ship all three use cases + dictation keyboard replacement
++ voice context at usable quality: 13-17 weeks.**
+
+Item ordering rationale: dictation (item 5) is sequenced **before** the
+"advanced gesture" items (6: KWS, 7: PPG pinch, 8: multi-gesture
+vocabulary) because it completes the "band as input device" story —
+cursor (items 2, 3), keyboard-shortcut macros (item 4), and now
+keyboard typing replacement (item 5).  Items 6-8 are all
+Edge-Impulse-and-training-data heavy and benefit from running after a
+substantial product is already shipping.
 
 ### Phase milestones
 
@@ -672,15 +731,19 @@ quality: 11-15 weeks.**
 - **End of Week 3**: items 0-3 shipping.  All three use cases have v1
   functionality at usable-but-not-great quality.  This is the
   earliest "demoable" point.
-- **End of Week 5**: items 4 shipping.  Custom macro gestures
+- **End of Week 5**: item 4 shipping.  Custom macro gestures
   available.
-- **End of Week 7-8**: item 5 shipping.  Voice context layer
+- **End of Week 7-8**: item 5 shipping.  Gesture-triggered live
+  dictation -- the band replaces the keyboard.  Spy-movie "raise
+  wrist + snap + speak" UX with text appearing at the Mac cursor.
+  Completes the "band as input device" story.
+- **End of Week 10**: item 6 shipping.  Voice context layer
   live -- band feels intent-aware ("say a word + do a gesture").
   This is the **defining product moment** that distinguishes us
   from any IMU-only gesture band on the market.
-- **End of Week 10**: item 6 shipping.  Pinch accuracy at
+- **End of Week 12**: item 7 shipping.  Pinch accuracy at
   Apple-tier numbers via PPG fusion.
-- **End of Week 15**: item 7 shipping.  Broader gesture vocabulary
+- **End of Week 17**: item 8 shipping.  Broader gesture vocabulary
   trained against real user data.
 
 ### Long pole: data collection
@@ -894,34 +957,46 @@ additive, not replacing.
 ```
 [0] Foundation
       |
-      +-> [1] Chip gestures
+      +-> [1] Chip gestures (snap detector reused later by [5])
       |
-      +-> [2] Air mouse + IMU pinch ---> [6] PPG-fused pinch
+      +-> [2] Air mouse + IMU pinch ---> [7] PPG-fused pinch
       |                                        |
       +-> [3] Surface mode (reuses [0] cursor + [1] tap)
       |
       +-> [4] Macro gestures (reuses [0] mode FSM)
       |
-      +-> [5] Voice context (needs [0] action router + custom GATT)
-                                                 |
-                                                 v
-                                    [7] Broader gesture set
+      +-> [5] Dictation (reuses [0] mode FSM + extends [1] chip-tap
+      |       to snap detection; Omi-borrowed PDM + Opus + BLE GATT
+      |       audio infra is new but self-contained)
+      |
+      +-> [6] Voice context (needs [0] action router + custom GATT;
+      |       coexists with [5] via PDM-mic mutex)
+      |                                                 |
+      |                                                 v
+      |                                    [8] Broader gesture set
 ```
 
 Dependencies:
 
 - **Item 0 unblocks everything else.**  Build it first.
 - **Items 1, 2, 3, 4 are parallelizable** after item 0.
-- **Item 5 (voice) needs only item 0** -- the action router and
-  custom GATT characteristic.  Can be built in parallel with
-  items 2-4.  Most product impact for the effort.
-- **Item 6 needs item 2 working** (extends the same gesture model).
-- **Item 7 needs items 2 + 6** (extends the same gesture model
+- **Item 5 (dictation) needs items 0 + 1** -- the mode FSM and the
+  chip-tap pattern (snap is a retuning of the tap engine).  The
+  PDM + Opus + BLE audio GATT plumbing is borrowed wholesale from
+  Omi and self-contained -- doesn't gate on any other item.
+- **Item 6 (voice KWS) needs only item 0** -- the action router and
+  custom GATT characteristic.  Coexists with item 5 via PDM-mic
+  mutual exclusion at the FSM level (cannot both be active).
+- **Item 7 needs item 2 working** (extends the same gesture model).
+- **Item 8 needs items 2 + 7** (extends the same gesture model
   further).
 
 Items 1, 3, 4 are each days of work and can be batched with item 0.
-Item 5 (voice) is the next-biggest product lever after item 2 and
-can run in parallel with item 6.
+Item 5 (dictation) is sequenced ahead of items 6-8 because it
+completes the "band as input device" story (cursor + clicks +
+keyboard typing replacement) before the heavier Edge Impulse training
+work begins.  Items 6-8 all require labelled training data and
+benefit from running after a substantial product is already shipping.
 
 ---
 

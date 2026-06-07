@@ -457,11 +457,17 @@ pose. No always-on listening, no continuous streaming.
 
 ## 13. Cross-references
 
-- §6.5 voice-context state machine: separate feature using the same PDM mic; mutual
-  exclusion required at the FSM level. Document the interaction when §6.5 ships.
+- **Architecture-doc roadmap placement: Item 5** (between custom macro gestures and
+  voice-context KWS). Sequenced before items 6-8 ("advanced gesture features": KWS,
+  PPG-fused pinch, multi-gesture vocabulary) because it completes the "band as input
+  device" story (cursor + clicks + keyboard typing replacement) before heavier
+  Edge-Impulse-and-training-data work begins.
+- §6.5 voice-context state machine (architecture-doc item 6): separate feature using
+  the same PDM mic; mutual exclusion required at the FSM level (cannot both be
+  active). Coexistence will be implemented when item 6 ships.
 - Cursor-mode cooldown bug (project memory 2026-06-07): the cooldown-keeps-acq-alive
-  pattern shipped today is reused for MODE_DICTATION cooldown — same problem, same
-  fix, no new design.
+  pattern shipped on `feature/gesture-foundation` is reused for `MODE_DICTATION`
+  cooldown — same problem, same fix, no new design.
 - Hardware wear position (memory): volar-side wrist mount means raising the wrist to
   the face puts the band toward the user's mouth — favorable PDM SNR. The wrist-at-face
   gravity-vector signature also follows from the volar mount.
