@@ -191,7 +191,7 @@ or wrist-at-face-only (scratching nose, drinking water) is ignored.
 | Custom BLE GATT audio service | Borrow from Omi |
 | Mac BLE central + Opus decode | Borrow from Omi macOS Swift app |
 | Streaming STT vendor adapter | Ours (thin wrapper around Deepgram SDK) |
-| Text injection at cursor | Borrow from one of Voquill / FreeFlow / OpenWhispr / VoiceInk / Handy (chosen during implementation plan based on license + language + code-shape fit) |
+| Mac app shell + text injection + AI cleanup | **Lead candidate: Voquill** (AGPLv3) — exact architectural fit (BYOK + cloud-provider abstraction + at-cursor injection + Wispr-Flow-style AI cleanup of verbal cues + personal glossary). Fallback if AGPL is rejected: Handy (MIT) with custom build-out of the cloud abstraction. |
 | Snap detection (firmware) | Ours |
 | Wrist-at-face pose (firmware) | Ours — extends existing orientation classifier |
 | MODE_DICTATION FSM (firmware) | Ours — extends existing gesture FSM |
@@ -319,23 +319,56 @@ protocol STTVendorAdapter {
 }
 ```
 
-## 8. Text injection
+## 8. Text injection and Mac app shell
 
-Borrow the implementation from one of:
-- **Handy** (MIT, Rust + tauri shell)
-- **OpenWhispr** (active, cross-platform)
-- **Voquill** (research during implementation)
-- **FreeFlow** (Wispr Flow-inspired)
-- **VoiceInk** (GPL-3 — if we go this route, our app inherits GPL)
+### Lead candidate: Voquill (AGPLv3)
 
-License is the primary filter. MIT/Apache is preferred so our Mac app license stays
-flexible. Final pick is an implementation-plan-phase decision based on a code-level
-read of each candidate's text-injection module.
+[Voquill](https://github.com/josiahsrc/voquill) is the architectural first-best fit:
 
-The core requirement: given a stream of partial transcripts and a final transcript,
-inject text at the focused field such that partials update in place (deleted and
-rewritten) and the final commits cleanly. This is what every Wispr-Flow-class product
-already does; we don't reinvent it.
+| Property | Voquill | Why it matters |
+|---|---|---|
+| Activation model | Hold-PTT (Wispr-Flow-style hotkey) | Exact match to our BLE HID held-modifier design |
+| ASR backend | Local Whisper *or* cloud STT provider (BYOK from day one) | Exact match to our BYOK-first v0 + multi-vendor v1 design |
+| Text injection | At-cursor with AI cleanup ("verbal cues → formatted text") | Beyond just injection — also gets us Wispr-Flow's signature command vocabulary ("new paragraph", "comma", etc.) for free |
+| Personal glossary | Built-in | A v2 feature we'd otherwise design ourselves |
+| Cross-platform | Mac + Windows + Linux | Easier to port forward later |
+| Project framing | Built as the OSS Wispr Flow alternative | The exact UX shape we're after |
+
+### License trade-off
+
+Voquill is **AGPLv3** — viral in both code distribution and network distribution
+contexts. Concrete implications:
+
+- If we fork or substantially copy Voquill, **our Mac app must be AGPL** (source
+  released).
+- The band firmware (separate artifact) and the v1 subscription backend (separate
+  artifact, communicates only over network protocols) can remain proprietary.
+- AGPL does not prevent commercialization — MongoDB, Elastic, Grafana, etc. all
+  ship AGPL clients with proprietary backends.
+- A source-available Mac app is a net trust positive for a privacy-adjacent
+  product.
+
+### Fallback candidates if AGPL is rejected
+
+- **Handy** (MIT, Rust + tauri) — license-clean but local-Whisper-first; we'd
+  build the cloud-provider abstraction ourselves
+- **OpenWhispr** — closer to our shape (BYOK + local), no AI-cleanup of the
+  Voquill kind
+- **VoiceInk** (GPL-3) — same viral-license issue, less feature overlap than
+  Voquill
+- **FreeFlow** — lighter project, fewer features
+
+### Implementation-plan decision
+
+Voquill is the lead unless the AGPL license is a project-policy blocker. Final
+selection is locked in during the implementation plan after a code-level read of
+the Voquill repo to confirm the audio-source / text-injection / cleanup boundaries
+are clean enough to swap in our BLE-central path as the audio source.
+
+The core requirement (independent of which donor we pick): given a stream of
+partial transcripts and a final transcript, inject text at the focused field such
+that partials update in place and the final commits cleanly. Every Wispr-Flow-
+class product already does this.
 
 ## 9. Privacy and data handling
 
@@ -398,10 +431,11 @@ pose. No always-on listening, no continuous streaming.
   the forearm being elevated. Distinguishing axis (palm direction) needs empirical
   validation — capture gravity vectors in both poses during implementation calibration
   and confirm they're separable.
-- **OSS license compatibility of the text-injection donor project.** If the only good
-  candidate is VoiceInk (GPL-3), the Mac app inherits GPL — which has business-model
-  implications for a subscription product. Mitigation: rewrite text injection from
-  scratch as a fallback (it's a few hundred lines of Accessibility API + CGEvent).
+- **Voquill AGPLv3 license acceptance.** Lead donor candidate is AGPL — viral in both
+  code and network distribution. Mac app becomes AGPL; band firmware and v1 backend
+  stay proprietary. Decision required from product owner before locking the donor in
+  the implementation plan. Mitigations if rejected: pick Handy (MIT) and build the
+  cloud-provider abstraction ourselves, or clean-room rewrite the injection layer.
 - **Co-existence with the §6.5 KWS feature.** Both use the PDM mic. Solution: mutual
   exclusion at the mode-FSM level — `MODE_DICTATION` and the KWS active state cannot
   both be true. Define interaction explicitly when §6.5 ships.
