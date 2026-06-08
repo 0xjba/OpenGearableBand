@@ -446,6 +446,20 @@ int lsm6dsl_fifo_enable_continuous(void)
      * configured (416 Hz) stays in place. */
     int err = 0;
 
+    /* Step 1.5: RESET FIFO to bypass mode FIRST.  ST documented gotcha
+     * (caught 2026-06-09 hardware test): "Before changing FIFO
+     * settings, the device must be in bypass mode."  Writing
+     * FIFO_CTRL1/2/3/4 while FIFO is in any other state silently
+     * fails -- the chip accepts the CTRL5 byte (readback shows
+     * correct value) but FIFO_STATUS always reports zero words.
+     * The fix is to write FIFO_CTRL5 = 0 (bypass) first so the
+     * subsequent CTRL writes land in a clean state, then arm
+     * continuous mode at the end as the last write. */
+    err = i2c_reg_write_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                             LSM6DSL_REG_FIFO_CTRL5,
+                             LSM6DSL_FIFO_MODE_BYPASS);
+    if (err) return err;
+
     /* Step 2: set FIFO threshold high (max 0x7FF in CTRL1+CTRL2),
      * but we don't actually use the watermark interrupt -- the tap
      * event is our trigger.  Write 0xFF/0x07 to keep the threshold
@@ -522,8 +536,28 @@ int lsm6dsl_fifo_get_word_count(uint16_t *count)
     if (err) return err;
     /* DIFF_FIFO spans bits [10:0] = s2[2:0] << 8 | s1.
      * Each "word" is 2 bytes; an accel sample is 3 words (XL/YL/ZL
-     * pairs).  Caller divides by 3 to get sample count. */
+     * pairs).  Caller divides by 3 to get sample count.
+     *
+     * FIFO_STATUS2 upper bits flag conditions:
+     *   [7] = WTM (watermark reached)
+     *   [6] = OVER_RUN (FIFO overrun in continuous mode)
+     *   [5] = FIFO_FULL
+     *   [4] = FIFO_EMPTY
+     *
+     * Diagnostic log so we can see the actual chip state if word
+     * count is 0 -- distinguishes "FIFO empty per chip" from
+     * "config silently failed." */
     *count = ((uint16_t)(s2 & 0x07) << 8) | s1;
+    if (*count == 0) {
+        /* Log the raw status bytes so we can see WHY the FIFO is
+         * reporting empty.  EMPTY flag set = chip confirms empty
+         * (config issue).  EMPTY clear with count=0 = transient. */
+        LOG_INF("LSM6DSL FIFO_STATUS: s1=0x%02x s2=0x%02x "
+                "(WTM=%d OVERRUN=%d FULL=%d EMPTY=%d)",
+                s1, s2,
+                !!(s2 & 0x80), !!(s2 & 0x40),
+                !!(s2 & 0x20), !!(s2 & 0x10));
+    }
     return 0;
 }
 
