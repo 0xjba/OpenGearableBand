@@ -124,6 +124,34 @@ int lsm6dsl_tap_set_threshold(uint8_t threshold);
 int lsm6dsl_read_tap_src(uint8_t *src);
 int lsm6dsl_read_func_src1(uint8_t *src);
 
+/* LSM6DSL FIFO bio-acoustic capture (Stage E) ---------------------------
+ *
+ * Enables the chip's internal 4 KB FIFO in continuous mode at
+ * 1.66 kHz, accel-only.  Buffers ~410 ms of pre-event signal as a
+ * ring; on a tap event, the consumer reads the entire FIFO to
+ * snapshot the pre-event window for feature extraction.
+ *
+ * Why continuous-to-... wasn't used: the chip's continuous-to-FIFO
+ * mode auto-switches on an "INT generator" event that's wired to a
+ * specific subset of detectors (not single-tap on LSM6DSL).  Plain
+ * continuous mode + MCU-driven read on tap event is the cleanest
+ * path that ships on this chip.
+ */
+int lsm6dsl_fifo_enable_continuous(void);
+int lsm6dsl_fifo_disable(void);
+
+/* Returns current FIFO occupancy in 2-byte words.  An accel-only
+ * sample is 3 words (X/Y/Z, each int16); caller divides by 3 to get
+ * sample count. */
+int lsm6dsl_fifo_get_word_count(uint16_t *count);
+
+/* Burst-read want_words 2-byte words from FIFO_DATA_OUT.  Returns
+ * actual words read in *got_words.  Caller supplies a buffer of at
+ * least want_words * 2 bytes.  Byte order is little-endian (chip's
+ * native format -- LSB first then MSB per axis). */
+int lsm6dsl_fifo_read_words(uint8_t *buf, uint16_t want_words,
+                            uint16_t *got_words);
+
 #ifdef __cplusplus
 }
 #endif

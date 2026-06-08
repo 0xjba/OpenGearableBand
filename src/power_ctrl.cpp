@@ -129,6 +129,47 @@ int max30102_wake(void)     { return max30102_set_shdn(false); }
 #define LSM6DSL_REG_TAP_SRC            0x1C
 #define LSM6DSL_REG_FUNC_SRC1          0x53
 
+/* FIFO registers for the bio-acoustic capture pipeline (Stage E).
+ * FIFO is 4 KB total, holding up to 682 accel-only samples (each 6
+ * bytes) at our intended high-ODR config of 1.66 kHz -- about 410 ms
+ * of pre-event signal continuously buffered. */
+#define LSM6DSL_REG_FIFO_CTRL1         0x06  /* FIFO threshold LSB */
+#define LSM6DSL_REG_FIFO_CTRL2         0x07  /* FIFO threshold MSB + timer en */
+#define LSM6DSL_REG_FIFO_CTRL3         0x08  /* per-sensor decimation */
+#define LSM6DSL_REG_FIFO_CTRL4         0x09  /* decimation slaves + stop_on_fth */
+#define LSM6DSL_REG_FIFO_CTRL5         0x0A  /* FIFO ODR + FIFO_MODE */
+#define LSM6DSL_REG_FIFO_STATUS1       0x3A  /* DIFF_FIFO LSB */
+#define LSM6DSL_REG_FIFO_STATUS2       0x3B  /* DIFF_FIFO MSB + status flags */
+#define LSM6DSL_REG_FIFO_DATA_OUT_L    0x3E  /* burst-read from here */
+#define LSM6DSL_REG_FIFO_DATA_OUT_H    0x3F
+
+/* FIFO_CTRL5 layout: [7:3] ODR_FIFO, [2:0] FIFO_MODE.
+ *
+ *   FIFO_MODE values (datasheet table):
+ *     000 = bypass (FIFO disabled, content reset)
+ *     001 = FIFO mode (stops on full)
+ *     011 = continuous-to-FIFO (continuous until trigger event)
+ *     100 = bypass-to-continuous (bypass until trigger)
+ *     110 = continuous (oldest overwritten on full)
+ *
+ *   ODR_FIFO values match ODR_XL encoding -- 1010 = 1.66 kHz.
+ */
+#define LSM6DSL_FIFO_MODE_BYPASS       0x00
+#define LSM6DSL_FIFO_MODE_FIFO         0x01  /* stop on full */
+#define LSM6DSL_FIFO_MODE_CONTINUOUS   0x06
+#define LSM6DSL_FIFO_ODR_1_66KHZ       (0xA << 3)
+
+/* FIFO_STATUS2 bit 6 = FIFO_FULL (FIFO at threshold).  Bits [10:0]
+ * across STATUS1/2 = DIFF_FIFO (current word count, 1 word = 2 bytes). */
+#define LSM6DSL_FIFO_STATUS2_FULL_BIT  (1U << 6)
+
+/* FIFO_CTRL3 bits [2:0] = DEC_FIFO_XL (accel decimation).
+ *   000 = sensor not in FIFO
+ *   001 = no decimation (every sample)
+ *   010 = decimation factor 2
+ *   ... etc. */
+#define LSM6DSL_FIFO_CTRL3_DEC_XL_NONE     0x01
+
 static const struct device *const lsm6dsl_bus =
     DEVICE_DT_GET(DT_NODELABEL(i2c0));
 
@@ -369,4 +410,123 @@ int lsm6dsl_read_func_src1(uint8_t *src)
     }
     return i2c_reg_read_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
                              LSM6DSL_REG_FUNC_SRC1, src);
+}
+
+/* ---- LSM6DSL FIFO bio-acoustic capture pipeline -------------------------
+ *
+ * Enables the chip's internal FIFO at 1.66 kHz in continuous mode,
+ * accel-only (no decimation, no gyro / external).  The FIFO ring-
+ * buffers ~410 ms of pre-event signal continuously.  On a tap event,
+ * the INT1 consumer reads the entire FIFO to capture the pre-event
+ * window, then resumes for the next event.
+ *
+ * Power impact: ~0.3 mA additional draw versus the 416 Hz tap-only
+ * config (chip runs at 1.66 kHz internally; we still poll at 100 Hz
+ * for the main acq pipeline).
+ */
+
+int lsm6dsl_fifo_enable_continuous(void)
+{
+    /* Step 1: bump CTRL1_XL ODR to 1.66 kHz (FIFO ODR must be ≤
+     * sensor ODR per AN5040).  This overrides the 416 Hz that
+     * lsm6dsl_tap_engine_enable() left in place. */
+    int err = lsm6dsl_update_bits(LSM6DSL_REG_CTRL1_XL,
+                                  LSM6DSL_CTRL1_XL_ODR_MASK,
+                                  0xA << 4);   /* 1010 = 1.66 kHz */
+    if (err) return err;
+
+    /* Step 2: set FIFO threshold high (max 0x7FF in CTRL1+CTRL2),
+     * but we don't actually use the watermark interrupt -- the tap
+     * event is our trigger.  Write 0xFF/0x07 to keep the threshold
+     * effectively disabled (chip won't fire watermark before tap). */
+    err = i2c_reg_write_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                             LSM6DSL_REG_FIFO_CTRL1, 0xFF);
+    if (err) return err;
+    err = i2c_reg_write_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                             LSM6DSL_REG_FIFO_CTRL2, 0x07);
+    if (err) return err;
+
+    /* Step 3: enable accel-only in FIFO with no decimation (every
+     * sample at 1.66 kHz makes it in).  Gyro / ext-sensor decimation
+     * stays at 000 (sensor not in FIFO). */
+    err = i2c_reg_write_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                             LSM6DSL_REG_FIFO_CTRL3,
+                             LSM6DSL_FIFO_CTRL3_DEC_XL_NONE);
+    if (err) return err;
+    err = i2c_reg_write_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                             LSM6DSL_REG_FIFO_CTRL4, 0x00);
+    if (err) return err;
+
+    /* Step 4: FIFO mode = continuous (110b), FIFO ODR = 1.66 kHz.
+     * This starts the FIFO actively writing. */
+    err = i2c_reg_write_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                             LSM6DSL_REG_FIFO_CTRL5,
+                             LSM6DSL_FIFO_ODR_1_66KHZ |
+                             LSM6DSL_FIFO_MODE_CONTINUOUS);
+    if (err) return err;
+
+    LOG_INF("LSM6DSL: FIFO enabled (continuous mode, 1.66 kHz, "
+            "accel-only) -- ~410 ms pre-event window");
+    return 0;
+}
+
+int lsm6dsl_fifo_disable(void)
+{
+    /* Bypass mode resets FIFO content and stops the engine. */
+    int err = lsm6dsl_update_bits(LSM6DSL_REG_FIFO_CTRL5,
+                                  0x07, LSM6DSL_FIFO_MODE_BYPASS);
+    if (err) return err;
+
+    /* Restore the tap-engine ODR (416 Hz) so tap detection still
+     * works after FIFO is off. */
+    err = lsm6dsl_update_bits(LSM6DSL_REG_CTRL1_XL,
+                              LSM6DSL_CTRL1_XL_ODR_MASK,
+                              LSM6DSL_CTRL1_XL_ODR_416HZ);
+    if (err) return err;
+
+    LOG_INF("LSM6DSL: FIFO disabled, ODR restored to 416 Hz");
+    return 0;
+}
+
+int lsm6dsl_fifo_get_word_count(uint16_t *count)
+{
+    if (!device_is_ready(lsm6dsl_bus) || !count) {
+        return -ENODEV;
+    }
+    uint8_t s1, s2;
+    int err = i2c_reg_read_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                                LSM6DSL_REG_FIFO_STATUS1, &s1);
+    if (err) return err;
+    err = i2c_reg_read_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                            LSM6DSL_REG_FIFO_STATUS2, &s2);
+    if (err) return err;
+    /* DIFF_FIFO spans bits [10:0] = s2[2:0] << 8 | s1.
+     * Each "word" is 2 bytes; an accel sample is 3 words (XL/YL/ZL
+     * pairs).  Caller divides by 3 to get sample count. */
+    *count = ((uint16_t)(s2 & 0x07) << 8) | s1;
+    return 0;
+}
+
+int lsm6dsl_fifo_read_words(uint8_t *buf, uint16_t want_words,
+                            uint16_t *got_words)
+{
+    if (!device_is_ready(lsm6dsl_bus) || !buf || !got_words) {
+        return -ENODEV;
+    }
+    *got_words = 0;
+
+    /* FIFO_DATA_OUT auto-increments by 2 bytes per read.  We can
+     * burst-read multiple words in one I2C transaction by reading
+     * from FIFO_DATA_OUT_L with auto-address-increment (default
+     * behaviour on this chip per IF_INC bit in CTRL3_C). */
+    uint16_t bytes = want_words * 2;
+    if (bytes == 0) return 0;
+
+    int err = i2c_burst_read(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                             LSM6DSL_REG_FIFO_DATA_OUT_L,
+                             buf, bytes);
+    if (err) return err;
+
+    *got_words = want_words;
+    return 0;
 }
