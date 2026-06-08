@@ -219,6 +219,83 @@ need MCU code for tap, double-tap, wake-up, or step counting.
 Anything more sophisticated (pinch, flick, finger-specific gestures)
 runs on the Cortex-M4 with our own / Edge Impulse code.
 
+### Bio-acoustic sensing path -- ViBand-style (added 2026-06-08)
+
+**Important addition based on assumption-shattering research (see
+principle_real_world_grounding_before_engineering memory rule
+extension):**
+
+The chip's binary tap engine fires on amplitude threshold at 416 Hz
+ODR -- great for direct mechanical impacts (band-tap with other
+hand, finger snap propagated through carpal bones), useless for
+many real-world gestures where the impulse is filtered by tissue
+or surface coupling.
+
+**Empirical finding 2026-06-08**: a same-hand finger tap on a desk
+with the band-wearing wrist resting on that desk does NOT trip the
+chip's binary tap engine, because the wrist mass damps the surface
+vibration before it reaches the IMU.  We initially concluded this
+gesture was "physically dead."  That conclusion was wrong.
+
+**[ViBand (CMU UIST 2016)](https://www.robertxiao.ca/research/viband/)**
+demonstrates that the LSM6-class accelerometer, when sampled at
+**~4 kHz** instead of the conventional 100-500 Hz, acts as a
+**vibrational microphone** coupled to the user's body.  At that
+rate, distinct signatures emerge for:
+
+- Tap on desk surface (any distance from band; the wrist coupling
+  carries the signal as a low-pass version, not a null)
+- Tap on forearm above the band
+- Tap on palm or back of hand
+- Finger flick (index released from thumb)
+- Finger snap (bone-conducted)
+- Scratch / drag on surface
+- Material identification of the tap target (cloth vs wood vs metal)
+
+The LSM6DS3TR-C supports ODR up to **6.66 kHz** (CTRL1_XL field 1010b),
+well within the rate ViBand uses.  Per AN5040, the slope filter
+required for tap detection is uncorrelated with the streaming ODR
+the chip outputs, so we can run the chip at high ODR for our own
+feature extraction while still using the chip's binary tap engine
+for cheap detection of clear events.
+
+**What this means for gesture vocabulary**: the literature offers a
+much richer set than just "tap on band" + "snap":
+
+| Gesture | Same-hand? | Wrist stays on desk? | Detection path |
+|---|---|---|---|
+| Direct band-tap (other hand) | -- | -- | Chip binary engine (works today) |
+| Finger snap (same hand) | yes | mostly | Chip binary engine (works today) |
+| Tap desk near band | yes | yes | High-ODR + bio-acoustic features (Cortex-M4) |
+| Finger flick (index against thumb release) | yes | yes | High-ODR + bio-acoustic features |
+| Tap forearm / palm / back-of-hand | yes | yes | High-ODR + bio-acoustic features |
+| Pinch / double-pinch / clench | yes | yes | PPG fusion (Apple Watch model -- deferred) |
+
+**Roadmap update**: bio-acoustic feature extraction is added as a
+new track (item 4.5 or similar) between the foundation items and
+the PPG-fused items.  PPG-fused gestures (pinch, clench) stay in
+the later PPG roadmap slot.
+
+**Discrimination question**: the chip's binary engine cannot
+distinguish band-tap (with other hand) from finger snap (same hand)
+-- both fire DOUBLE_TAP for the same hardware reason.  With raw
+samples at high ODR, the discriminating features are:
+
+- Dominant axis: tap is perpendicular to band face; snap propagates
+  through forearm with broader axis distribution
+- Rise time / jerk profile: direct mechanical impact vs bone-conducted
+- Spectral content: tap excites PCB / case resonance (1-3 kHz);
+  snap is body-low-passed
+- Pre-event acceleration: snap involves anticipatory hand motion;
+  tap does not
+
+Sources: [Patent US 8442797 (directional tap detection)](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/8442797),
+[Enabling Hand Gesture Customization on Wrist-Worn Devices (CHI 2022)](https://dl.acm.org/doi/fullHtml/10.1145/3491102.3501904),
+[Counting Finger and Wrist Movements Using Only a Wrist-Worn IMU
+(MDPI Sensors 2023)](https://www.mdpi.com/1424-8220/23/12/5690),
+[Acustico (UIST 2020)](https://dl.acm.org/doi/10.1145/3379337.3415901),
+[ViBand (UIST 2016)](https://www.cmu.edu/news/stories/archives/2016/october/smartwatch-capability.html).
+
 ### MAX30102 (the PPG sensor we have)
 
 **Relevant for gestures:**
