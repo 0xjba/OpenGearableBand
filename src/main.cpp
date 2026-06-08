@@ -1051,6 +1051,13 @@ static void run_idle(void) {
                         current_tap_ths * 62);
             }
 
+            /* Snapshot the FIFO contents for bio-acoustic feature
+             * extraction.  This wakes the background worker thread
+             * which logs the classification (snap vs band-tap).
+             * Independent of the multi-tap counter path; both run
+             * for every tap event. */
+            gesture_mode_bio_acoustic_on_tap();
+
             gesture_mode_on_chip_single_tap(axis, sign);
         }
 
@@ -1312,6 +1319,12 @@ int main(void) {
                     "without chip tap detection", err);
         }
     }
+
+    // Bio-acoustic capture pipeline (Stage E).  Enables FIFO ring
+    // buffer at 1.66 kHz + starts the worker thread.  Must happen
+    // AFTER tap engine enable so the FIFO ODR override correctly
+    // supersedes the tap engine's 416 Hz default.
+    gesture_mode_bio_acoustic_init();
 
     // Start the cursor publish thread.  Idle until the gesture mode
     // transitions into a cursor-bearing mode (AIR_MOUSE or SURFACE),

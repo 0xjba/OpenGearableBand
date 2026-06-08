@@ -5,6 +5,8 @@
 #include <zephyr/sys/atomic.h>
 #include <math.h>
 
+#include "power_ctrl.h"
+
 LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 
 /*
@@ -1132,4 +1134,303 @@ int gesture_mode_get_cursor_cooldown_remaining(void)
 void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb)
 {
     s_acq_request_cb = cb;
+}
+
+/*
+ * --- Bio-acoustic capture + feature extraction + classifier (Stage E) ---
+ *
+ * When the chip's tap engine fires INT1, the main dispatcher calls
+ * gesture_mode_bio_acoustic_on_tap().  That function reads the chip's
+ * FIFO (continuous mode at 1.66 kHz; ~410 ms ring-buffer of recent
+ * accel samples) into a static capture buffer, then signals a worker
+ * thread.  The worker computes features and classifies the tap as
+ * snap-vs-band-tap.
+ *
+ * Architecture decisions (see docs/research/gesture-architecture.md §3
+ * Bio-acoustic sensing path):
+ *   - Capture: chip FIFO in continuous mode (chip-native pre-trigger
+ *     ring buffer).  ~250 samples = ~150 ms pre-event window at
+ *     1.66 kHz reading.
+ *   - Worker: async thread (industry standard).  Acq thread keeps
+ *     reading at 100 Hz unaffected.
+ *   - Classifier: simple rules in v0.  Snap = anticipatory pre-event
+ *     motion + broad axis distribution.  Band-tap = quiet pre-event +
+ *     Z-axis dominance.  ML migration tracked in Item 8.
+ *   - Output: log-only for now.  When classifier proves reliable on
+ *     real data, the classification will feed mode-routing decisions.
+ *
+ * For v0 testing, the classifier output does NOT change FSM behavior
+ * -- it only logs.  The existing multi-tap counter continues to drive
+ * AIR_MOUSE / SURFACE entry as before.  This lets you validate the
+ * classifier against ground truth (you know which gesture you did)
+ * without breaking working paths.
+ */
+
+/* Capture buffer.  At 1.66 kHz, 500 samples = ~300 ms of signal.
+ * Each sample is 3 axes * int16 = 6 bytes.  Total 3000 bytes. */
+#define TAP_CAPTURE_SAMPLES   500
+#define TAP_CAPTURE_BYTES     (TAP_CAPTURE_SAMPLES * 6)
+static uint8_t  tap_capture_buf[TAP_CAPTURE_BYTES];
+static uint16_t tap_capture_sample_count = 0;
+
+/* Worker synchronisation: dispatcher gives the semaphore after
+ * filling the buffer; worker takes it and processes.  Binary
+ * semaphore -- if a second tap arrives while the worker is still
+ * processing, the dispatcher skips capture and logs "dropped"
+ * rather than corrupting the in-flight buffer. */
+static K_SEM_DEFINE(tap_capture_sem, 0, 1);
+static atomic_t tap_capture_busy = ATOMIC_INIT(0);  /* 1 = buffer in use */
+
+/* Feature extraction output.  Computed by the worker from
+ * tap_capture_buf, then fed to the classifier. */
+struct tap_features {
+    int16_t peak_x;        /* signed peak (most positive or negative) */
+    int16_t peak_y;
+    int16_t peak_z;
+    uint16_t peak_x_abs;   /* magnitudes for ratio comparisons */
+    uint16_t peak_y_abs;
+    uint16_t peak_z_abs;
+    uint16_t peak_sample_idx;  /* where in buffer the peak is */
+    uint32_t pre_event_energy;  /* sum-of-deltas over pre-event window */
+    char     dominant_axis;     /* 'X' / 'Y' / 'Z' */
+};
+
+/* Helper: parse one accel sample (6 bytes, little-endian) from buf. */
+static inline void _parse_sample(const uint8_t *p,
+                                 int16_t *x, int16_t *y, int16_t *z)
+{
+    *x = (int16_t)((p[1] << 8) | p[0]);
+    *y = (int16_t)((p[3] << 8) | p[2]);
+    *z = (int16_t)((p[5] << 8) | p[4]);
+}
+
+static inline uint16_t _abs16(int16_t v)
+{
+    return (v < 0) ? (uint16_t)(-v) : (uint16_t)v;
+}
+
+/* Locate the peak-magnitude sample.  Scans all samples; the one
+ * with the largest |X|+|Y|+|Z| sum is treated as the impulse moment.
+ * Records peak per axis and the index where the peak sits. */
+static void _extract_peak(const uint8_t *buf, uint16_t sample_count,
+                          struct tap_features *out)
+{
+    uint32_t max_sum = 0;
+    uint16_t max_idx = 0;
+    int16_t  px = 0, py = 0, pz = 0;
+
+    for (uint16_t i = 0; i < sample_count; i++) {
+        int16_t x, y, z;
+        _parse_sample(buf + i * 6, &x, &y, &z);
+        uint32_t s = (uint32_t)_abs16(x) +
+                     (uint32_t)_abs16(y) +
+                     (uint32_t)_abs16(z);
+        if (s > max_sum) {
+            max_sum = s;
+            max_idx = i;
+            px = x;
+            py = y;
+            pz = z;
+        }
+    }
+    out->peak_x = px;
+    out->peak_y = py;
+    out->peak_z = pz;
+    out->peak_x_abs = _abs16(px);
+    out->peak_y_abs = _abs16(py);
+    out->peak_z_abs = _abs16(pz);
+    out->peak_sample_idx = max_idx;
+
+    /* Dominant axis = whichever |axis| is largest at peak. */
+    if (out->peak_z_abs >= out->peak_x_abs &&
+        out->peak_z_abs >= out->peak_y_abs) {
+        out->dominant_axis = 'Z';
+    } else if (out->peak_x_abs >= out->peak_y_abs) {
+        out->dominant_axis = 'X';
+    } else {
+        out->dominant_axis = 'Y';
+    }
+}
+
+/* Compute pre-event "energy" as sum of consecutive-sample deltas over
+ * the window [peak - 150ms, peak - 50ms].  At 1.66 kHz that's
+ * samples [peak_idx - 250, peak_idx - 83].  Quiet pre-event (band-
+ * tap) gives small values; anticipatory motion (snap) gives larger
+ * values.
+ *
+ * Using sum-of-|delta| rather than variance keeps the math cheap
+ * (no multiplications, single int accumulator) and is robust to
+ * the DC offset that gravity introduces. */
+static uint32_t _compute_pre_event_energy(const uint8_t *buf,
+                                          uint16_t peak_idx)
+{
+    /* Pre-event window bounds.  Bail if peak is too close to the
+     * start of the buffer to have a meaningful pre-event window. */
+    if (peak_idx < 250) {
+        return 0;  /* not enough pre-event history -- worst-case
+                    * value is "no motion" which biases toward
+                    * band-tap classification; safer default */
+    }
+    uint16_t pre_start = peak_idx - 250;
+    uint16_t pre_end   = peak_idx - 83;
+
+    uint32_t energy = 0;
+    int16_t  prev_x, prev_y, prev_z;
+    _parse_sample(buf + pre_start * 6, &prev_x, &prev_y, &prev_z);
+
+    for (uint16_t i = pre_start + 1; i <= pre_end; i++) {
+        int16_t x, y, z;
+        _parse_sample(buf + i * 6, &x, &y, &z);
+        energy += _abs16((int16_t)(x - prev_x));
+        energy += _abs16((int16_t)(y - prev_y));
+        energy += _abs16((int16_t)(z - prev_z));
+        prev_x = x; prev_y = y; prev_z = z;
+    }
+    return energy;
+}
+
+/* Simple classifier rules.  Returns:
+ *   'S' = snap
+ *   'B' = band-tap
+ *   '?' = unclassified (between thresholds)
+ *
+ * Decision logic per design doc:
+ *   - Pre-event energy HIGH + dominant axis NOT Z -> snap
+ *   - Pre-event energy LOW + Z dominant + peak large -> band-tap
+ *   - Anything else: ambiguous
+ *
+ * Thresholds are initial guesses; tune empirically with real data.
+ * The classifier logs both the features AND the verdict so users can
+ * see what tipped it which way. */
+#define SNAP_PRE_ENERGY_THRESH   2000   /* sum-of-|delta| units */
+#define BAND_TAP_Z_RATIO_THRESH  60     /* % of total |a| at peak */
+#define MIN_PEAK_SUM             4000   /* |x|+|y|+|z| at peak */
+static char _classify(const struct tap_features *f)
+{
+    uint32_t total_abs = (uint32_t)f->peak_x_abs +
+                         (uint32_t)f->peak_y_abs +
+                         (uint32_t)f->peak_z_abs;
+    if (total_abs < MIN_PEAK_SUM) {
+        return '?';  /* too weak to characterise */
+    }
+    uint32_t z_ratio_pct = (uint32_t)f->peak_z_abs * 100 / total_abs;
+
+    bool z_dominant_strong = (z_ratio_pct >= BAND_TAP_Z_RATIO_THRESH);
+    bool pre_event_motion  = (f->pre_event_energy >= SNAP_PRE_ENERGY_THRESH);
+
+    if (pre_event_motion && !z_dominant_strong) {
+        return 'S';  /* snap signature */
+    }
+    if (!pre_event_motion && z_dominant_strong) {
+        return 'B';  /* band-tap signature */
+    }
+    return '?';
+}
+
+/* Worker thread entry.  Blocks on tap_capture_sem, processes one
+ * capture at a time, logs the result.  Sample count and buffer are
+ * static and protected by the busy flag. */
+static void bio_acoustic_worker(void *, void *, void *)
+{
+    while (1) {
+        k_sem_take(&tap_capture_sem, K_FOREVER);
+
+        uint16_t n = tap_capture_sample_count;
+        if (n < 100) {
+            LOG_INF("[BIO] capture too short (%u samples) -- skipping",
+                    (unsigned)n);
+            atomic_set(&tap_capture_busy, 0);
+            continue;
+        }
+
+        struct tap_features f = {};
+        _extract_peak(tap_capture_buf, n, &f);
+        f.pre_event_energy =
+            _compute_pre_event_energy(tap_capture_buf, f.peak_sample_idx);
+        char verdict = _classify(&f);
+
+        uint32_t total_abs = (uint32_t)f.peak_x_abs +
+                             (uint32_t)f.peak_y_abs +
+                             (uint32_t)f.peak_z_abs;
+        uint32_t z_ratio_pct = total_abs ?
+                                (uint32_t)f.peak_z_abs * 100 / total_abs :
+                                0;
+
+        const char *verdict_str = (verdict == 'S') ? "SNAP" :
+                                  (verdict == 'B') ? "BAND-TAP" :
+                                  "UNCLASSIFIED";
+
+        LOG_INF("[BIO] verdict=%s peak[%d,%d,%d] dom=%c "
+                "z_ratio=%u%% pre_event_energy=%u idx=%u/%u",
+                verdict_str,
+                (int)f.peak_x, (int)f.peak_y, (int)f.peak_z,
+                f.dominant_axis,
+                (unsigned)z_ratio_pct,
+                (unsigned)f.pre_event_energy,
+                (unsigned)f.peak_sample_idx, (unsigned)n);
+
+        atomic_set(&tap_capture_busy, 0);
+    }
+}
+
+K_THREAD_DEFINE(bio_acoustic_worker_id, 1536,
+                bio_acoustic_worker, NULL, NULL, NULL,
+                7,  /* priority -- below acq but above background */
+                0, 0);
+
+/* Public API for main.cpp.  Call once at boot to enable the chip
+ * FIFO; call on every chip tap event to snapshot + signal worker. */
+void gesture_mode_bio_acoustic_init(void)
+{
+    int err = lsm6dsl_fifo_enable_continuous();
+    if (err) {
+        LOG_ERR("[BIO] FIFO enable failed (%d) -- bio-acoustic "
+                "capture will not work", err);
+    } else {
+        LOG_INF("[BIO] worker thread started; FIFO armed for capture");
+    }
+}
+
+void gesture_mode_bio_acoustic_on_tap(void)
+{
+    /* Try to claim the capture buffer.  If the worker is still
+     * processing a previous capture, drop this one with a log so the
+     * loss is visible -- we'd rather skip than corrupt mid-process. */
+    if (!atomic_cas(&tap_capture_busy, 0, 1)) {
+        LOG_INF("[BIO] tap dropped -- worker still processing previous");
+        return;
+    }
+
+    /* Read whatever's in the FIFO right now.  In continuous mode the
+     * FIFO has been ring-buffering up to ~410 ms of pre-event signal
+     * plus whatever has arrived between the tap and this read
+     * (typically <5 ms = ~8 samples).  Capacity capped at our local
+     * buffer size (500 samples). */
+    uint16_t words_in_fifo = 0;
+    int err = lsm6dsl_fifo_get_word_count(&words_in_fifo);
+    if (err) {
+        LOG_WRN("[BIO] FIFO_STATUS read failed (%d)", err);
+        atomic_set(&tap_capture_busy, 0);
+        return;
+    }
+
+    /* Each accel sample is 3 words (X/Y/Z each = 1 word = 2 bytes).
+     * Cap at TAP_CAPTURE_SAMPLES. */
+    uint16_t samples_in_fifo = words_in_fifo / 3;
+    uint16_t want_samples = (samples_in_fifo > TAP_CAPTURE_SAMPLES)
+                                ? TAP_CAPTURE_SAMPLES
+                                : samples_in_fifo;
+    uint16_t want_words = want_samples * 3;
+
+    uint16_t got_words = 0;
+    err = lsm6dsl_fifo_read_words(tap_capture_buf, want_words, &got_words);
+    if (err || got_words == 0) {
+        LOG_WRN("[BIO] FIFO read failed (err=%d got=%u)", err,
+                (unsigned)got_words);
+        atomic_set(&tap_capture_busy, 0);
+        return;
+    }
+
+    tap_capture_sample_count = got_words / 3;
+    k_sem_give(&tap_capture_sem);
 }

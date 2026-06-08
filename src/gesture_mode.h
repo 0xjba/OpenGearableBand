@@ -243,6 +243,22 @@ typedef void (*gesture_acq_request_cb_t)(bool needs);
  */
 void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb);
 
+/*
+ * Bio-acoustic capture pipeline (Stage E).  Initialises the chip
+ * FIFO in continuous mode at 1.66 kHz and starts the background
+ * worker thread.  Call once from main() at boot, after the LSM6DSL
+ * tap engine is enabled but before any taps could arrive.
+ *
+ * After init, gesture_mode_bio_acoustic_on_tap() should be invoked
+ * from the INT1 dispatcher in main.cpp on every chip tap event.
+ * That function reads the FIFO into a static buffer and signals the
+ * worker to extract features + classify.  The classification is
+ * logged for now; FSM routing wiring comes after the rules are
+ * validated empirically.
+ */
+void gesture_mode_bio_acoustic_init(void);
+void gesture_mode_bio_acoustic_on_tap(void);
+
 #ifdef __cplusplus
 }
 #endif
