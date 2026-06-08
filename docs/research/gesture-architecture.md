@@ -276,6 +276,37 @@ new track (item 4.5 or similar) between the foundation items and
 the PPG-fused items.  PPG-fused gestures (pinch, clench) stay in
 the later PPG roadmap slot.
 
+**Implementation choices for the bio-acoustic track (decided 2026-06-08
+after Stage D ship):**
+
+- **Capture path: LSM6DSL continuous-to-FIFO hybrid mode** (chip-
+  native).  FIFO ring-buffers continuously; on a tap event, the FIFO
+  switches to STOP-ON-FULL mode preserving the pre-event window.
+  Chosen over (a) burst-read-on-event because snap-vs-band-tap
+  discrimination needs the pre-event anticipatory-motion signature,
+  which post-event-only would lose; chosen over (b) FIFO snapshot
+  because the hybrid mode is what the chip was designed for; chosen
+  over (c) continuous high-rate MCU polling (ViBand's pattern)
+  because the chip-native option has lower MCU load.  Documented
+  source: [ST community thread on continuous-to-FIFO](https://community.st.com/t5/mems-sensors/lsm6ds3-fifo-status-fth-for-continuous-to-fifo/td-p/122460).
+- **Feature extraction: async worker thread** (industry standard).
+  Acq thread keeps reading samples; a separate background thread
+  pulls captured-event sample windows from a queue and computes
+  features.  Avoids dropping samples during feature computation at
+  high ODR.
+- **Classifier: simple threshold rules in v0**, with planned ML
+  migration in Item 8 (Multi-gesture vocabulary).  Rationale: for
+  the first discrimination problem (snap vs band-tap), feature
+  space is genuinely separable -- snap propagates broader-axis
+  with anticipatory pre-event motion; band-tap is Z-perpendicular
+  with no pre-event signature.  Rules suffice.  ML revisit happens
+  at the same time Edge Impulse infrastructure lands for Item 8.
+- **First discrimination problem: snap vs band-tap.**  Both
+  currently fire chip DOUBLE_TAP today; discriminating them
+  unlocks per-gesture mode routing without needing any new
+  gestures to work first.  Surface-tap, finger-flick, palm-tap
+  come after.
+
 **Discrimination question**: the chip's binary engine cannot
 distinguish band-tap (with other hand) from finger snap (same hand)
 -- both fire DOUBLE_TAP for the same hardware reason.  With raw
