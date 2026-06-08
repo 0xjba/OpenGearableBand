@@ -1441,11 +1441,16 @@ void gesture_mode_bio_acoustic_on_tap(void)
         return;
     }
 
-    /* Read whatever's in the FIFO right now.  In continuous mode the
-     * FIFO has been ring-buffering up to ~410 ms of pre-event signal
-     * plus whatever has arrived between the tap and this read
-     * (typically <5 ms = ~8 samples).  Capacity capped at our local
-     * buffer size (500 samples). */
+    /* Read the LATEST samples from the FIFO -- this is where the tap
+     * impulse lives (the chip wrote it most recently).  Previous
+     * implementation read the OLDEST samples from FIFO head, which
+     * meant the actual impulse was sitting just past our read window
+     * (the unread tail).  We were "capturing" pre-event signal but
+     * missing the impulse entirely, and the classifier was operating
+     * on gravity vectors only.  Caught in hardware test 2026-06-09.
+     *
+     * Fix: figure out total occupancy, discard the older samples to
+     * get to the latest TAP_CAPTURE_SAMPLES, then read those. */
     uint16_t words_in_fifo = 0;
     int err = lsm6dsl_fifo_get_word_count(&words_in_fifo);
     if (err) {
@@ -1455,13 +1460,39 @@ void gesture_mode_bio_acoustic_on_tap(void)
     }
 
     /* Each accel sample is 3 words (X/Y/Z each = 1 word = 2 bytes).
-     * Cap at TAP_CAPTURE_SAMPLES. */
+     * Cap our keep-window at TAP_CAPTURE_SAMPLES. */
     uint16_t samples_in_fifo = words_in_fifo / 3;
     uint16_t want_samples = (samples_in_fifo > TAP_CAPTURE_SAMPLES)
                                 ? TAP_CAPTURE_SAMPLES
                                 : samples_in_fifo;
-    uint16_t want_words = want_samples * 3;
+    uint16_t skip_samples = (samples_in_fifo > want_samples)
+                                ? (samples_in_fifo - want_samples)
+                                : 0;
 
+    /* Discard the older samples one chunk at a time.  Reusing
+     * tap_capture_buf as scratch is safe -- the worker isn't running
+     * yet (we hold the busy flag) so the buffer's data will be
+     * overwritten before being inspected.  Chunk size sized to one
+     * I2C burst that fits comfortably. */
+    uint16_t discard_chunk_samples = 64;  /* 64 samples * 6 bytes = 384 B */
+    while (skip_samples > 0) {
+        uint16_t chunk = (skip_samples > discard_chunk_samples)
+                            ? discard_chunk_samples
+                            : skip_samples;
+        uint16_t got_discard = 0;
+        err = lsm6dsl_fifo_read_words(tap_capture_buf, chunk * 3,
+                                      &got_discard);
+        if (err || got_discard == 0) {
+            LOG_WRN("[BIO] FIFO discard-read failed (err=%d got=%u)",
+                    err, (unsigned)got_discard);
+            atomic_set(&tap_capture_busy, 0);
+            return;
+        }
+        skip_samples -= got_discard / 3;
+    }
+
+    /* Now read the latest want_samples into the capture buffer. */
+    uint16_t want_words = want_samples * 3;
     uint16_t got_words = 0;
     err = lsm6dsl_fifo_read_words(tap_capture_buf, want_words, &got_words);
     if (err || got_words == 0) {
