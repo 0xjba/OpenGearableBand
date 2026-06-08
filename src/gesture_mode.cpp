@@ -1361,11 +1361,17 @@ static uint32_t _compute_pre_event_energy(const uint8_t *buf,
  * Using both for robustness: agreement of both -> confident
  * classification.  Disagreement -> UNCLASSIFIED. */
 #define SNAP_PRE_ENERGY_THRESH   15000  /* sum-of-|delta| units;
-                                            empirical midpoint of
-                                            tap ~10k and snap ~25k */
-#define SNAP_Z_RATIO_THRESH      35     /* % of total |a| at peak;
-                                            empirical midpoint of
-                                            tap max 34% and snap min 33% */
+                                            empirical: tap cluster ~10k,
+                                            snap cluster ~25k.  Flicked
+                                            taps approach ~17k -- they
+                                            land in UNCLASSIFIED zone
+                                            which is correct (hybrid
+                                            gesture). */
+#define SNAP_Z_RATIO_THRESH      30     /* % of total |a| at peak;
+                                            empirical: tap max 28%,
+                                            snap min 33% (n=9).  30%
+                                            puts threshold in the
+                                            middle of the clean gap. */
 #define MIN_PEAK_SUM             20000  /* |x|+|y|+|z| at peak;
                                             below this is too weak
                                             to be a real tap/snap */
