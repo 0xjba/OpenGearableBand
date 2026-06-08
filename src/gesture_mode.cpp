@@ -186,7 +186,14 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
  * Otherwise it ticks up.  A tap is accepted only if
  * samples_since_activity >= ACTIVITY_GATE_DWELL.
  */
-#define ACTIVITY_GATE_THRESH        1.0f   /* m/s^2 motion residual */
+/* Initial value was 1.0 m/s^2 -- too aggressive.  Hardware test
+ * 2026-06-09 showed natural arm motion (lowering wrist from
+ * AIR_MOUSE pose) was gating legitimate snap events.  Bumped to
+ * 2.0 m/s^2 to match SURFACE_MOTION_BURST_THRESH (already
+ * empirically validated as a clean separator between gliding and
+ * transport motion).  Tune lower again only if gait-driven
+ * false positives reappear. */
+#define ACTIVITY_GATE_THRESH        2.0f   /* m/s^2 motion residual */
 #define ACTIVITY_GATE_DWELL         50     /* 500 ms at 100 Hz */
 
 /*

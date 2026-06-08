@@ -547,17 +547,43 @@ int lsm6dsl_fifo_get_word_count(uint16_t *count)
      * Diagnostic log so we can see the actual chip state if word
      * count is 0 -- distinguishes "FIFO empty per chip" from
      * "config silently failed." */
-    *count = ((uint16_t)(s2 & 0x07) << 8) | s1;
-    if (*count == 0) {
-        /* Log the raw status bytes so we can see WHY the FIFO is
-         * reporting empty.  EMPTY flag set = chip confirms empty
-         * (config issue).  EMPTY clear with count=0 = transient. */
-        LOG_INF("LSM6DSL FIFO_STATUS: s1=0x%02x s2=0x%02x "
-                "(WTM=%d OVERRUN=%d FULL=%d EMPTY=%d)",
-                s1, s2,
-                !!(s2 & 0x80), !!(s2 & 0x40),
-                !!(s2 & 0x20), !!(s2 & 0x10));
+    /* Interpret occupancy.  DIFF_FIFO is an 11-bit field with max
+     * 0x7FF = 2047.  But the FIFO's actual capacity is 2048 words
+     * (4 KB / 2 bytes per word).  When FIFO is at capacity, the
+     * 11-bit field wraps to 0 and the FULL flag is set.  Without
+     * checking the FULL flag, we'd think the FIFO is empty when
+     * it's actually completely full -- which is what bit us in the
+     * 2026-06-09 hardware test where every status read showed
+     * "DIFF_FIFO=0 with FULL=1" and we returned count=0.
+     *
+     * Disambiguation:
+     *   EMPTY=1, DIFF_FIFO=0 -> truly empty (0 words)
+     *   FULL=1,  DIFF_FIFO=0 -> at max capacity (~2048 words)
+     *   neither flag, DIFF_FIFO=N -> N words available
+     *
+     * We return at most 2047 for FULL since uint16_t can hold it
+     * and our caller divides by 3 for sample count anyway (682
+     * samples at max, fits in our 500-sample capture buffer). */
+    bool is_empty = (s2 & 0x10) != 0;
+    bool is_full  = (s2 & 0x20) != 0;
+    uint16_t raw_diff = ((uint16_t)(s2 & 0x07) << 8) | s1;
+
+    if (is_empty) {
+        *count = 0;
+    } else if (is_full) {
+        *count = 2047;  /* effectively max-capacity */
+    } else {
+        *count = raw_diff;
     }
+
+    /* Diagnostic: log every read so we can see chip state during
+     * empirical tuning.  Downgrade to LOG_DBG once stable. */
+    LOG_INF("LSM6DSL FIFO_STATUS: s1=0x%02x s2=0x%02x "
+            "(WTM=%d OVERRUN=%d FULL=%d EMPTY=%d raw_diff=%u count=%u)",
+            s1, s2,
+            !!(s2 & 0x80), !!(s2 & 0x40),
+            is_full, is_empty,
+            (unsigned)raw_diff, (unsigned)*count);
     return 0;
 }
 
