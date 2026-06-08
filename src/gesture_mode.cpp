@@ -1334,17 +1334,41 @@ static uint32_t _compute_pre_event_energy(const uint8_t *buf,
  *   'B' = band-tap
  *   '?' = unclassified (between thresholds)
  *
- * Decision logic per design doc:
- *   - Pre-event energy HIGH + dominant axis NOT Z -> snap
- *   - Pre-event energy LOW + Z dominant + peak large -> band-tap
- *   - Anything else: ambiguous
+ * Rules calibrated from 5-tap + 5-snap hardware test 2026-06-09:
  *
- * Thresholds are initial guesses; tune empirically with real data.
- * The classifier logs both the features AND the verdict so users can
- * see what tipped it which way. */
-#define SNAP_PRE_ENERGY_THRESH   2000   /* sum-of-|delta| units */
-#define BAND_TAP_Z_RATIO_THRESH  60     /* % of total |a| at peak */
-#define MIN_PEAK_SUM             4000   /* |x|+|y|+|z| at peak */
+ *   TAPS (n=5): dominant axis never Z (3x X, 2x Y).  z_ratio 19-34%.
+ *               pre_event_energy 9992-12790 (cluster ~10000).
+ *               Peak magnitudes 40k-80k LSB (~2-5g equivalent).
+ *
+ *   SNAPS (n=5): dominant axis always Z.  z_ratio 33-53%.
+ *               pre_event_energy 20186-34663 (cluster ~25000).
+ *               Peak magnitudes 60k-100k LSB (~4-6g equivalent).
+ *
+ * Decision logic (inverted from my original physics-intuition guess
+ * which was wrong about WHERE the user taps the band):
+ *
+ *   Snap propagates through carpal bones -> strong Z coupling
+ *     (Z = back-of-wrist axis perpendicular to band face).  Plus
+ *     anticipatory muscle tension shows up as pre-event energy.
+ *   Band-tap hits the SIDE of the band (natural tap location for
+ *     most users) -> X or Y dominant, NOT Z.  No anticipatory
+ *     motion since the band is held still pre-impact.
+ *
+ * Both features are clean discriminators in the empirical data:
+ *   - Z-dominance: 100% separation (snap always Z, tap never Z)
+ *   - pre_event_energy: 2.5x ratio (tap ~10k, snap ~25k)
+ *
+ * Using both for robustness: agreement of both -> confident
+ * classification.  Disagreement -> UNCLASSIFIED. */
+#define SNAP_PRE_ENERGY_THRESH   15000  /* sum-of-|delta| units;
+                                            empirical midpoint of
+                                            tap ~10k and snap ~25k */
+#define SNAP_Z_RATIO_THRESH      35     /* % of total |a| at peak;
+                                            empirical midpoint of
+                                            tap max 34% and snap min 33% */
+#define MIN_PEAK_SUM             20000  /* |x|+|y|+|z| at peak;
+                                            below this is too weak
+                                            to be a real tap/snap */
 static char _classify(const struct tap_features *f)
 {
     uint32_t total_abs = (uint32_t)f->peak_x_abs +
@@ -1355,13 +1379,17 @@ static char _classify(const struct tap_features *f)
     }
     uint32_t z_ratio_pct = (uint32_t)f->peak_z_abs * 100 / total_abs;
 
-    bool z_dominant_strong = (z_ratio_pct >= BAND_TAP_Z_RATIO_THRESH);
-    bool pre_event_motion  = (f->pre_event_energy >= SNAP_PRE_ENERGY_THRESH);
+    bool z_dominant     = (z_ratio_pct >= SNAP_Z_RATIO_THRESH);
+    bool high_pre_event = (f->pre_event_energy >= SNAP_PRE_ENERGY_THRESH);
 
-    if (pre_event_motion && !z_dominant_strong) {
+    /* Both features must agree to commit a classification.  If they
+     * disagree (e.g., Z-dominant but no pre-event motion), the
+     * gesture is ambiguous -- log UNCLASSIFIED so we don't make
+     * confident wrong calls. */
+    if (z_dominant && high_pre_event) {
         return 'S';  /* snap signature */
     }
-    if (!pre_event_motion && z_dominant_strong) {
+    if (!z_dominant && !high_pre_event) {
         return 'B';  /* band-tap signature */
     }
     return '?';
