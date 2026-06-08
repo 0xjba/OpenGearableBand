@@ -1332,46 +1332,47 @@ static uint32_t _compute_pre_event_energy(const uint8_t *buf,
 /* Simple classifier rules.  Returns:
  *   'S' = snap
  *   'B' = band-tap
- *   '?' = unclassified (between thresholds)
+ *   '?' = unclassified (genuinely ambiguous)
  *
- * Rules calibrated from 5-tap + 5-snap hardware test 2026-06-09:
+ * Rules calibrated from 6-tap + 6-snap hardware test 2026-06-09:
  *
- *   TAPS (n=5): dominant axis never Z (3x X, 2x Y).  z_ratio 19-34%.
- *               pre_event_energy 9992-12790 (cluster ~10000).
- *               Peak magnitudes 40k-80k LSB (~2-5g equivalent).
+ *   TAPS (n=6):  pre_event_energy 9967-14055 (max 14055)
+ *                z_ratio 14-34% (mostly ≤ 28% but 2 events at 31/34%)
  *
- *   SNAPS (n=5): dominant axis always Z.  z_ratio 33-53%.
- *               pre_event_energy 20186-34663 (cluster ~25000).
- *               Peak magnitudes 60k-100k LSB (~4-6g equivalent).
+ *   SNAPS (n=6): pre_event_energy 30551-51938 (min 30551)
+ *                z_ratio 30-55% (1 event at exact 30%)
  *
- * Decision logic (inverted from my original physics-intuition guess
- * which was wrong about WHERE the user taps the band):
+ * PRIMARY DISCRIMINATOR: pre_event_energy.  Clean 2.2x gap with no
+ * overlap (tap max 14055, snap min 30551).  Threshold at 20000
+ * lands in the middle.
  *
- *   Snap propagates through carpal bones -> strong Z coupling
- *     (Z = back-of-wrist axis perpendicular to band face).  Plus
- *     anticipatory muscle tension shows up as pre-event energy.
- *   Band-tap hits the SIDE of the band (natural tap location for
- *     most users) -> X or Y dominant, NOT Z.  No anticipatory
- *     motion since the band is held still pre-impact.
+ * WHY pre_event_energy is the right primary feature:
+ *   - Measures CHANGE over a window, not absolute axis values.
+ *     Pose-independent.
+ *   - Snap requires anticipatory hand motion (winding up the
+ *     fingers) which produces ~30-50k delta-energy over 100-200 ms
+ *     before the impulse.
+ *   - Tap with the other hand has near-zero pre-event motion
+ *     because the wrist is held still until impact.  Resulting
+ *     pre_event_energy is just baseline noise (~10-14k).
  *
- * Both features are clean discriminators in the empirical data:
- *   - Z-dominance: 100% separation (snap always Z, tap never Z)
- *   - pre_event_energy: 2.5x ratio (tap ~10k, snap ~25k)
+ * z_ratio is SECONDARY -- pose-dependent (different wrist
+ * orientations make different axes receive the impulse).  Useful
+ * for confirming snap suspicions when pre_event is borderline, but
+ * not reliable as a primary.
  *
- * Using both for robustness: agreement of both -> confident
- * classification.  Disagreement -> UNCLASSIFIED. */
-#define SNAP_PRE_ENERGY_THRESH   15000  /* sum-of-|delta| units;
-                                            empirical: tap cluster ~10k,
-                                            snap cluster ~25k.  Flicked
-                                            taps approach ~17k -- they
-                                            land in UNCLASSIFIED zone
-                                            which is correct (hybrid
-                                            gesture). */
-#define SNAP_Z_RATIO_THRESH      30     /* % of total |a| at peak;
-                                            empirical: tap max 28%,
-                                            snap min 33% (n=9).  30%
-                                            puts threshold in the
-                                            middle of the clean gap. */
+ * For productionization (see project_calibration_and_pose memory):
+ * thresholds will need per-user calibration since gesture intensity
+ * varies.  Current values are tuned for THIS user's right wrist on
+ * an open dev board (no housing).  Housing + per-user variance
+ * means these need to be tunable / learned. */
+#define SNAP_PRE_ENERGY_THRESH   20000  /* sum-of-|delta| units;
+                                            midpoint of empirical
+                                            gap tap-max 14055 to
+                                            snap-min 30551 */
+#define SNAP_Z_RATIO_THRESH      40     /* % -- snap "strong"
+                                            indicator; not primary,
+                                            confirms suspected snaps */
 #define MIN_PEAK_SUM             20000  /* |x|+|y|+|z| at peak;
                                             below this is too weak
                                             to be a real tap/snap */
@@ -1385,20 +1386,18 @@ static char _classify(const struct tap_features *f)
     }
     uint32_t z_ratio_pct = (uint32_t)f->peak_z_abs * 100 / total_abs;
 
-    bool z_dominant     = (z_ratio_pct >= SNAP_Z_RATIO_THRESH);
-    bool high_pre_event = (f->pre_event_energy >= SNAP_PRE_ENERGY_THRESH);
-
-    /* Both features must agree to commit a classification.  If they
-     * disagree (e.g., Z-dominant but no pre-event motion), the
-     * gesture is ambiguous -- log UNCLASSIFIED so we don't make
-     * confident wrong calls. */
-    if (z_dominant && high_pre_event) {
-        return 'S';  /* snap signature */
+    /* Primary: pre_event_energy threshold.  Empirical gap is
+     * clean (2.2x ratio with no overlap on n=12 dataset). */
+    if (f->pre_event_energy >= SNAP_PRE_ENERGY_THRESH) {
+        return 'S';
     }
-    if (!z_dominant && !high_pre_event) {
-        return 'B';  /* band-tap signature */
+    /* Below the snap threshold.  Check if z_ratio is suspiciously
+     * snap-like -- could be an attempted snap with weak anticipatory
+     * motion.  We hold UNCLASSIFIED rather than misclassify. */
+    if (z_ratio_pct >= SNAP_Z_RATIO_THRESH) {
+        return '?';
     }
-    return '?';
+    return 'B';  /* band-tap */
 }
 
 /* Worker thread entry.  Blocks on tap_capture_sem, processes one
