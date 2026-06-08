@@ -144,6 +144,50 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 #define SURFACE_MOTION_BURST_DWELL  15      /* 150 ms at 100 Hz */
 
 /*
+ * Firmware multi-tap counter (Stage C, 2026-06-08).
+ *
+ * The chip is now configured in SDT=0 mode -- it emits ONLY
+ * SINGLE_TAP events, one per shock.  Firmware groups consecutive
+ * arrivals within MULTI_TAP_WINDOW_MS into multi-tap sequences:
+ *   1 tap, no follow-up    -> currently no-op (surface-tap re-engage
+ *                              will hook here in a later stage)
+ *   2 taps within window   -> chained to gesture_mode_on_chip_double_tap
+ *                              (AIR_MOUSE entry)
+ *   3+ taps within window  -> chained to gesture_mode_on_chip_triple_tap
+ *                              (SURFACE entry)
+ *
+ * The window value follows industry guidance (Agent 3 research:
+ * iOS VoiceOver 250 ms default, Arduino 101 CurieIMU 250 ms,
+ * Apple accessibility 500 ms).  250 ms is the human-comfortable
+ * default.
+ *
+ * Commit-on-timeout pattern: each tap arrival updates last_tap_time
+ * and increments count.  The per-sample update polls "has
+ * MULTI_TAP_WINDOW_MS elapsed since the last tap?"  If yes, commits
+ * the sequence and resets.  This gives the disambiguation latency
+ * documented in Choice 3 (Stage A): action fires ~250 ms after the
+ * last tap, accepting that delay so a third tap can still upgrade
+ * the sequence.
+ */
+#define MULTI_TAP_WINDOW_MS         250
+
+/*
+ * Activity gate (Choice 4, Stage C, 2026-06-08).
+ *
+ * Reject chip-tap events if motion residual was high in the
+ * preceding ~500 ms.  Kills the dominant false-positive source
+ * documented in patent literature (gait impacts, wrist-on-surface
+ * micro-contacts during typing).  See AN5040 / ADXL367 AN-2554.
+ *
+ * Implementation: each per-sample update where motion residual
+ * exceeds ACTIVITY_GATE_THRESH resets samples_since_activity to 0.
+ * Otherwise it ticks up.  A tap is accepted only if
+ * samples_since_activity >= ACTIVITY_GATE_DWELL.
+ */
+#define ACTIVITY_GATE_THRESH        1.0f   /* m/s^2 motion residual */
+#define ACTIVITY_GATE_DWELL         50     /* 500 ms at 100 Hz */
+
+/*
  * Per-mode entry-grace window after a cursor mode is entered while
  * NOT already in the expected pose.  Counted down per accel sample.
  * If it hits zero before the user reaches the expected pose, the
@@ -227,6 +271,23 @@ static int surface_motion_burst_dwell = 0;
 static float surface_motion_peak = 0.0f;
 static int   surface_motion_log_counter = 0;
 #define      SURFACE_MOTION_LOG_PERIOD   200    /* 2 s at 100 Hz */
+
+/* Multi-tap counter state.  See MULTI_TAP_WINDOW_MS comment block. */
+static int     multi_tap_count = 0;
+static int64_t multi_tap_last_time_ms = 0;
+/* Diagnostic: last tap's axis/sign characters, included in the
+ * commit log so we can spot patterns (e.g., all-Z = direct band
+ * hit; mixed-axis = snap or surface-transmitted). */
+static char    multi_tap_first_axis = '?';
+static char    multi_tap_first_sign = '?';
+
+/* Activity gate state.  See ACTIVITY_GATE_* comment block.
+ * samples_since_activity counts up per accel sample (saturated at
+ * ACTIVITY_GATE_DWELL since the precise high value doesn't matter
+ * once the gate is open), and resets to 0 when motion residual
+ * exceeds ACTIVITY_GATE_THRESH.  Initialised at the saturation
+ * value so the gate is open at boot. */
+static int     samples_since_activity = ACTIVITY_GATE_DWELL;
 
 /* Cooldown after a cursor mode exits via orientation-drop.  During
  * the cooldown window, the user can return to the same mode by
@@ -436,6 +497,15 @@ static WristOrientation _classify_orientation(float gx, float gy, float gz)
  * from inside _transition_to to notify acq edges. */
 static void _update_acq_request(void);
 
+/* Flag set by the cooldown re-engage path before calling
+ * _transition_to(), so the "entered while already in pose" log can
+ * be suppressed -- the re-engage path already logged "Cooldown
+ * re-engage (MODE): N ms remaining when fired" which provides full
+ * context.  Without this, cooldown re-engages produce a misleading
+ * "entered while already in pose" line that reads like a fresh cold
+ * entry.  Cleared inside _transition_to after the check. */
+static bool s_transition_via_cooldown_reengage = false;
+
 static void _transition_to(GestureMode new_mode)
 {
     GestureMode old = (GestureMode)atomic_get(&mode_atomic);
@@ -452,6 +522,12 @@ static void _transition_to(GestureMode new_mode)
     surface_motion_burst_dwell = 0;
     surface_motion_peak = 0.0f;
     surface_motion_log_counter = 0;
+    /* Multi-tap counter and activity gate persist across transitions
+     * by design: a tap arriving DURING the disambiguation window
+     * that triggers a mode change (e.g., AIR_MOUSE entry on tap 2)
+     * should still be folded if a 3rd tap arrives quickly, upgrading
+     * to triple-tap.  We rely on _check_tap_timeout() in the per-sample
+     * update to commit and reset cleanly.  No reset here. */
 
     /* Manage the cursor-mode entry-grace state machine.  Same logic
      * for AIR_MOUSE and SURFACE -- only the "expected pose" varies.
@@ -482,9 +558,18 @@ static void _transition_to(GestureMode new_mode)
                                          : "flat wrist (palm-down)";
         if (cursor_has_reached_pose) {
             entry_grace_remaining = 0;
-            LOG_INF("%s entered while already in %s pose -- "
-                    "exit detection armed immediately",
-                    mode_str, pose_str);
+            /* During a cooldown re-engage the user has just returned
+             * to the expected pose, so cursor_has_reached_pose is
+             * naturally true.  The re-engage path already logged
+             * "Cooldown re-engage" with context, so suppress the
+             * otherwise-misleading "already in pose" line.  Only log
+             * for fresh cold entries (e.g. user double-taps the band
+             * while their wrist happens to already be raised). */
+            if (!s_transition_via_cooldown_reengage) {
+                LOG_INF("%s entered while already in %s pose -- "
+                        "exit detection armed immediately",
+                        mode_str, pose_str);
+            }
         } else {
             entry_grace_remaining = _entry_grace_for(new_mode);
             LOG_INF("%s entered -- assume %s pose within %d ms to "
@@ -496,6 +581,11 @@ static void _transition_to(GestureMode new_mode)
         entry_grace_remaining = 0;
         cursor_reference_valid = false;
     }
+
+    /* Clear the cooldown-reengage flag unconditionally so it never
+     * leaks across transitions (the entry-grace -> IDLE path skips
+     * the branches above that would otherwise consume it). */
+    s_transition_via_cooldown_reengage = false;
 
     /* Re-evaluate the acq-request edge.  Acq must stay alive while a
      * cursor mode is active OR a cooldown is open -- without samples
@@ -556,6 +646,11 @@ void gesture_mode_init(void)
     surface_motion_burst_dwell = 0;
     surface_motion_peak = 0.0f;
     surface_motion_log_counter = 0;
+    multi_tap_count = 0;
+    multi_tap_last_time_ms = 0;
+    multi_tap_first_axis = '?';
+    multi_tap_first_sign = '?';
+    samples_since_activity = ACTIVITY_GATE_DWELL;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -624,6 +719,59 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         }
     }
 
+    /* Activity gate maintenance.  Compute motion residual once and
+     * reset samples_since_activity to 0 if motion is "active"; tick
+     * up to the saturation point otherwise.  See ACTIVITY_GATE_*
+     * comment block for design intent. */
+    {
+        float rx = ax - gx_filt;
+        float ry = ay - gy_filt;
+        float rz = az - gz_filt;
+        float r_mag = sqrtf(rx * rx + ry * ry + rz * rz);
+        if (r_mag > ACTIVITY_GATE_THRESH) {
+            samples_since_activity = 0;
+        } else if (samples_since_activity < ACTIVITY_GATE_DWELL) {
+            samples_since_activity++;
+        }
+    }
+
+    /* Multi-tap commit-on-timeout.  See MULTI_TAP_WINDOW_MS comment
+     * block for the design rationale (Choice 3 disambiguation
+     * latency).  Fires the accumulated 1/2/3-tap action when
+     * MULTI_TAP_WINDOW_MS has elapsed since the last tap arrived. */
+    if (multi_tap_count > 0) {
+        int64_t now = k_uptime_get();
+        if ((now - multi_tap_last_time_ms) > MULTI_TAP_WINDOW_MS) {
+            int n = multi_tap_count;
+            char first_axis = multi_tap_first_axis;
+            char first_sign = multi_tap_first_sign;
+            multi_tap_count = 0;
+            multi_tap_last_time_ms = 0;
+            multi_tap_first_axis = '?';
+            multi_tap_first_sign = '?';
+
+            if (n == 1) {
+                /* Lone single tap.  Currently no action -- the
+                 * surface-tap re-engage path will hook here later
+                 * once Stage E feature extraction can confirm the
+                 * tap is a surface-tap (not a stray band-tap). */
+                LOG_INF("Multi-tap commit: 1 (lone single, axis=%c "
+                        "sign=%c -- no action wired yet)",
+                        first_axis, first_sign);
+            } else if (n == 2) {
+                LOG_INF("Multi-tap commit: 2 (axis=%c sign=%c -> "
+                        "AIR_MOUSE entry via chip-double-tap path)",
+                        first_axis, first_sign);
+                gesture_mode_on_chip_double_tap();
+            } else { /* 3 or more */
+                LOG_INF("Multi-tap commit: %d (axis=%c sign=%c -> "
+                        "SURFACE entry via chip-triple-tap path)",
+                        n, first_axis, first_sign);
+                gesture_mode_on_chip_triple_tap();
+            }
+        }
+    }
+
     /* Helper: which orientation does the given cursor mode expect? */
     auto expected_pose_for = [](GestureMode m) -> WristOrientation {
         return (m == MODE_AIR_MOUSE) ? WRIST_UP_RAISED : WRIST_DOWN_FLAT;
@@ -646,6 +794,11 @@ void gesture_mode_update_accel(float ax, float ay, float az)
                         cursor_cooldown_remaining * 10);
                 GestureMode target = cursor_cooldown_mode;
                 cursor_cooldown_remaining = 0;
+                /* Flag the upcoming transition so _transition_to
+                 * suppresses the "entered while already in pose"
+                 * log -- the line above already explains we're
+                 * coming back from cooldown. */
+                s_transition_via_cooldown_reengage = true;
                 _transition_to(target);
             }
         }
@@ -872,6 +1025,53 @@ void gesture_mode_on_chip_double_tap(void)
                 "entry-only; exit by lowering the wrist)",
                 _mode_str(current_mode));
     }
+}
+
+void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
+{
+    /* Stage C (2026-06-08): firmware multi-tap counter.  Each
+     * SINGLE_TAP arrival from the chip is gated by the activity
+     * detector, then folded into a running count.  The per-sample
+     * timeout check in gesture_mode_update_accel() commits the
+     * accumulated count to a 1/2/3-tap action MULTI_TAP_WINDOW_MS
+     * after the last arrival. */
+
+    GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
+
+    /* Activity gate: reject the event if motion residual was high
+     * recently.  Kills gait + typing false-positives that the chip's
+     * SHOCK+QUIET windows alone won't filter (those are debounce
+     * within a tap, not "is this a tap or background motion"). */
+    if (samples_since_activity < ACTIVITY_GATE_DWELL) {
+        LOG_INF("Chip single-tap GATED by recent motion "
+                "(%d ms ago, axis=%c sign=%c mode=%s)",
+                samples_since_activity * 10,
+                peak_axis, tap_sign,
+                _mode_str(current_mode));
+        return;
+    }
+
+    int64_t now = k_uptime_get();
+    bool starts_new_sequence =
+        (multi_tap_count == 0) ||
+        ((now - multi_tap_last_time_ms) > MULTI_TAP_WINDOW_MS);
+
+    if (starts_new_sequence) {
+        multi_tap_count = 1;
+        multi_tap_first_axis = peak_axis;
+        multi_tap_first_sign = tap_sign;
+    } else {
+        multi_tap_count++;
+    }
+    multi_tap_last_time_ms = now;
+
+    LOG_INF("Chip single-tap: axis=%c sign=%c (sequence count=%d, "
+            "first axis=%c, mode=%s orient=%s)",
+            peak_axis, tap_sign,
+            multi_tap_count,
+            multi_tap_first_axis,
+            _mode_str(current_mode),
+            _orientation_str(orientation_current));
 }
 
 void gesture_mode_on_chip_triple_tap(void)

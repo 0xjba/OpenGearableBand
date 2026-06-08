@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -52,6 +54,75 @@ int max30102_wake(void);
  */
 int lsm6dsl_enable_sign_motion(void);
 int lsm6dsl_disable_sign_motion(void);
+
+/* LSM6DSL chip-embedded tap engine ---------------------------------------
+ *
+ * The chip's tap state machine generates SINGLE_TAP and DOUBLE_TAP events
+ * via hardware-debounced shock/quiet/duration windows configured in
+ * INT_DUR2.  Both events route to the same INT1 GPIO our sig-motion
+ * already uses, sharing the pin (the chip ORs them at the pad).  The
+ * INT1 consumer demuxes by reading TAP_SRC + FUNC_SRC1.
+ *
+ * Configuration choices baked into enable():
+ *   - ODR_XL bumped to 416 Hz while tap is armed.  Industry-standard
+ *     for tap on this chip family: ST's own Mbed LSM6DSL driver
+ *     hardcodes 416 Hz inside its Enable_Single_Tap_Detection() and
+ *     Enable_Double_Tap_Detection() functions, and every working
+ *     community example (SparkFun, Ozzmaker) uses 416 Hz.  We restore
+ *     the driver's 104 Hz on disable.
+ *   - Full-scale stays at the driver-configured ±2 g (default)
+ *   - LIR (latched interrupt) = 1, latched.  Empirically pivoted
+ *     2026-06-08 from the LIR=0 community baseline after Test 4
+ *     showed isolated single-tap events were race-lost.  Per ST
+ *     AN4987 "critical for reliable tap detection applications."
+ *     INT1 stays high until the consumer thread reads TAP_SRC --
+ *     zero race risk regardless of wake latency.
+ *   - SINGLE_DOUBLE_TAP = 0: chip emits ONLY SINGLE_TAP events.
+ *     Firmware multi-tap counter in gesture_mode.cpp derives double-
+ *     and triple-tap with its own timing window.  Pivoted 2026-06-08
+ *     from SDT=1 because LIR=1 + SDT=1 only latches the double-tap
+ *     line (per AN5040), losing single-tap reliability that we need
+ *     for firmware-derived triple-tap.  Net: same effective vocabulary,
+ *     cleaner architecture, no race risk.
+ *   - Tap detection enabled on X, Y, and Z (wristband can be hit from
+ *     any direction; the tap engine uses the |slope| of whichever
+ *     axis dominates)
+ *   - INTERRUPTS_ENABLE bit set -- the LSM6DS3TR-C variant gates ALL
+ *     embedded-event interrupts on this bit, silent failure if missed
+ *
+ * tap_threshold: the TAP_THS field of TAP_THS_6D (5 bits, 0-31).  LSB
+ *   value = FS_XL / 32.  At ±2 g, 1 LSB ≈ 62.5 mg.  Tuned empirically
+ *   via calibration mode -- 0x08 (~500 mg) is the initial guess.
+ *
+ * Returns 0 on success, negative errno on I2C failure.
+ */
+int lsm6dsl_tap_engine_enable(uint8_t tap_threshold);
+int lsm6dsl_tap_engine_disable(void);
+
+/* Runtime threshold tuning during calibration mode.  Updates the TAP_THS
+ * field of TAP_THS_6D without disturbing the 6D-orientation bits.
+ * threshold: 0-31 (5-bit value). */
+int lsm6dsl_tap_set_threshold(uint8_t threshold);
+
+/* Source-register reads used by the INT1 dispatcher.  Both registers
+ * are read-on-the-fly when INT1 fires; the chip clears them on read
+ * (or after LIR), so each call returns the events that have fired
+ * since the last read.
+ *
+ *   TAP_SRC (0x1C) bits:
+ *     [6] TAP_IA       -- umbrella: any tap event fired
+ *     [5] SINGLE_TAP   -- single tap detected this event
+ *     [4] DOUBLE_TAP   -- double tap detected this event
+ *     [3] TAP_SIGN     -- sign of slope at detection (1 = negative)
+ *     [2] X_TAP        -- tap on X
+ *     [1] Y_TAP        -- tap on Y
+ *     [0] Z_TAP        -- tap on Z
+ *
+ *   FUNC_SRC1 (0x53) bit [6]: SIGN_MOTION_IA (significant motion)
+ *
+ * Returns 0 on success, negative errno on I2C failure. */
+int lsm6dsl_read_tap_src(uint8_t *src);
+int lsm6dsl_read_func_src1(uint8_t *src);
 
 #ifdef __cplusplus
 }

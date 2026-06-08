@@ -488,6 +488,20 @@ static const struct device *console_uart =
 // because a stray "old" value just delays the action by one poll cycle.
 static volatile uint8_t pending_cmd = 0;
 
+// Tap calibration mode -- set by the 'c' serial command.  When true,
+// every chip-tap event logs extra diagnostic info (current TAP_THS
+// value, activity-gate state).  Helps tune TAP_THS empirically per
+// the discipline established 2026-06-07: pick threshold from real
+// data, not datasheet guesses.
+static volatile bool tap_calibration_mode = false;
+
+// Current chip TAP_THS_6D register value (the threshold).  Tracked
+// in firmware so '+'/'-' serial commands can adjust it at runtime
+// without re-reading from the chip.  Updated by lsm6dsl_tap_set_threshold().
+// Initial value matches what lsm6dsl_tap_engine_enable(0x08) writes.
+// 1 LSB ≈ 62.5 mg at FS=±2g.
+static volatile uint8_t current_tap_ths = 0x08;
+
 // Serial-console "mouse test mode" -- set by the 'm' command.  While
 // active, WASD inject cursor deltas, 1/2 generate clicks, comma/period
 // scroll.  Lets us prove the cursor pipeline + HID + host integration
@@ -547,6 +561,18 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // Stage 1 stand-in for triple-tap -- the SURFACE entry
             // trigger.  Same Stage 2 deferral story as 't'.
             pending_cmd = 'y';
+        } else if (c == 'c' || c == 'C') {
+            // Tap calibration mode toggle.  When on, chip-tap events
+            // log extra diagnostic info (current TAP_THS + activity
+            // gate state).  Used with '+'/'-' to find the right
+            // threshold for the user's specific environment.
+            pending_cmd = 'c';
+        } else if (c == '+') {
+            // Lower TAP_THS by 2 LSB (~125 mg) -- more sensitive.
+            pending_cmd = '+';
+        } else if (c == '-') {
+            // Raise TAP_THS by 2 LSB (~125 mg) -- less sensitive.
+            pending_cmd = '-';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -575,6 +601,8 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  't'=simulate chip double-tap (AIR_MOUSE entry)");
     LOG_INF("  'y'=simulate chip triple-tap (SURFACE entry)");
     LOG_INF("  'm'=force mouse test mode (wasd=move, 1/2=click, ,/.=scroll, m again exits)");
+    LOG_INF("  'c'=toggle chip-tap calibration logging");
+    LOG_INF("  '+'=lower TAP_THS (more sensitive)   '-'=raise TAP_THS (less sensitive)");
 
     /* Per-step cursor delta for the mouse-test injects.  10 pixels
      * per press gives a clearly visible cursor jump on the host. */
@@ -692,6 +720,36 @@ void reset_thread_entry(void *, void *, void *) {
             pending_cmd = 0;
             LOG_INF("Simulating chip triple-tap event");
             gesture_mode_on_chip_triple_tap();
+        } else if (cmd == 'c') {
+            pending_cmd = 0;
+            tap_calibration_mode = !tap_calibration_mode;
+            LOG_INF("Tap calibration mode %s -- TAP_THS=0x%02x "
+                    "(~%d mg at FS=2g).  Use '+'/'-' to adjust.",
+                    tap_calibration_mode ? "ON" : "OFF",
+                    current_tap_ths,
+                    current_tap_ths * 62);  /* ~62.5 mg per LSB at ±2g */
+        } else if (cmd == '+') {
+            pending_cmd = 0;
+            /* Lower threshold by 2 LSB (~125 mg), bounded at 1 (so we
+             * never go below the minimum useful value). */
+            uint8_t new_ths = (current_tap_ths > 2) ? (current_tap_ths - 2) : 1;
+            int err = lsm6dsl_tap_set_threshold(new_ths);
+            if (err == 0) {
+                current_tap_ths = new_ths;
+                LOG_INF("TAP_THS lowered to 0x%02x (~%d mg) -- more sensitive",
+                        new_ths, new_ths * 62);
+            }
+        } else if (cmd == '-') {
+            pending_cmd = 0;
+            /* Raise threshold by 2 LSB (~125 mg), bounded at 0x1F (max
+             * 5-bit value, ~1.94g). */
+            uint8_t new_ths = (current_tap_ths < 0x1D) ? (current_tap_ths + 2) : 0x1F;
+            int err = lsm6dsl_tap_set_threshold(new_ths);
+            if (err == 0) {
+                current_tap_ths = new_ths;
+                LOG_INF("TAP_THS raised to 0x%02x (~%d mg) -- less sensitive",
+                        new_ths, new_ths * 62);
+            }
         }
         k_sleep(K_MSEC(50));
     }
@@ -945,13 +1003,73 @@ static void run_idle(void) {
     };
     k_poll(events, ARRAY_SIZE(events), K_FOREVER);
 
-    // Motion takes priority over a snapshot tick that fired at the same
-    // moment -- we'd rather start tracking the workout than burn the
-    // 15s on a snapshot first.
+    // INT1 fired -- demux the source.  The pin is shared between
+    // sig-motion (routed via INT1_CTRL bit 6) and the chip-embedded
+    // tap engine (routed via MD1_CFG); both can fire on the same
+    // edge and we have to read each source register to know what
+    // happened.
     if (events[1].state == K_POLL_STATE_SEM_AVAILABLE) {
         k_sem_take(&motion_wake_sem, K_NO_WAIT);
-        k_sem_reset(&snapshot_tick_sem);  // ignore the tick we didn't service
-        transition_to_workout_verify();
+
+        uint8_t tap_src = 0, func_src1 = 0;
+        lsm6dsl_read_tap_src(&tap_src);
+        lsm6dsl_read_func_src1(&func_src1);
+
+        bool tap_fired = (tap_src & (1U << 6)) != 0;     // TAP_IA
+        bool sigm_fired = (func_src1 & (1U << 6)) != 0;  // SIGN_MOTION_IA
+
+        // Tap-event dispatch.  Under SINGLE_DOUBLE_TAP=0 mode the
+        // chip emits ONLY SINGLE_TAP events -- each shock that
+        // passes the chip's SHOCK+QUIET hardware debounce fires
+        // independently.  Firmware multi-tap counter in
+        // gesture_mode_on_chip_single_tap() derives double-tap
+        // (AIR_MOUSE entry) and triple-tap (SURFACE entry) from
+        // consecutive single-tap arrivals with its own ~250 ms
+        // timing window.
+        //
+        // The DOUBLE_TAP bit in TAP_SRC will never be set under
+        // SDT=0 -- we don't read it.  Reading TAP_SRC also drops
+        // the LIR latch and de-asserts INT1, freeing the chip to
+        // fire the next event.
+        //
+        // This path does NOT change power state.
+        if (tap_fired) {
+            char axis = (tap_src & 0x04) ? 'X' :
+                        (tap_src & 0x02) ? 'Y' :
+                        (tap_src & 0x01) ? 'Z' : '?';
+            char sign = (tap_src & 0x08) ? '-' : '+';
+
+            /* When calibration mode is on, dump the raw TAP_SRC byte
+             * + current threshold for empirical-tuning visibility.
+             * The gesture-mode handler will additionally log the
+             * activity-gate decision and sequence count. */
+            if (tap_calibration_mode) {
+                LOG_INF("[CAL] tap event: TAP_SRC=0x%02x axis=%c sign=%c "
+                        "(threshold=0x%02x ~%d mg)",
+                        tap_src, axis, sign,
+                        current_tap_ths,
+                        current_tap_ths * 62);
+            }
+
+            gesture_mode_on_chip_single_tap(axis, sign);
+        }
+
+        // Sig-motion event: standard workout-verify path.  We only
+        // honour sig-motion when it actually fired (not just because
+        // a stale wake from earlier left the semaphore set).
+        if (sigm_fired) {
+            k_sem_reset(&snapshot_tick_sem);  // ignore tick we didn't service
+            transition_to_workout_verify();
+            return;
+        }
+
+        // Neither bit set: stale signal, just stay in IDLE and let
+        // the poll loop re-arm.
+        if (!tap_fired && !sigm_fired) {
+            LOG_DBG("INT1 fired but no source bit set "
+                    "(TAP_SRC=0x%02x FUNC_SRC1=0x%02x)",
+                    tap_src, func_src1);
+        }
         return;
     }
     if (events[0].state == K_POLL_STATE_SEM_AVAILABLE) {
@@ -1176,6 +1294,24 @@ int main(void) {
     // start, are owned by the power state machine (it transitions
     // into IDLE on boot, which configures both).
     motion_wake_init();
+
+    // Enable the chip-embedded tap engine.  Tap stays on for the whole
+    // device lifetime -- it shares INT1 with sig-motion (routed via
+    // MD1_CFG vs INT1_CTRL respectively, no register conflict), and
+    // the dispatcher in run_idle() demuxes which event source fired.
+    //
+    // Initial TAP_THS = 0x08 (~500 mg at FS=±2g): a moderate threshold
+    // we'll tune empirically via calibration mode in a later stage.
+    // Don't fail boot on tap-enable error -- log and continue so we
+    // still get basic gesture / HR functionality even if the I2C
+    // sequence hits a transient error.
+    {
+        int err = lsm6dsl_tap_engine_enable(0x08);
+        if (err) {
+            LOG_ERR("LSM6DSL tap engine enable failed (%d) -- continuing "
+                    "without chip tap detection", err);
+        }
+    }
 
     // Start the cursor publish thread.  Idle until the gesture mode
     // transitions into a cursor-bearing mode (AIR_MOUSE or SURFACE),

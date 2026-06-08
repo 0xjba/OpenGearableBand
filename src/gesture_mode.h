@@ -132,14 +132,44 @@ void gesture_mode_update_gyro(float gx, float gy, float gz);
 void gesture_mode_on_chip_double_tap(void);
 
 /*
+ * Inform the mode detector that the LSM6DSL chip-embedded SINGLE_TAP
+ * interrupt fired (without a co-asserted DOUBLE_TAP bit -- the
+ * dispatcher in main.cpp prefers DOUBLE_TAP when both are set on
+ * the same TAP_SRC read).
+ *
+ * This entry point feeds a firmware-side multi-tap counter (added
+ * in stage C).  Per the design:
+ *   - 3 single-tap events inside a window -> chained to
+ *     _on_chip_triple_tap() (SURFACE entry).  This is the firmware-
+ *     side path because the chip is native single + double only.
+ *   - 1 event, no follow-up within window -> currently a no-op; the
+ *     surface-tap re-engage path (later) will hook here.
+ *   - 2 single-taps without a co-asserted DOUBLE_TAP would be
+ *     unusual (the chip's hardware double-tap classifier should
+ *     fire on the second shock) -- if observed, gets counted toward
+ *     the 3-for-triple window.
+ *
+ * The counter is gated by an activity check (must have been still
+ * for ~500 ms prior) to suppress gait-driven false positives.
+ *
+ * In stage B, this entry is a stub that only logs the arrival --
+ * lets us validate that chip taps reach the firmware before we
+ * layer the counter logic on top.
+ *
+ * Called from the INT1 dispatcher in main.cpp after reading TAP_SRC.
+ *   peak_axis: 'X', 'Y', or 'Z' (axis where slope dominated)
+ *   tap_sign:  '+' or '-' (sign of the slope at detection)
+ */
+void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign);
+
+/*
  * Inform the mode detector that a triple-tap was detected.  Triple-tap
  * is the SURFACE entry trigger -- the wrist-on-desk "touchpad" pose.
  * Called from IDLE -> enters SURFACE.  Called from any non-IDLE state
  * -> ignored (logged).
  *
- * Once Stage 2 wires the chip-embedded tap engine, this fires from
- * the GPIO INT callback in main.cpp.  Stage 1 wires it to the serial
- * 'y' test command for FSM validation without the register work.
+ * Wired to the serial 'y' test command and to the firmware multi-tap
+ * counter (stage C) when 3 single-taps land inside the window.
  */
 void gesture_mode_on_chip_triple_tap(void);
 
