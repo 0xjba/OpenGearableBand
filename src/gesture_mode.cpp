@@ -283,6 +283,17 @@ static int64_t multi_tap_last_time_ms = 0;
 static char    multi_tap_first_axis = '?';
 static char    multi_tap_first_sign = '?';
 
+/* k_work_delayable that fires MULTI_TAP_WINDOW_MS after the last
+ * tap arrival to commit the accumulated sequence.  Rescheduled on
+ * each tap (resets the timer), so the work only fires once the
+ * sequence has gone quiet.  Independent of the acq pipeline --
+ * fires regardless of whether gesture_mode_update_accel is being
+ * called, which is what the per-sample check used to depend on
+ * (and the bug 2026-06-08 that this work item fixes). */
+static void multi_tap_commit_handler(struct k_work *work_arg);
+static K_WORK_DELAYABLE_DEFINE(multi_tap_commit_work,
+                               multi_tap_commit_handler);
+
 /* Activity gate state.  See ACTIVITY_GATE_* comment block.
  * samples_since_activity counts up per accel sample (saturated at
  * ACTIVITY_GATE_DWELL since the precise high value doesn't matter
@@ -737,42 +748,13 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         }
     }
 
-    /* Multi-tap commit-on-timeout.  See MULTI_TAP_WINDOW_MS comment
-     * block for the design rationale (Choice 3 disambiguation
-     * latency).  Fires the accumulated 1/2/3-tap action when
-     * MULTI_TAP_WINDOW_MS has elapsed since the last tap arrived. */
-    if (multi_tap_count > 0) {
-        int64_t now = k_uptime_get();
-        if ((now - multi_tap_last_time_ms) > MULTI_TAP_WINDOW_MS) {
-            int n = multi_tap_count;
-            char first_axis = multi_tap_first_axis;
-            char first_sign = multi_tap_first_sign;
-            multi_tap_count = 0;
-            multi_tap_last_time_ms = 0;
-            multi_tap_first_axis = '?';
-            multi_tap_first_sign = '?';
-
-            if (n == 1) {
-                /* Lone single tap.  Currently no action -- the
-                 * surface-tap re-engage path will hook here later
-                 * once Stage E feature extraction can confirm the
-                 * tap is a surface-tap (not a stray band-tap). */
-                LOG_INF("Multi-tap commit: 1 (lone single, axis=%c "
-                        "sign=%c -- no action wired yet)",
-                        first_axis, first_sign);
-            } else if (n == 2) {
-                LOG_INF("Multi-tap commit: 2 (axis=%c sign=%c -> "
-                        "AIR_MOUSE entry via chip-double-tap path)",
-                        first_axis, first_sign);
-                gesture_mode_on_chip_double_tap();
-            } else { /* 3 or more */
-                LOG_INF("Multi-tap commit: %d (axis=%c sign=%c -> "
-                        "SURFACE entry via chip-triple-tap path)",
-                        n, first_axis, first_sign);
-                gesture_mode_on_chip_triple_tap();
-            }
-        }
-    }
+    /* Multi-tap commit-on-timeout MOVED to a k_work_delayable
+     * scheduled from gesture_mode_on_chip_single_tap().  Reason:
+     * gesture_mode_update_accel runs from the acq pipeline, which
+     * is NOT active in IDLE with no cursor mode and no cooldown.
+     * Without acq running, the per-sample timeout check would
+     * never fire and multi-tap sequences would never commit (real
+     * bug observed 2026-06-08).  See multi_tap_commit_handler. */
 
     /* Helper: which orientation does the given cursor mode expect? */
     auto expected_pose_for = [](GestureMode m) -> WristOrientation {
@@ -1067,6 +1049,11 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
     }
     multi_tap_last_time_ms = now;
 
+    /* (Re)schedule the commit-on-timeout work item.  Each tap
+     * arrival pushes the timeout out by MULTI_TAP_WINDOW_MS.  When
+     * the tap sequence goes quiet, the work fires once and commits. */
+    k_work_reschedule(&multi_tap_commit_work, K_MSEC(MULTI_TAP_WINDOW_MS));
+
     LOG_INF("Chip single-tap: axis=%c sign=%c (sequence count=%d, "
             "first axis=%c, mode=%s orient=%s)",
             peak_axis, tap_sign,
@@ -1074,6 +1061,52 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
             multi_tap_first_axis,
             _mode_str(current_mode),
             _orientation_str(orientation_current));
+}
+
+/* Multi-tap commit-on-timeout handler.  Fires once MULTI_TAP_WINDOW_MS
+ * after the last tap arrival.  Walks the accumulated count to a
+ * 1/2/3+-tap action and chains to the existing chip-event handlers
+ * (_on_chip_double_tap for AIR_MOUSE entry, _on_chip_triple_tap for
+ * SURFACE entry).
+ *
+ * Runs in system workqueue context.  Concurrent access with
+ * gesture_mode_on_chip_single_tap (which runs in the run_idle thread)
+ * is benign: the worst case is the work fires concurrently with a
+ * new tap arriving, which would commit count N and immediately start
+ * a fresh sequence -- correct behavior.  The k_work_reschedule
+ * already takes care of cancel-and-restart races. */
+static void multi_tap_commit_handler(struct k_work *work_arg)
+{
+    if (multi_tap_count == 0) {
+        return;
+    }
+    int n = multi_tap_count;
+    char first_axis = multi_tap_first_axis;
+    char first_sign = multi_tap_first_sign;
+    multi_tap_count = 0;
+    multi_tap_last_time_ms = 0;
+    multi_tap_first_axis = '?';
+    multi_tap_first_sign = '?';
+
+    if (n == 1) {
+        /* Lone single tap.  Currently no action -- the surface-tap
+         * re-engage path will hook here later once feature
+         * extraction (Stage E) can confirm the tap is a surface-tap
+         * (not a stray band-tap). */
+        LOG_INF("Multi-tap commit: 1 (lone single, axis=%c sign=%c "
+                "-- no action wired yet)",
+                first_axis, first_sign);
+    } else if (n == 2) {
+        LOG_INF("Multi-tap commit: 2 (axis=%c sign=%c -> AIR_MOUSE "
+                "entry via chip-double-tap path)",
+                first_axis, first_sign);
+        gesture_mode_on_chip_double_tap();
+    } else { /* 3 or more */
+        LOG_INF("Multi-tap commit: %d (axis=%c sign=%c -> SURFACE "
+                "entry via chip-triple-tap path)",
+                n, first_axis, first_sign);
+        gesture_mode_on_chip_triple_tap();
+    }
 }
 
 void gesture_mode_on_chip_triple_tap(void)

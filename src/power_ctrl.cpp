@@ -158,6 +158,7 @@ int max30102_wake(void)     { return max30102_set_shdn(false); }
 #define LSM6DSL_FIFO_MODE_FIFO         0x01  /* stop on full */
 #define LSM6DSL_FIFO_MODE_CONTINUOUS   0x06
 #define LSM6DSL_FIFO_ODR_1_66KHZ       (0xA << 3)
+#define LSM6DSL_FIFO_ODR_416HZ         (0x6 << 3)
 
 /* FIFO_STATUS2 bit 6 = FIFO_FULL (FIFO at threshold).  Bits [10:0]
  * across STATUS1/2 = DIFF_FIFO (current word count, 1 word = 2 bytes). */
@@ -427,13 +428,23 @@ int lsm6dsl_read_func_src1(uint8_t *src)
 
 int lsm6dsl_fifo_enable_continuous(void)
 {
-    /* Step 1: bump CTRL1_XL ODR to 1.66 kHz (FIFO ODR must be ≤
-     * sensor ODR per AN5040).  This overrides the 416 Hz that
-     * lsm6dsl_tap_engine_enable() left in place. */
-    int err = lsm6dsl_update_bits(LSM6DSL_REG_CTRL1_XL,
-                                  LSM6DSL_CTRL1_XL_ODR_MASK,
-                                  0xA << 4);   /* 1010 = 1.66 kHz */
-    if (err) return err;
+    /* Step 1: KEEP CTRL1_XL ODR at 416 Hz (do NOT bump higher).
+     *
+     * Hardware empirical (2026-06-08): bumping sensor ODR to 1.66 kHz
+     * caused the chip's SHOCK/QUIET tap-debounce windows to shrink
+     * proportionally (from 58/29 ms to 14.5/7.2 ms).  Band housing
+     * mechanical ringing post-impact lasts ~20+ ms, which exceeded
+     * the shortened QUIET window -- so each physical tap fired the
+     * chip TWICE (initial impact + ringing).  Caught in Test logs
+     * showing 3-ms-apart tap pairs.
+     *
+     * FIFO ODR must be ≤ sensor ODR.  Keeping sensor at 416 Hz means
+     * FIFO at 416 Hz.  At 6 bytes/sample, 4 KB FIFO buffers ~1.6 s
+     * of pre-event signal -- plenty for any plausible window.
+     *
+     * Net: no CTRL1_XL change here.  Whatever lsm6dsl_tap_engine_enable
+     * configured (416 Hz) stays in place. */
+    int err = 0;
 
     /* Step 2: set FIFO threshold high (max 0x7FF in CTRL1+CTRL2),
      * but we don't actually use the watermark interrupt -- the tap
@@ -457,34 +468,43 @@ int lsm6dsl_fifo_enable_continuous(void)
                              LSM6DSL_REG_FIFO_CTRL4, 0x00);
     if (err) return err;
 
-    /* Step 4: FIFO mode = continuous (110b), FIFO ODR = 1.66 kHz.
+    /* Step 4: FIFO mode = continuous (110b), FIFO ODR = 416 Hz
+     * (matches sensor ODR set by tap engine; see step 1 rationale).
      * This starts the FIFO actively writing. */
     err = i2c_reg_write_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
                              LSM6DSL_REG_FIFO_CTRL5,
-                             LSM6DSL_FIFO_ODR_1_66KHZ |
+                             LSM6DSL_FIFO_ODR_416HZ |
                              LSM6DSL_FIFO_MODE_CONTINUOUS);
     if (err) return err;
 
-    LOG_INF("LSM6DSL: FIFO enabled (continuous mode, 1.66 kHz, "
-            "accel-only) -- ~410 ms pre-event window");
+    /* Diagnostic readback: confirm FIFO_CTRL5 actually took the value
+     * we wrote.  Read-back-verify on the FIFO-empty issue from
+     * earlier hardware test -- if config didn't stick, we want to
+     * see it in logs. */
+    uint8_t fc5_readback = 0;
+    int rerr = i2c_reg_read_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
+                                 LSM6DSL_REG_FIFO_CTRL5, &fc5_readback);
+    if (rerr == 0) {
+        LOG_INF("LSM6DSL: FIFO_CTRL5 read-back = 0x%02x "
+                "(expected 0x%02x)", fc5_readback,
+                LSM6DSL_FIFO_ODR_416HZ | LSM6DSL_FIFO_MODE_CONTINUOUS);
+    }
+
+    LOG_INF("LSM6DSL: FIFO enabled (continuous mode, 416 Hz, "
+            "accel-only) -- ~1.6 s pre-event window");
     return 0;
 }
 
 int lsm6dsl_fifo_disable(void)
 {
-    /* Bypass mode resets FIFO content and stops the engine. */
+    /* Bypass mode resets FIFO content and stops the engine.  Note:
+     * sensor ODR is NOT touched -- we don't bump it on enable (kept
+     * at the 416 Hz tap engine set), so no restore is needed. */
     int err = lsm6dsl_update_bits(LSM6DSL_REG_FIFO_CTRL5,
                                   0x07, LSM6DSL_FIFO_MODE_BYPASS);
     if (err) return err;
 
-    /* Restore the tap-engine ODR (416 Hz) so tap detection still
-     * works after FIFO is off. */
-    err = lsm6dsl_update_bits(LSM6DSL_REG_CTRL1_XL,
-                              LSM6DSL_CTRL1_XL_ODR_MASK,
-                              LSM6DSL_CTRL1_XL_ODR_416HZ);
-    if (err) return err;
-
-    LOG_INF("LSM6DSL: FIFO disabled, ODR restored to 416 Hz");
+    LOG_INF("LSM6DSL: FIFO disabled (sensor ODR unchanged)");
     return 0;
 }
 
