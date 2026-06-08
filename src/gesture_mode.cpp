@@ -86,37 +86,81 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 #define COOLDOWN_REENGAGE_DWELL     50
 
 /*
- * Dwell required for orientation-drop exit from a cursor mode.  Pose
- * must NOT be the mode's expected one (UP_RAISED for AIR_MOUSE,
- * DOWN_FLAT for SURFACE) for this many consecutive samples before
- * the FSM transitions out.  50 samples = 500 ms tolerates brief
- * unintentional tilts without bouncing out of the mode.
+ * Per-mode dwell required for orientation-drop exit.  Pose must NOT
+ * be the mode's expected one (UP_RAISED for AIR_MOUSE, DOWN_FLAT
+ * for SURFACE) for this many consecutive samples before the FSM
+ * transitions out.
  *
- * Same value for both modes -- the tolerance for "did the user
- * actually move out of pose" doesn't depend on which mode we're in.
+ * AIR_MOUSE_EXIT_DWELL = 50 (500 ms):
+ *   Lowering the wrist out of the raised pose is a slow, deliberate
+ *   motion -- "I'm done air-mousing".  Half a second of dwell
+ *   tolerates brief unintentional tilts without bouncing out.
+ *
+ * SURFACE_EXIT_DWELL = 0 (~250 ms effective due to ORIENTATION_DWELL):
+ *   The model is "lift the mouse 1-2 cm to reposition" -- a real
+ *   optical mouse pauses tracking within ~50 ms of leaving the
+ *   surface.  We can't match 50 ms because the orientation classifier
+ *   has its own 250 ms dwell; setting SURFACE_EXIT_DWELL to 0 makes
+ *   the orientation dwell the only delay (~250 ms total), which is
+ *   the closest we get to mouse-like tactile response.
+ *
+ *   This means SURFACE exits and starts cooldown almost the instant
+ *   the user lifts their wrist, mimicking a mouse losing surface
+ *   contact.  The 20 s cooldown then handles "they'll come back."
  */
-#define CURSOR_EXIT_DWELL           50
+#define AIR_MOUSE_EXIT_DWELL        50
+#define SURFACE_EXIT_DWELL          0
 
 /*
- * Entry-grace window after a cursor mode is entered while NOT already
- * in the expected pose.  The user has this many samples to assume
- * the pose (raise into UP_RAISED for AIR_MOUSE, place wrist flat for
- * SURFACE); if they don't, the FSM bounces back to IDLE without ever
- * having armed exit detection.
+ * SURFACE motion-burst exit detector.
  *
- * Sized to accommodate the natural human reaction time + orientation
- * dwell + comfortable margin:
- *   - Press trigger: ~0 ms
- *   - Initiate movement: 200-400 ms
- *   - Reach pose: 500-1000 ms
- *   - Orientation classifier dwell to register the new pose: 250 ms
- *   - Margin for slow / hesitant movement
+ * Problem the orientation-drop exit alone doesn't solve: a wrist
+ * palm-down on a desk and a wrist palm-down on the user's lap have
+ * the SAME gravity-vector signature (both are Z+ dominant ->
+ * WRIST_DOWN_FLAT).  So moving the wrist from desk to lap without
+ * rotating the palm doesn't change orientation_current, and SURFACE
+ * stays engaged when it should exit.
  *
- * 500 samples = 5 s at 100 Hz.  Same window for both modes -- both
- * require comparable time for a user to deliberately assume the pose
- * after pressing the entry trigger.
+ * We have no altimeter and accel dead-reckoning drifts in seconds,
+ * so we can't measure "height."  But the TRANSITION from desk to
+ * lap involves a brief acceleration burst (lift up, translate, set
+ * down) -- 2-5 m/s^2 motion residual for ~500 ms.  Steady gliding
+ * on the desk (the intended SURFACE use) stays below ~1 m/s^2.
+ * That gap lets us detect "the user is transporting the wrist
+ * somewhere" without false-triggering on actual surface use.
+ *
+ * Motion residual = (a - gravity_lpf), magnitude per sample.
+ * SURFACE_MOTION_BURST_THRESH (m/s^2) is the gating magnitude;
+ * SURFACE_MOTION_BURST_DWELL is the consecutive-sample count the
+ * residual must stay above the threshold before firing.
+ *
+ * Initial values are physics-motivated estimates (a 30 cm vertical
+ * translation in 0.5 s requires ~2.4 m/s^2 peak); empirical tuning
+ * happens after first hardware test.  The exit log prints the
+ * actual peak magnitude so the user can read it back and we can
+ * tighten.
  */
-#define CURSOR_ENTRY_GRACE          500
+#define SURFACE_MOTION_BURST_THRESH 2.0f
+#define SURFACE_MOTION_BURST_DWELL  15      /* 150 ms at 100 Hz */
+
+/*
+ * Per-mode entry-grace window after a cursor mode is entered while
+ * NOT already in the expected pose.  Counted down per accel sample.
+ * If it hits zero before the user reaches the expected pose, the
+ * FSM bounces back to IDLE without ever arming exit detection.
+ *
+ * AIR_MOUSE_ENTRY_GRACE = 500 (5 s):
+ *   Raising the arm to shoulder height takes deliberate effort plus
+ *   settling time.  5 s leaves margin for repositioning, getting
+ *   comfortable in the pose, or hesitation before commitment.
+ *
+ * SURFACE_ENTRY_GRACE = 300 (3 s):
+ *   Placing the wrist flat on a desk is faster -- typically a single
+ *   motion from wherever the hand was.  3 s is enough for the user
+ *   to settle the wrist into a comfortable touchpad position.
+ */
+#define AIR_MOUSE_ENTRY_GRACE       500
+#define SURFACE_ENTRY_GRACE         300
 
 /* (Previously: FLAT_DWELL_SAMPLES = 100 -- auto-triggered SURFACE
  * mode from DOWN_FLAT pose dwell.  Removed: user feedback established
@@ -162,8 +206,27 @@ static int orientation_candidate_dwell = 0;
 static int reengage_dwell = 0;
 
 /* Counts non-expected-pose samples while in a cursor mode.  When it
- * hits CURSOR_EXIT_DWELL, FSM exits to IDLE + starts cooldown. */
+ * exceeds the per-mode exit dwell (AIR_MOUSE_EXIT_DWELL or
+ * SURFACE_EXIT_DWELL via _exit_dwell_for()), the FSM exits to IDLE +
+ * starts cooldown. */
 static int cursor_exit_dwell = 0;
+
+/* Motion-burst exit detector (SURFACE only).  Counts consecutive
+ * samples with motion-residual magnitude above
+ * SURFACE_MOTION_BURST_THRESH.  Reaches SURFACE_MOTION_BURST_DWELL
+ * -> SURFACE exit + cooldown.  Used to catch wrist-transport
+ * gestures (e.g., desk -> lap) that don't change palm orientation. */
+static int surface_motion_burst_dwell = 0;
+
+/* Peak motion-residual seen since the last periodic stats log
+ * (reset every SURFACE_MOTION_LOG_PERIOD samples).  Used both for
+ * the periodic calibration stream and as the value reported in the
+ * exit log.  Lets the user read off actual peaks during gliding
+ * (should be small) vs transport (should be large) to tune the
+ * threshold empirically without further code changes. */
+static float surface_motion_peak = 0.0f;
+static int   surface_motion_log_counter = 0;
+#define      SURFACE_MOTION_LOG_PERIOD   200    /* 2 s at 100 Hz */
 
 /* Cooldown after a cursor mode exits via orientation-drop.  During
  * the cooldown window, the user can return to the same mode by
@@ -192,17 +255,40 @@ static GestureMode cursor_cooldown_mode = MODE_IDLE;
  *
  * With this latch, exit detection only arms after we've SEEN the
  * expected pose at least once.  If the user never reaches it
- * within the CURSOR_ENTRY_GRACE window (see entry_grace_remaining),
+ * within the per-mode entry-grace window (see entry_grace_remaining),
  * the FSM bounces back to IDLE without ever arming exit dwell --
  * prevents the band sitting in a cursor mode indefinitely if the
  * user pressed the entry trigger and got distracted. */
 static bool cursor_has_reached_pose = false;
 
-/* Counts down from CURSOR_ENTRY_GRACE on every accel sample while
- * we're in a cursor mode AND haven't yet reached the expected pose.
- * Hits zero -> the FSM bounces back to IDLE (no cooldown -- the user
- * never engaged, no point allowing quick re-engage). */
+/* Counts down from the per-mode entry grace on every accel sample
+ * while we're in a cursor mode AND haven't yet reached the expected
+ * pose.  Hits zero -> the FSM bounces back to IDLE (no cooldown --
+ * the user never engaged, no point allowing quick re-engage). */
 static int entry_grace_remaining = 0;
+
+/* Reference gravity vector captured at the moment a cursor mode
+ * first engages (cursor_has_reached_pose flips false -> true).
+ *
+ * For SURFACE this is the "desk plane reference" -- the gravity
+ * orientation at the instant the wrist was placed on the desk.
+ * Item 2 (cursor tracking) will compute cursor motion as deviations
+ * from this reference, so gliding the wrist around at desk level
+ * produces relative motion correctly even though every position is
+ * roughly DOWN_FLAT to the orientation classifier.  Lifting the
+ * wrist will then read as "gravity left the reference plane,"
+ * giving us the mouse-lift semantic precisely.
+ *
+ * For AIR_MOUSE the same idea applies but for the raised pose --
+ * tracking is relative to the at-engagement orientation rather than
+ * absolute angles.
+ *
+ * Captured here but NOT yet consumed in Item 0; cursor_pipeline.cpp
+ * will read these once cursor tracking lands. */
+static float cursor_reference_gx = 0.0f;
+static float cursor_reference_gy = 0.0f;
+static float cursor_reference_gz = 0.0f;
+static bool  cursor_reference_valid = false;
 
 /* Acquisition-request callback registered by main.cpp. */
 static gesture_acq_request_cb_t s_acq_request_cb = NULL;
@@ -214,6 +300,19 @@ static bool s_prev_needs_acq = false;
 static inline bool _mode_needs_continuous_imu(GestureMode m)
 {
     return (m == MODE_AIR_MOUSE) || (m == MODE_SURFACE);
+}
+
+/* Per-mode timing accessors -- centralise the mode-vs-constant
+ * lookups so the FSM body doesn't sprinkle conditionals throughout. */
+static inline int _entry_grace_for(GestureMode m)
+{
+    return (m == MODE_AIR_MOUSE) ? AIR_MOUSE_ENTRY_GRACE
+                                 : SURFACE_ENTRY_GRACE;
+}
+static inline int _exit_dwell_for(GestureMode m)
+{
+    return (m == MODE_AIR_MOUSE) ? AIR_MOUSE_EXIT_DWELL
+                                 : SURFACE_EXIT_DWELL;
 }
 
 /* Wrist-flick state. */
@@ -333,6 +432,10 @@ static WristOrientation _classify_orientation(float gx, float gy, float gz)
     }
 }
 
+/* Forward decl -- defined immediately after _transition_to.  Called
+ * from inside _transition_to to notify acq edges. */
+static void _update_acq_request(void);
+
 static void _transition_to(GestureMode new_mode)
 {
     GestureMode old = (GestureMode)atomic_get(&mode_atomic);
@@ -346,6 +449,9 @@ static void _transition_to(GestureMode new_mode)
      * starts cleanly. */
     reengage_dwell = 0;
     cursor_exit_dwell = 0;
+    surface_motion_burst_dwell = 0;
+    surface_motion_peak = 0.0f;
+    surface_motion_log_counter = 0;
 
     /* Manage the cursor-mode entry-grace state machine.  Same logic
      * for AIR_MOUSE and SURFACE -- only the "expected pose" varies.
@@ -357,7 +463,7 @@ static void _transition_to(GestureMode new_mode)
      *
      * Entering from any other orientation:
      *   - cursor_has_reached_pose = FALSE; set when orientation matches
-     *   - entry_grace_remaining loaded with CURSOR_ENTRY_GRACE;
+     *   - entry_grace_remaining loaded from _entry_grace_for(new_mode);
      *     if it counts down to zero without the user reaching the pose,
      *     the FSM bounces back to IDLE
      *
@@ -380,21 +486,44 @@ static void _transition_to(GestureMode new_mode)
                     "exit detection armed immediately",
                     mode_str, pose_str);
         } else {
-            entry_grace_remaining = CURSOR_ENTRY_GRACE;
+            entry_grace_remaining = _entry_grace_for(new_mode);
             LOG_INF("%s entered -- assume %s pose within %d ms to "
                     "engage, or it auto-exits to IDLE",
-                    mode_str, pose_str, CURSOR_ENTRY_GRACE * 10);
+                    mode_str, pose_str, entry_grace_remaining * 10);
         }
     } else {
         cursor_has_reached_pose = false;
         entry_grace_remaining = 0;
+        cursor_reference_valid = false;
     }
 
-    /* Notify the acquisition-request callback on edges between
-     * "needs continuous IMU" and "doesn't."  Only fires on real edges
-     * so the callback doesn't get spammed on every transition. */
-    bool now_needs = _mode_needs_continuous_imu(new_mode);
-    if (s_acq_request_cb && now_needs != s_prev_needs_acq) {
+    /* Re-evaluate the acq-request edge.  Acq must stay alive while a
+     * cursor mode is active OR a cooldown is open -- without samples
+     * during cooldown the decrement freezes and the re-engage check
+     * goes blind (the 2026-06-07 bug).  See _update_acq_request(). */
+    _update_acq_request();
+}
+
+/* Evaluate whether the acquisition pipeline needs to be alive RIGHT
+ * NOW and notify the registered callback on edges.  "Needs alive"
+ * means EITHER (a) the current mode is a cursor mode that consumes
+ * IMU samples, OR (b) a cooldown is currently open -- because the
+ * cooldown countdown is driven by accel-sample callbacks and the
+ * re-engage detector needs fresh orientation classifications to
+ * notice the user returning to the expected pose.
+ *
+ * Called from _transition_to (mode changes) and from the cooldown
+ * decrement site (cooldown crossing zero).  Both are real edges of
+ * the "needs alive" predicate; both must notify. */
+static void _update_acq_request(void)
+{
+    if (!s_acq_request_cb) {
+        return;
+    }
+    GestureMode m = (GestureMode)atomic_get(&mode_atomic);
+    bool now_needs = _mode_needs_continuous_imu(m) ||
+                     cursor_cooldown_remaining > 0;
+    if (now_needs != s_prev_needs_acq) {
         s_acq_request_cb(now_needs);
         s_prev_needs_acq = now_needs;
     }
@@ -420,6 +549,13 @@ void gesture_mode_init(void)
     cursor_cooldown_mode = MODE_IDLE;
     cursor_has_reached_pose = false;
     entry_grace_remaining = 0;
+    cursor_reference_valid = false;
+    cursor_reference_gx = 0.0f;
+    cursor_reference_gy = 0.0f;
+    cursor_reference_gz = 0.0f;
+    surface_motion_burst_dwell = 0;
+    surface_motion_peak = 0.0f;
+    surface_motion_log_counter = 0;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -471,11 +607,21 @@ void gesture_mode_update_accel(float ax, float ay, float az)
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
 
-    /* Decrement AIR_MOUSE cooldown each sample.  Once it hits 0, the
-     * orientation-only re-engage path is closed and the user has to
-     * deliberately double-tap to re-enter AIR_MOUSE. */
+    /* Decrement cursor-mode cooldown each sample.  Once it hits 0,
+     * the orientation-only re-engage path is closed and the user has
+     * to deliberately re-tap (double-tap for AIR_MOUSE, triple-tap
+     * for SURFACE) to re-enter.  At that crossing we also release
+     * the acq-keep-alive hold so the IMU pipeline can suspend back
+     * to whatever the underlying power state wants. */
     if (cursor_cooldown_remaining > 0) {
         cursor_cooldown_remaining--;
+        if (cursor_cooldown_remaining == 0) {
+            LOG_INF("Cooldown for %s expired -- explicit re-tap required",
+                    _mode_str(cursor_cooldown_mode));
+            cursor_cooldown_mode = MODE_IDLE;
+            reengage_dwell = 0;
+            _update_acq_request();
+        }
     }
 
     /* Helper: which orientation does the given cursor mode expect? */
@@ -524,8 +670,24 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         orientation_current == expected) {
         cursor_has_reached_pose = true;
         entry_grace_remaining = 0;  /* engaged -- stop the timeout */
-        LOG_INF("%s: expected pose reached -- exit detection armed",
-                _mode_str(current_mode));
+
+        /* Capture the engagement gravity vector as the reference plane.
+         * For SURFACE this records the desk-plane orientation at the
+         * instant of contact; for AIR_MOUSE it records the raised-pose
+         * baseline.  Item 2 (cursor pipeline) will use this to compute
+         * cursor motion relative to the engagement orientation rather
+         * than absolute angles. */
+        cursor_reference_gx = gx_filt;
+        cursor_reference_gy = gy_filt;
+        cursor_reference_gz = gz_filt;
+        cursor_reference_valid = true;
+
+        LOG_INF("%s: expected pose reached -- exit detection armed, "
+                "ref g=[%.3f, %.3f, %.3f]",
+                _mode_str(current_mode),
+                (double)cursor_reference_gx,
+                (double)cursor_reference_gy,
+                (double)cursor_reference_gz);
     }
 
     /* Entry-grace timeout: counts down while in a cursor mode and
@@ -544,17 +706,37 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     }
 
     /* Exit via orientation drop: pose is no longer the expected one
-     * for CURSOR_EXIT_DWELL samples -> exit to IDLE and start the
-     * cooldown.  Only runs after the user has assumed the pose at
-     * least once. */
+     * for _exit_dwell_for(current_mode) samples -> exit to IDLE and
+     * start the cooldown.  Only runs after the user has assumed the
+     * pose at least once.
+     *
+     * Note on per-mode exit semantics:
+     *   AIR_MOUSE: "lowering wrist" -- deliberate, slow.  Dwell = 500 ms.
+     *   SURFACE  : "lifting wrist off desk" -- like lifting a mouse to
+     *              reposition.  Dwell = 0 (only the orientation
+     *              classifier's own 250 ms dwell remains), so the mode
+     *              exits almost instantly when the wrist comes off the
+     *              desk plane.  The 20 s cooldown then lets the user
+     *              put the wrist back down and resume seamlessly.
+     *
+     *   For SURFACE specifically: the user might also LOWER (e.g. drop
+     *   arm to lap) rather than LIFT.  Either departure from DOWN_FLAT
+     *   triggers exit + cooldown; the orientation classifier doesn't
+     *   distinguish between "lifted up" and "dropped down", just
+     *   "no longer flat."  This matches how a mouse behaves: any way
+     *   of losing surface contact pauses tracking.
+     */
+    int exit_dwell_target = _exit_dwell_for(current_mode);
     if (in_cursor_mode && cursor_has_reached_pose &&
         orientation_current != expected) {
-        if (cursor_exit_dwell < CURSOR_EXIT_DWELL) {
+        if (cursor_exit_dwell <= exit_dwell_target) {
             cursor_exit_dwell++;
-            if (cursor_exit_dwell == CURSOR_EXIT_DWELL) {
-                LOG_INF("%s exit: orientation dropped, starting %d ms "
-                        "re-engage cooldown",
+            if (cursor_exit_dwell > exit_dwell_target) {
+                LOG_INF("%s exit: %s -- starting %d ms re-engage cooldown",
                         _mode_str(current_mode),
+                        (current_mode == MODE_SURFACE)
+                            ? "wrist left desk plane (lift or drop)"
+                            : "wrist lowered out of raised pose",
                         CURSOR_COOLDOWN_SAMPLES * 10);
                 cursor_cooldown_mode = current_mode;
                 cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
@@ -563,6 +745,60 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         }
     } else {
         cursor_exit_dwell = 0;
+    }
+
+    /* SURFACE motion-burst exit detector.  See
+     * SURFACE_MOTION_BURST_THRESH comment block for rationale.  Only
+     * runs in SURFACE (AIR_MOUSE has no equivalent "transport without
+     * orientation change" failure mode -- raising the arm always
+     * rotates the wrist).  Runs after cursor_has_reached_pose is
+     * latched -- pre-engagement motion is just the user placing the
+     * wrist down. */
+    if (current_mode == MODE_SURFACE && cursor_has_reached_pose) {
+        float rx = ax - gx_filt;
+        float ry = ay - gy_filt;
+        float rz = az - gz_filt;
+        float r_mag = sqrtf(rx * rx + ry * ry + rz * rz);
+
+        /* Track windowed peak (resets each periodic log). */
+        if (r_mag > surface_motion_peak) {
+            surface_motion_peak = r_mag;
+        }
+
+        /* Periodic stats log -- a calibration stream the user can
+         * read off while gliding (low values expected, ~0.2-0.8) vs
+         * transporting (high values expected, 2-5+).  Helps tune
+         * SURFACE_MOTION_BURST_THRESH from real data. */
+        surface_motion_log_counter++;
+        if (surface_motion_log_counter >= SURFACE_MOTION_LOG_PERIOD) {
+            LOG_INF("SURFACE motion stats: peak |a-g|=%.2f m/s^2 "
+                    "in last %d ms (burst thresh=%.2f)",
+                    (double)surface_motion_peak,
+                    SURFACE_MOTION_LOG_PERIOD * 10,
+                    (double)SURFACE_MOTION_BURST_THRESH);
+            surface_motion_peak = 0.0f;
+            surface_motion_log_counter = 0;
+        }
+
+        if (r_mag > SURFACE_MOTION_BURST_THRESH) {
+            if (surface_motion_burst_dwell < SURFACE_MOTION_BURST_DWELL) {
+                surface_motion_burst_dwell++;
+                if (surface_motion_burst_dwell == SURFACE_MOTION_BURST_DWELL) {
+                    LOG_INF("SURFACE exit: motion burst |a-g|=%.2f m/s^2 "
+                            "(thresh=%.2f, window peak=%.2f) -- "
+                            "starting %d ms re-engage cooldown",
+                            (double)r_mag,
+                            (double)SURFACE_MOTION_BURST_THRESH,
+                            (double)surface_motion_peak,
+                            CURSOR_COOLDOWN_SAMPLES * 10);
+                    cursor_cooldown_mode = MODE_SURFACE;
+                    cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
+                    _transition_to(MODE_IDLE);
+                }
+            }
+        } else {
+            surface_motion_burst_dwell = 0;
+        }
     }
 }
 
