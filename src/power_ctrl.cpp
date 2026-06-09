@@ -94,7 +94,13 @@ int max30102_wake(void)     { return max30102_set_shdn(false); }
 #define LSM6DSL_REG_CTRL1_XL           0x10
 #define LSM6DSL_CTRL1_XL_ODR_MASK      0xF0
 #define LSM6DSL_CTRL1_XL_ODR_104HZ     (4U << 4)   /* matches driver default */
-#define LSM6DSL_CTRL1_XL_ODR_416HZ     (6U << 4)   /* AN5040-recommended for tap */
+#define LSM6DSL_CTRL1_XL_ODR_416HZ     (6U << 4)   /* AN5040-recommended tap */
+#define LSM6DSL_CTRL1_XL_ODR_833HZ     (7U << 4)   /* Stage E spectral analysis;
+                                                     gives Nyquist 416 Hz which
+                                                     covers the snap-vs-tap
+                                                     spectral discrimination
+                                                     bands.  QUIET still ~14 ms
+                                                     so band ringing is filtered. */
 
 /* Tap-engine registers per AN5040 / LSM6DSL datasheet section 9.x. */
 #define LSM6DSL_REG_TAP_CFG            0x58
@@ -159,6 +165,7 @@ int max30102_wake(void)     { return max30102_set_shdn(false); }
 #define LSM6DSL_FIFO_MODE_CONTINUOUS   0x06
 #define LSM6DSL_FIFO_ODR_1_66KHZ       (0xA << 3)
 #define LSM6DSL_FIFO_ODR_416HZ         (0x6 << 3)
+#define LSM6DSL_FIFO_ODR_833HZ         (0x7 << 3)
 
 /* FIFO_STATUS2 bit 6 = FIFO_FULL (FIFO at threshold).  Bits [10:0]
  * across STATUS1/2 = DIFF_FIFO (current word count, 1 word = 2 bytes). */
@@ -263,9 +270,14 @@ int lsm6dsl_tap_engine_enable(uint8_t tap_threshold)
      * stream remains accessible via the same registers -- we keep
      * polling at our usual rate; the chip just samples internally 4x
      * faster while tap is armed. */
+    /* ODR bumped to 833 Hz 2026-06-10 for spectral-feature
+     * discrimination of snap vs tap.  Nyquist 416 Hz covers the
+     * useful frequency content.  At 833 Hz the chip's QUIET window
+     * (max 14.4 ms) still filters band ringing for clean tap
+     * events.  Firmware adds a 50 ms refractory as safety. */
     int err = lsm6dsl_update_bits(LSM6DSL_REG_CTRL1_XL,
                                   LSM6DSL_CTRL1_XL_ODR_MASK,
-                                  LSM6DSL_CTRL1_XL_ODR_416HZ);
+                                  LSM6DSL_CTRL1_XL_ODR_833HZ);
     if (err) return err;
 
     /* Step 2: program the threshold.  Mask off the 6D-orientation bits
@@ -346,7 +358,7 @@ int lsm6dsl_tap_engine_enable(uint8_t tap_threshold)
     if (err) return err;
 
     LOG_INF("LSM6DSL: tap engine enabled (LIR=1 latched, "
-            "SINGLE_DOUBLE_TAP=0, TAP_THS=0x%02x, ODR=416 Hz)", ths);
+            "SINGLE_DOUBLE_TAP=0, TAP_THS=0x%02x, ODR=833 Hz)", ths);
     return 0;
 }
 
@@ -482,30 +494,30 @@ int lsm6dsl_fifo_enable_continuous(void)
                              LSM6DSL_REG_FIFO_CTRL4, 0x00);
     if (err) return err;
 
-    /* Step 4: FIFO mode = continuous (110b), FIFO ODR = 416 Hz
-     * (matches sensor ODR set by tap engine; see step 1 rationale).
-     * This starts the FIFO actively writing. */
+    /* Step 4: FIFO mode = continuous (110b), FIFO ODR = 833 Hz
+     * (matches sensor ODR set by tap engine).  This starts the
+     * FIFO actively writing. */
     err = i2c_reg_write_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
                              LSM6DSL_REG_FIFO_CTRL5,
-                             LSM6DSL_FIFO_ODR_416HZ |
+                             LSM6DSL_FIFO_ODR_833HZ |
                              LSM6DSL_FIFO_MODE_CONTINUOUS);
     if (err) return err;
 
     /* Diagnostic readback: confirm FIFO_CTRL5 actually took the value
-     * we wrote.  Read-back-verify on the FIFO-empty issue from
-     * earlier hardware test -- if config didn't stick, we want to
-     * see it in logs. */
+     * we wrote.  Catches silent config rejection if it recurs. */
     uint8_t fc5_readback = 0;
     int rerr = i2c_reg_read_byte(lsm6dsl_bus, LSM6DSL_I2C_ADDR,
                                  LSM6DSL_REG_FIFO_CTRL5, &fc5_readback);
     if (rerr == 0) {
         LOG_INF("LSM6DSL: FIFO_CTRL5 read-back = 0x%02x "
                 "(expected 0x%02x)", fc5_readback,
-                LSM6DSL_FIFO_ODR_416HZ | LSM6DSL_FIFO_MODE_CONTINUOUS);
+                LSM6DSL_FIFO_ODR_833HZ | LSM6DSL_FIFO_MODE_CONTINUOUS);
     }
 
-    LOG_INF("LSM6DSL: FIFO enabled (continuous mode, 416 Hz, "
-            "accel-only) -- ~1.6 s pre-event window");
+    /* FIFO depth 2048 words / 3 words per accel sample = 682 samples.
+     * At 833 Hz that's ~820 ms of pre-event ring buffer. */
+    LOG_INF("LSM6DSL: FIFO enabled (continuous mode, 833 Hz, "
+            "accel-only) -- ~820 ms pre-event window");
     return 0;
 }
 

@@ -5,6 +5,9 @@
 #include <zephyr/sys/atomic.h>
 #include <math.h>
 
+#include <arm_math.h>
+#include <arm_const_structs.h>
+
 #include "power_ctrl.h"
 
 LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
@@ -300,6 +303,20 @@ static char    multi_tap_first_sign = '?';
 static void multi_tap_commit_handler(struct k_work *work_arg);
 static K_WORK_DELAYABLE_DEFINE(multi_tap_commit_work,
                                multi_tap_commit_handler);
+
+/* Firmware ringing-rejection refractory.  At higher ODR the chip's
+ * QUIET window shrinks proportionally (14.4 ms at 833 Hz vs ~29 ms
+ * at 416 Hz).  Band housing mechanical ringing post-impact can
+ * survive shorter QUIET windows and cause double-firing of the
+ * same physical tap.  This firmware-side guard rejects any chip-
+ * tap event arriving within RINGING_REFRACTORY_MS of the previous
+ * one -- treating it as ringing duplicate, not a real second tap.
+ *
+ * 50 ms is comfortably above the ~3-30 ms ringing we observed at
+ * 1.66 kHz, and well below the ~150-250 ms minimum human inter-tap
+ * gap, so real double-taps are unaffected. */
+#define RINGING_REFRACTORY_MS    50
+static int64_t last_chip_tap_time_ms = 0;
 
 /* Activity gate state.  See ACTIVITY_GATE_* comment block.
  * samples_since_activity counts up per accel sample (saturated at
@@ -670,6 +687,7 @@ void gesture_mode_init(void)
     multi_tap_last_time_ms = 0;
     multi_tap_first_axis = '?';
     multi_tap_first_sign = '?';
+    last_chip_tap_time_ms = 0;
     samples_since_activity = ACTIVITY_GATE_DWELL;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
@@ -1021,13 +1039,28 @@ void gesture_mode_on_chip_double_tap(void)
 void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
 {
     /* Stage C (2026-06-08): firmware multi-tap counter.  Each
-     * SINGLE_TAP arrival from the chip is gated by the activity
-     * detector, then folded into a running count.  The per-sample
-     * timeout check in gesture_mode_update_accel() commits the
-     * accumulated count to a 1/2/3-tap action MULTI_TAP_WINDOW_MS
-     * after the last arrival. */
+     * SINGLE_TAP arrival from the chip is gated by ringing-
+     * rejection refractory, then activity gate, then folded into
+     * a running count.  The k_work_delayable commit handler
+     * commits the accumulated count to a 1/2/3-tap action
+     * MULTI_TAP_WINDOW_MS after the last arrival. */
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
+    int64_t now = k_uptime_get();
+
+    /* Ringing-rejection refractory: at 833 Hz the chip's QUIET
+     * window is ~14.4 ms which is borderline for some band-ringing
+     * patterns.  Reject duplicate events within RINGING_REFRACTORY_MS
+     * as ringing leftover from the previous shock. */
+    if (last_chip_tap_time_ms != 0 &&
+        (now - last_chip_tap_time_ms) < RINGING_REFRACTORY_MS) {
+        LOG_INF("Chip single-tap SUPPRESSED as ringing duplicate "
+                "(%d ms after previous, axis=%c sign=%c)",
+                (int)(now - last_chip_tap_time_ms),
+                peak_axis, tap_sign);
+        return;
+    }
+    last_chip_tap_time_ms = now;
 
     /* Activity gate: reject the event if motion residual was high
      * recently.  Kills gait + typing false-positives that the chip's
@@ -1042,7 +1075,6 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
         return;
     }
 
-    int64_t now = k_uptime_get();
     bool starts_new_sequence =
         (multi_tap_count == 0) ||
         ((now - multi_tap_last_time_ms) > MULTI_TAP_WINDOW_MS);
@@ -1206,12 +1238,26 @@ void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb)
  * without breaking working paths.
  */
 
-/* Capture buffer.  At 1.66 kHz, 500 samples = ~300 ms of signal.
- * Each sample is 3 axes * int16 = 6 bytes.  Total 3000 bytes. */
-#define TAP_CAPTURE_SAMPLES   500
+/* Capture buffer.  At 833 Hz, 512 samples = ~615 ms of signal,
+ * a power of 2 so CMSIS-DSP arm_rfft_fast_f32 can transform it
+ * directly.  Each sample is 3 axes * int16 = 6 bytes.  Total
+ * 3072 bytes. */
+#define TAP_CAPTURE_SAMPLES   512
 #define TAP_CAPTURE_BYTES     (TAP_CAPTURE_SAMPLES * 6)
 static uint8_t  tap_capture_buf[TAP_CAPTURE_BYTES];
 static uint16_t tap_capture_sample_count = 0;
+
+/* FFT scratch -- magnitude signal time-domain (input) and complex
+ * frequency-domain (output).  CMSIS-DSP arm_rfft_fast_f32 produces
+ * an N-element interleaved real/imag output for an N-element real
+ * input.  At 833 Hz / 512 points, bin resolution is 1.63 Hz.
+ *
+ * Total memory: 2 * 512 * 4 = 4 KB.  Acceptable on our 256 KB RAM. */
+#define FFT_SIZE              TAP_CAPTURE_SAMPLES
+static float32_t fft_input[FFT_SIZE];
+static float32_t fft_output[FFT_SIZE];
+static arm_rfft_fast_instance_f32 fft_inst;
+static bool fft_initialised = false;
 
 /* Worker synchronisation: dispatcher gives the semaphore after
  * filling the buffer; worker takes it and processes.  Binary
@@ -1222,7 +1268,9 @@ static K_SEM_DEFINE(tap_capture_sem, 0, 1);
 static atomic_t tap_capture_busy = ATOMIC_INIT(0);  /* 1 = buffer in use */
 
 /* Feature extraction output.  Computed by the worker from
- * tap_capture_buf, then fed to the classifier. */
+ * tap_capture_buf, then fed to the classifier.  v2 features
+ * (2026-06-10): spectral band energies replace pre_event_energy
+ * which proved unreliable in real-world use. */
 struct tap_features {
     int16_t peak_x;        /* signed peak (most positive or negative) */
     int16_t peak_y;
@@ -1231,8 +1279,11 @@ struct tap_features {
     uint16_t peak_y_abs;
     uint16_t peak_z_abs;
     uint16_t peak_sample_idx;  /* where in buffer the peak is */
-    uint32_t pre_event_energy;  /* sum-of-deltas over pre-event window */
-    char     dominant_axis;     /* 'X' / 'Y' / 'Z' */
+    float    low_band_energy;  /* energy in 20-200 Hz band (snap-favouring) */
+    float    mid_band_energy;  /* energy in 200-400 Hz band (tap-favouring) */
+    float    low_band_ratio;   /* low / (low + mid); near 1.0 = snap, near
+                                  0.5 = broadband (tap) */
+    char     dominant_axis;    /* 'X' / 'Y' / 'Z' */
 };
 
 /* Helper: parse one accel sample (6 bytes, little-endian) from buf. */
@@ -1292,41 +1343,99 @@ static void _extract_peak(const uint8_t *buf, uint16_t sample_count,
     }
 }
 
-/* Compute pre-event "energy" as sum of consecutive-sample deltas over
- * the window [peak - 150ms, peak - 50ms].  At 1.66 kHz that's
- * samples [peak_idx - 250, peak_idx - 83].  Quiet pre-event (band-
- * tap) gives small values; anticipatory motion (snap) gives larger
- * values.
+/* Compute spectral band energies of the impulse signal.
  *
- * Using sum-of-|delta| rather than variance keeps the math cheap
- * (no multiplications, single int accumulator) and is robust to
- * the DC offset that gravity introduces. */
-static uint32_t _compute_pre_event_energy(const uint8_t *buf,
-                                          uint16_t peak_idx)
+ * Approach (ViBand-style, adapted for 833 Hz ODR):
+ *   1. Build a magnitude signal mag[i] = sqrt(x^2 + y^2 + z^2)
+ *      from the int16 accel samples.  Magnitude is pose-invariant
+ *      (whichever axis the impulse hits, magnitude captures it).
+ *   2. Subtract mean (DC removal) so gravity doesn't dominate the
+ *      DC bin.  Saves dynamic range for the impulse content.
+ *   3. Apply Hann window to reduce spectral leakage at the
+ *      buffer edges.
+ *   4. Run real FFT via CMSIS-DSP arm_rfft_fast_f32.
+ *   5. Sum |X[k]|^2 over the two bands of interest.
+ *
+ * Bands (at 833 Hz / 512 points, bin resolution 1.63 Hz):
+ *   - Low band: bins 12-122 = 19.5 - 199 Hz.  Bone-conducted
+ *     snap impulses dominate here per ViBand.
+ *   - Mid band: bins 122-246 = 199 - 400 Hz.  Direct mechanical
+ *     impacts (tap on band housing) have more energy here.
+ *
+ * Discriminator: low_ratio = low / (low + mid).  Snap -> ratio
+ * high (~0.7+); tap -> ratio lower (~0.5 or less). */
+#define FFT_BIN_LOW_START   12     /* ~19.5 Hz */
+#define FFT_BIN_LOW_END     122    /* ~199 Hz, exclusive */
+#define FFT_BIN_MID_START   122    /* ~199 Hz */
+#define FFT_BIN_MID_END     246    /* ~400 Hz, exclusive */
+
+static void _compute_band_energies(const uint8_t *buf,
+                                   uint16_t sample_count,
+                                   float *out_low,
+                                   float *out_mid,
+                                   float *out_ratio)
 {
-    /* Pre-event window bounds.  Bail if peak is too close to the
-     * start of the buffer to have a meaningful pre-event window. */
-    if (peak_idx < 250) {
-        return 0;  /* not enough pre-event history -- worst-case
-                    * value is "no motion" which biases toward
-                    * band-tap classification; safer default */
+    *out_low = 0.0f;
+    *out_mid = 0.0f;
+    *out_ratio = 0.5f;  /* neutral default */
+
+    if (sample_count < FFT_SIZE || !fft_initialised) {
+        return;
     }
-    uint16_t pre_start = peak_idx - 250;
-    uint16_t pre_end   = peak_idx - 83;
 
-    uint32_t energy = 0;
-    int16_t  prev_x, prev_y, prev_z;
-    _parse_sample(buf + pre_start * 6, &prev_x, &prev_y, &prev_z);
-
-    for (uint16_t i = pre_start + 1; i <= pre_end; i++) {
+    /* Step 1+2: magnitude signal with DC removal. */
+    float mean = 0.0f;
+    for (uint16_t i = 0; i < FFT_SIZE; i++) {
         int16_t x, y, z;
         _parse_sample(buf + i * 6, &x, &y, &z);
-        energy += _abs16((int16_t)(x - prev_x));
-        energy += _abs16((int16_t)(y - prev_y));
-        energy += _abs16((int16_t)(z - prev_z));
-        prev_x = x; prev_y = y; prev_z = z;
+        float fx = (float)x;
+        float fy = (float)y;
+        float fz = (float)z;
+        float mag = sqrtf(fx * fx + fy * fy + fz * fz);
+        fft_input[i] = mag;
+        mean += mag;
     }
-    return energy;
+    mean /= (float)FFT_SIZE;
+    for (uint16_t i = 0; i < FFT_SIZE; i++) {
+        fft_input[i] -= mean;
+    }
+
+    /* Step 3: Hann window.  Reduces spectral leakage at the buffer
+     * edges so the band-energy integrals are more accurate.  Half-
+     * cosine envelope from 0 at the ends to 1 at the centre.
+     * Local 2*PI constant -- M_PI isn't exposed in this build
+     * configuration. */
+    static const float TWO_PI = 6.28318530717958647692f;
+    for (uint16_t i = 0; i < FFT_SIZE; i++) {
+        float w = 0.5f * (1.0f - cosf(TWO_PI * (float)i /
+                                       (float)(FFT_SIZE - 1)));
+        fft_input[i] *= w;
+    }
+
+    /* Step 4: FFT.  ifftFlag=0 means forward transform. */
+    arm_rfft_fast_f32(&fft_inst, fft_input, fft_output, 0);
+
+    /* Step 5: sum |X[k]|^2 over the two bands.  arm_rfft_fast_f32
+     * output format: index 0 = DC (real), index 1 = Nyquist (real),
+     * indices 2..N-1 = interleaved real/imag pairs for bins 1..N/2-1.
+     *
+     * For our band ranges (12-122 and 122-246) we're well clear of
+     * bins 0 and Nyquist, so we read pairs starting at offset 2*k. */
+    for (uint16_t k = FFT_BIN_LOW_START; k < FFT_BIN_LOW_END; k++) {
+        float re = fft_output[2 * k];
+        float im = fft_output[2 * k + 1];
+        *out_low += re * re + im * im;
+    }
+    for (uint16_t k = FFT_BIN_MID_START; k < FFT_BIN_MID_END; k++) {
+        float re = fft_output[2 * k];
+        float im = fft_output[2 * k + 1];
+        *out_mid += re * re + im * im;
+    }
+
+    float total = *out_low + *out_mid;
+    if (total > 0.0f) {
+        *out_ratio = *out_low / total;
+    }
 }
 
 /* Simple classifier rules.  Returns:
@@ -1334,45 +1443,29 @@ static uint32_t _compute_pre_event_energy(const uint8_t *buf,
  *   'B' = band-tap
  *   '?' = unclassified (genuinely ambiguous)
  *
- * Rules calibrated from 6-tap + 6-snap hardware test 2026-06-09:
+ * v3 (2026-06-10): spectral-feature classifier.  Previous version
+ * (pre_event_energy) was rejected because it conflates "user
+ * positioning motion" with "gesture intent" -- see
+ * principle_real_world_grounding_before_engineering memory.
  *
- *   TAPS (n=6):  pre_event_energy 9967-14055 (max 14055)
- *                z_ratio 14-34% (mostly ≤ 28% but 2 events at 31/34%)
+ * Snap (bone-conducted via carpal bones):
+ *   - Tissue is a natural low-pass filter
+ *   - Energy concentrated 20-200 Hz
+ *   - low_band_ratio expected HIGH (>0.7)
  *
- *   SNAPS (n=6): pre_event_energy 30551-51938 (min 30551)
- *                z_ratio 30-55% (1 event at exact 30%)
+ * Band-tap (direct mechanical impact on housing):
+ *   - Housing/PCB resonance up to 1 kHz+
+ *   - Energy spread across our 20-400 Hz band
+ *   - low_band_ratio expected LOWER (~0.5 if energy is even-ish
+ *     across our two bands)
  *
- * PRIMARY DISCRIMINATOR: pre_event_energy.  Clean 2.2x gap with no
- * overlap (tap max 14055, snap min 30551).  Threshold at 20000
- * lands in the middle.
- *
- * WHY pre_event_energy is the right primary feature:
- *   - Measures CHANGE over a window, not absolute axis values.
- *     Pose-independent.
- *   - Snap requires anticipatory hand motion (winding up the
- *     fingers) which produces ~30-50k delta-energy over 100-200 ms
- *     before the impulse.
- *   - Tap with the other hand has near-zero pre-event motion
- *     because the wrist is held still until impact.  Resulting
- *     pre_event_energy is just baseline noise (~10-14k).
- *
- * z_ratio is SECONDARY -- pose-dependent (different wrist
- * orientations make different axes receive the impulse).  Useful
- * for confirming snap suspicions when pre_event is borderline, but
- * not reliable as a primary.
- *
- * For productionization (see project_calibration_and_pose memory):
- * thresholds will need per-user calibration since gesture intensity
- * varies.  Current values are tuned for THIS user's right wrist on
- * an open dev board (no housing).  Housing + per-user variance
- * means these need to be tunable / learned. */
-#define SNAP_PRE_ENERGY_THRESH   20000  /* sum-of-|delta| units;
-                                            midpoint of empirical
-                                            gap tap-max 14055 to
-                                            snap-min 30551 */
-#define SNAP_Z_RATIO_THRESH      40     /* % -- snap "strong"
-                                            indicator; not primary,
-                                            confirms suspected snaps */
+ * Initial thresholds are physics-motivated; tune from hardware
+ * data.  MIN_PEAK_SUM keeps weak events from being classified
+ * confidently. */
+#define SNAP_LOW_RATIO_THRESH    0.70f  /* low_band fraction; above
+                                            this is confidently snap */
+#define TAP_LOW_RATIO_THRESH     0.55f  /* below this is confidently
+                                            tap; in-between is unclassified */
 #define MIN_PEAK_SUM             20000  /* |x|+|y|+|z| at peak;
                                             below this is too weak
                                             to be a real tap/snap */
@@ -1384,20 +1477,15 @@ static char _classify(const struct tap_features *f)
     if (total_abs < MIN_PEAK_SUM) {
         return '?';  /* too weak to characterise */
     }
-    uint32_t z_ratio_pct = (uint32_t)f->peak_z_abs * 100 / total_abs;
 
-    /* Primary: pre_event_energy threshold.  Empirical gap is
-     * clean (2.2x ratio with no overlap on n=12 dataset). */
-    if (f->pre_event_energy >= SNAP_PRE_ENERGY_THRESH) {
-        return 'S';
+    /* Primary: spectral band-energy ratio. */
+    if (f->low_band_ratio >= SNAP_LOW_RATIO_THRESH) {
+        return 'S';  /* snap */
     }
-    /* Below the snap threshold.  Check if z_ratio is suspiciously
-     * snap-like -- could be an attempted snap with weak anticipatory
-     * motion.  We hold UNCLASSIFIED rather than misclassify. */
-    if (z_ratio_pct >= SNAP_Z_RATIO_THRESH) {
-        return '?';
+    if (f->low_band_ratio <= TAP_LOW_RATIO_THRESH) {
+        return 'B';  /* band-tap */
     }
-    return 'B';  /* band-tap */
+    return '?';  /* boundary zone */
 }
 
 /* Worker thread entry.  Blocks on tap_capture_sem, processes one
@@ -1418,8 +1506,10 @@ static void bio_acoustic_worker(void *, void *, void *)
 
         struct tap_features f = {};
         _extract_peak(tap_capture_buf, n, &f);
-        f.pre_event_energy =
-            _compute_pre_event_energy(tap_capture_buf, f.peak_sample_idx);
+        _compute_band_energies(tap_capture_buf, n,
+                               &f.low_band_energy,
+                               &f.mid_band_energy,
+                               &f.low_band_ratio);
         char verdict = _classify(&f);
 
         uint32_t total_abs = (uint32_t)f.peak_x_abs +
@@ -1433,13 +1523,19 @@ static void bio_acoustic_worker(void *, void *, void *)
                                   (verdict == 'B') ? "BAND-TAP" :
                                   "UNCLASSIFIED";
 
-        LOG_INF("[BIO] verdict=%s peak[%d,%d,%d] dom=%c "
-                "z_ratio=%u%% pre_event_energy=%u idx=%u/%u",
+        /* Log the full feature vector so empirical tuning of the
+         * spectral thresholds is visible.  ratio is the headline
+         * discriminator; low/mid absolute energies confirm we have
+         * meaningful signal (vs noise floor). */
+        LOG_INF("[BIO] verdict=%s peak[%d,%d,%d] dom=%c z_ratio=%u%% "
+                "low_band=%.0f mid_band=%.0f low_ratio=%.2f idx=%u/%u",
                 verdict_str,
                 (int)f.peak_x, (int)f.peak_y, (int)f.peak_z,
                 f.dominant_axis,
                 (unsigned)z_ratio_pct,
-                (unsigned)f.pre_event_energy,
+                (double)f.low_band_energy,
+                (double)f.mid_band_energy,
+                (double)f.low_band_ratio,
                 (unsigned)f.peak_sample_idx, (unsigned)n);
 
         atomic_set(&tap_capture_busy, 0);
@@ -1455,12 +1551,27 @@ K_THREAD_DEFINE(bio_acoustic_worker_id, 1536,
  * FIFO; call on every chip tap event to snapshot + signal worker. */
 void gesture_mode_bio_acoustic_init(void)
 {
+    /* Initialise CMSIS-DSP RFFT instance.  Length must be a
+     * supported power of 2 (32..4096); 512 fits us perfectly.
+     * arm_rfft_fast_init_f32 returns ARM_MATH_SUCCESS (0) on
+     * success.  Stash the success flag so the worker can short-
+     * circuit if init failed (shouldn't happen but defensive). */
+    arm_status fft_status = arm_rfft_fast_init_f32(&fft_inst, FFT_SIZE);
+    if (fft_status != ARM_MATH_SUCCESS) {
+        LOG_ERR("[BIO] arm_rfft_fast_init_f32 failed (%d) -- spectral "
+                "classifier disabled", (int)fft_status);
+        fft_initialised = false;
+    } else {
+        fft_initialised = true;
+    }
+
     int err = lsm6dsl_fifo_enable_continuous();
     if (err) {
         LOG_ERR("[BIO] FIFO enable failed (%d) -- bio-acoustic "
                 "capture will not work", err);
     } else {
-        LOG_INF("[BIO] worker thread started; FIFO armed for capture");
+        LOG_INF("[BIO] worker thread started; FIFO armed for capture; "
+                "FFT %s", fft_initialised ? "ready" : "DISABLED");
     }
 }
 
