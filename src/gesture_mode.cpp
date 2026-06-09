@@ -5,6 +5,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
 #include <math.h>
+#include <limits.h>
 
 #include <arm_math.h>
 #include <arm_const_structs.h>
@@ -177,6 +178,26 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
  */
 #define MULTI_TAP_WINDOW_MS         250
 
+/* Cadenced double-tap: deliberate user-driven double-tap with inter-
+ * tap interval in a specific window.  Values research-grounded
+ * 2026-06-10:
+ *
+ *   - Apple VoiceOver: default 250 ms, user-adjustable 200-500 ms
+ *     in 50 ms steps.
+ *   - Patent literature on natural double-tap behavior: normal
+ *     150-180 ms; fast (in a hurry) 80-90 ms; slow/deliberate
+ *     250-480 ms.
+ *
+ * CADENCE_MIN_MS = 150 matches the natural-double-tap floor;
+ * sub-150 ms intervals are statistically unusual and likely
+ * involuntary double-bumps, so rejecting them strengthens the
+ * deliberate-intent filter.
+ *
+ * CADENCE_MAX_MS = 500 matches Apple's slowest tunable setting and
+ * covers the 250-480 ms slow-deliberate range. */
+#define CADENCE_MIN_MS   150
+#define CADENCE_MAX_MS   500
+
 /*
  * Activity gate (Choice 4, Stage C, 2026-06-08).
  *
@@ -329,6 +350,37 @@ static K_WORK_DELAYABLE_DEFINE(multi_tap_commit_work,
  * gap, so real double-taps are unaffected. */
 #define RINGING_REFRACTORY_MS    50
 static int64_t last_chip_tap_time_ms = 0;
+
+/* Time of the chip-tap event before the current one.  Used by
+ * last_two_tap_interval_ms() to compute the inter-tap interval for
+ * cadenced-double-tap detection.  Updated by
+ * gesture_mode_on_chip_single_tap() after the new tap is accepted.
+ * Zero means there isn't a "previous" tap to compare against. */
+static int64_t prev_chip_tap_time_ms = 0;
+
+/* Inter-tap interval (ms) between the most-recent and second-most-
+ * recent chip-tap events.  Returns 0 if there is no recent previous
+ * tap to compare against (cold start). */
+static int last_two_tap_interval_ms(void)
+{
+    if (prev_chip_tap_time_ms == 0) return 0;
+    /* last_chip_tap_time_ms is the existing module-state set after
+     * the most-recent accepted chip-tap.  prev_chip_tap_time_ms is
+     * the value last_chip_tap_time_ms had BEFORE the most-recent
+     * update -- so (last - prev) is the gap between the two most
+     * recent chip-tap events. */
+    int64_t delta = last_chip_tap_time_ms - prev_chip_tap_time_ms;
+    if (delta < 0 || delta > INT_MAX) return 0;
+    return (int)delta;
+}
+
+/* True if the given inter-tap interval falls within the cadenced
+ * double-tap window. */
+static bool is_cadenced_double_tap_window(int interval_ms)
+{
+    return (interval_ms >= CADENCE_MIN_MS) &&
+           (interval_ms <= CADENCE_MAX_MS);
+}
 
 /* Activity gate state.  See ACTIVITY_GATE_* comment block.
  * samples_since_activity counts up per accel sample (saturated at
@@ -771,6 +823,7 @@ void gesture_mode_init(void)
     multi_tap_first_axis = '?';
     multi_tap_first_sign = '?';
     last_chip_tap_time_ms = 0;
+    prev_chip_tap_time_ms = 0;
     samples_since_activity = ACTIVITY_GATE_DWELL;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
@@ -1146,6 +1199,10 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
                 peak_axis, tap_sign);
         return;
     }
+    /* Push current to previous BEFORE updating last_chip_tap_time_ms.
+     * This is what enables last_two_tap_interval_ms() to compute the
+     * gap between the two most-recent events. */
+    prev_chip_tap_time_ms = last_chip_tap_time_ms;
     last_chip_tap_time_ms = now;
 
     /* Activity gate: reject the event if motion residual was high
