@@ -1227,6 +1227,21 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
         return;
     }
 
+    /* Pose gate: chip-tap is only a mode-entry candidate if we're
+     * currently in a pose-armed state.  Without an armed pose, the
+     * tap is logged for diagnostics but does NOT advance multi-tap
+     * state or trigger mode entry.
+     *
+     * This is what prevents skin-taps near the band, desk slaps, thigh
+     * slaps, lap-rest impacts, etc. from triggering modes. */
+    pose_id_t armed = gesture_mode_armed_pose();
+    if (armed == POSE_NONE) {
+        LOG_INF("Chip single-tap IGNORED: no pose armed "
+                "(axis=%c sign=%c).  Mode entry requires pose-first.",
+                peak_axis, tap_sign);
+        return;
+    }
+
     bool starts_new_sequence =
         (multi_tap_count == 0) ||
         ((now - multi_tap_last_time_ms) > MULTI_TAP_WINDOW_MS);
