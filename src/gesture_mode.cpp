@@ -1670,38 +1670,6 @@ static void _compute_band_energies(const uint8_t *buf,
     }
 }
 
-/* Simple classifier rules.  Returns:
- *   'S' = snap
- *   'B' = band-tap
- *   '?' = unclassified (genuinely ambiguous)
- *
- * v3 (2026-06-10): spectral-feature classifier.  Previous version
- * (pre_event_energy) was rejected because it conflates "user
- * positioning motion" with "gesture intent" -- see
- * principle_real_world_grounding_before_engineering memory.
- *
- * Snap (bone-conducted via carpal bones):
- *   - Tissue is a natural low-pass filter
- *   - Energy concentrated 20-200 Hz
- *   - low_band_ratio expected HIGH (>0.7)
- *
- * Band-tap (direct mechanical impact on housing):
- *   - Housing/PCB resonance up to 1 kHz+
- *   - Energy spread across our 20-400 Hz band
- *   - low_band_ratio expected LOWER (~0.5 if energy is even-ish
- *     across our two bands)
- *
- * Initial thresholds are physics-motivated; tune from hardware
- * data.  MIN_PEAK_SUM keeps weak events from being classified
- * confidently. */
-#define SNAP_LOW_RATIO_THRESH    0.70f  /* low_band fraction; above
-                                            this is confidently snap */
-#define TAP_LOW_RATIO_THRESH     0.55f  /* below this is confidently
-                                            tap; in-between is unclassified */
-#define MIN_PEAK_SUM             20000  /* |x|+|y|+|z| at peak;
-                                            below this is too weak
-                                            to be a real tap/snap */
-
 /* Surface-spectral confirmation -- v0 proxy.
  *
  * Literature-backed discriminator (PMC 2016, surface-stiffness
@@ -1730,25 +1698,6 @@ static void _compute_band_energies(const uint8_t *buf,
  * SURFACE_RESONANCE_MID_BAND_THRESH is defined near the top of the
  * static-variable block (before multi_tap_commit_handler) so it is
  * visible to that function without a forward reference. */
-
-static char _classify(const struct tap_features *f)
-{
-    uint32_t total_abs = (uint32_t)f->peak_x_abs +
-                         (uint32_t)f->peak_y_abs +
-                         (uint32_t)f->peak_z_abs;
-    if (total_abs < MIN_PEAK_SUM) {
-        return '?';  /* too weak to characterise */
-    }
-
-    /* Primary: spectral band-energy ratio. */
-    if (f->low_band_ratio >= SNAP_LOW_RATIO_THRESH) {
-        return 'S';  /* snap */
-    }
-    if (f->low_band_ratio <= TAP_LOW_RATIO_THRESH) {
-        return 'B';  /* band-tap */
-    }
-    return '?';  /* boundary zone */
-}
 
 /* Returns true if the most recently captured tap shows desk-feedback
  * spectral content (mid_band above threshold).  Used to confirm
@@ -1781,8 +1730,6 @@ static void bio_acoustic_worker(void *, void *, void *)
                                &f.low_band_energy,
                                &f.mid_band_energy,
                                &f.low_band_ratio);
-        char verdict = _classify(&f);
-
         uint32_t total_abs = (uint32_t)f.peak_x_abs +
                              (uint32_t)f.peak_y_abs +
                              (uint32_t)f.peak_z_abs;
@@ -1790,17 +1737,13 @@ static void bio_acoustic_worker(void *, void *, void *)
                                 (uint32_t)f.peak_z_abs * 100 / total_abs :
                                 0;
 
-        const char *verdict_str = (verdict == 'S') ? "SNAP" :
-                                  (verdict == 'B') ? "BAND-TAP" :
-                                  "UNCLASSIFIED";
-
-        /* Log the full feature vector so empirical tuning of the
-         * spectral thresholds is visible.  ratio is the headline
-         * discriminator; low/mid absolute energies confirm we have
-         * meaningful signal (vs noise floor). */
-        LOG_INF("[BIO] verdict=%s peak[%d,%d,%d] dom=%c z_ratio=%u%% "
+        /* Log the full feature vector for diagnostics.  ratio is the
+         * headline discriminator; low/mid absolute energies confirm we
+         * have meaningful signal (vs noise floor).  No verdict -- pose
+         * carries mode info; snap-vs-tap discrimination deferred to
+         * future in-session fusion (F6). */
+        LOG_INF("[BIO] features peak[%d,%d,%d] dom=%c z_ratio=%u%% "
                 "low_band=%.0f mid_band=%.0f low_ratio=%.2f idx=%u/%u",
-                verdict_str,
                 (int)f.peak_x, (int)f.peak_y, (int)f.peak_z,
                 f.dominant_axis,
                 (unsigned)z_ratio_pct,
