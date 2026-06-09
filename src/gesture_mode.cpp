@@ -785,12 +785,23 @@ static void _transition_to(GestureMode new_mode)
 }
 
 /* Evaluate whether the acquisition pipeline needs to be alive RIGHT
- * NOW and notify the registered callback on edges.  "Needs alive"
- * means EITHER (a) the current mode is a cursor mode that consumes
- * IMU samples, OR (b) a cooldown is currently open -- because the
- * cooldown countdown is driven by accel-sample callbacks and the
- * re-engage detector needs fresh orientation classifications to
- * notice the user returning to the expected pose.
+ * NOW and notify the registered callback on edges.
+ *
+ * ALWAYS-ON policy (2026-06-10 fix): the acq pipeline must stay alive
+ * continuously so the pose FSM receives accel samples in MODE_IDLE
+ * (the always-listening trigger state).  Previously this was gated on
+ * _mode_needs_continuous_imu(m) || cursor_cooldown_remaining > 0,
+ * which meant pose detection only ran during AIR_MOUSE/SURFACE/
+ * SNAPSHOT states -- broken for the trigger-detection use case since
+ * the user is in MODE_IDLE when they want to trigger.
+ *
+ * Power cost: ~30-50 µA additional vs gated-acq IDLE.  The IMU is
+ * already running at 833 Hz continuously (for the chip tap engine);
+ * this only adds the MCU's per-sample read + processing at 100 Hz.
+ * Acceptable for an always-listening gesture device.
+ *
+ * Reference m is preserved (via (void)m) for future per-state
+ * optimisation (e.g., lower acq rate in IDLE specifically).
  *
  * Called from _transition_to (mode changes) and from the cooldown
  * decrement site (cooldown crossing zero).  Both are real edges of
@@ -800,9 +811,25 @@ static void _update_acq_request(void)
     if (!s_acq_request_cb) {
         return;
     }
+    /* Acq pipeline must stay alive continuously so the pose FSM
+     * receives accel samples in IDLE (the always-listening trigger
+     * state).  Previously this was gated on
+     * _mode_needs_continuous_imu() || cursor_cooldown_remaining > 0,
+     * which meant pose detection only ran during AIR_MOUSE/SURFACE/
+     * SNAPSHOT states -- broken for the trigger detection use case
+     * since the user is in MODE_IDLE when they want to trigger.
+     *
+     * Power cost: ~30-50 µA additional vs gated-acq IDLE.  The
+     * IMU is already running at 833 Hz continuously (for the chip
+     * tap engine); this only adds the MCU's per-sample read+
+     * processing at 100 Hz.  Acceptable for an always-listening
+     * gesture device.
+     *
+     * Reference m for future per-state optimisation if needed
+     * (e.g., lower acq rate in IDLE specifically). */
     GestureMode m = (GestureMode)atomic_get(&mode_atomic);
-    bool now_needs = _mode_needs_continuous_imu(m) ||
-                     cursor_cooldown_remaining > 0;
+    (void)m;  /* not currently used for gating; preserved for future */
+    bool now_needs = true;
     if (now_needs != s_prev_needs_acq) {
         s_acq_request_cb(now_needs);
         s_prev_needs_acq = now_needs;
