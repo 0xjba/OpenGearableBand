@@ -1,7 +1,29 @@
 #include "WearableDSP.h"
 #include <zephyr/logging/log.h>
+#include <math.h>
 
 LOG_MODULE_REGISTER(dsp, LOG_LEVEL_INF);
+
+// --- PPG quality probe accumulators ('q' command; see header) -----------
+// Written by WearableDSP::processHeartRate() (DSP thread) while active,
+// read by dsp_probe_finish_and_log() (power-loop thread) after collection
+// is disarmed.  The disarm-before-read ordering makes the cross-thread
+// access benign for a diagnostic tool.
+#define PROBE_PI_CAP 24
+static bool  s_probe_active    = false;
+static int   s_probe_windows   = 0;   // windows seen since start (incl. skipped)
+static int   s_probe_used      = 0;   // windows actually counted
+static float s_probe_pi_sum    = 0.0f;
+static float s_probe_pi_min    = 0.0f;
+static float s_probe_pi_max    = 0.0f;
+static float s_probe_dc_sum    = 0.0f;
+static float s_probe_acrms_sum = 0.0f;
+static int   s_probe_good_sqi  = 0;
+static int   s_probe_in_range  = 0;
+static float s_probe_bpm_sum   = 0.0f;
+static float s_probe_bpm_sumsq = 0.0f;
+static int   s_probe_bpm_n     = 0;
+static float s_probe_pi_vals[PROBE_PI_CAP];
 
 // Skip the first AUTOCORR_TRANSIENT_SKIP samples of the band-pass IIR's
 // output before correlating.  The 4th-order Butterworth IIR is re-init'd
@@ -264,18 +286,126 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_smv) {
 
     bool bpm_in_range = (raw_bpm >= MIN_BPM && raw_bpm <= MAX_BPM);
 
+    // Perfusion Index proxy: AC_RMS / DC * 100%.  ppg_var is the variance
+    // of the band-pass-filtered (AC) PPG, so sqrt(ppg_var) is the AC RMS;
+    // ac_mean is the DC level.  PI is the gold-standard signal-strength
+    // metric for comparing PPG sensor positions (wrist ref: <0.1% weak,
+    // >0.5% strong).
+    float ac_rms = sqrtf(ppg_var);
+    float pi = (ac_mean > 1.0f) ? (ac_rms / ac_mean * 100.0f) : 0.0f;
+
     // One diagnostic line per window.  ac / fft / conf are zero on any
     // path that didn't run dual-method (motion or sqi-skip).
-    LOG_INF("dsp: ppg_dc=%.0f ppg_var=%.0f imu_var=%.3f motion=%d sqi=%d "
+    LOG_INF("dsp: ppg_dc=%.0f ppg_var=%.0f pi=%.4f%% imu_var=%.3f motion=%d sqi=%d "
             "path=%s ac=%.2f fft=%.2f conf=%.2f raw=%.2f in_range=%d kalman=%.2f",
-            (double)ac_mean, (double)ppg_var, (double)imu_var,
+            (double)ac_mean, (double)ppg_var, (double)pi, (double)imu_var,
             (int)motion, (int)sqi_passed, path,
             (double)ac_bpm, (double)fft_bpm, (double)stat_conf,
             (double)raw_bpm, (int)bpm_in_range, (double)kalman.x);
 
+    // PPG-probe accumulation.  Skip the first window (512-sample buffer
+    // fill + band-pass startup transient) so warmup doesn't bias the
+    // position comparison.
+    if (s_probe_active) {
+        s_probe_windows++;
+        if (s_probe_windows > 1) {
+            if (s_probe_used < PROBE_PI_CAP) {
+                s_probe_pi_vals[s_probe_used] = pi;
+            }
+            if (s_probe_used == 0) {
+                s_probe_pi_min = pi;
+                s_probe_pi_max = pi;
+            } else {
+                if (pi < s_probe_pi_min) s_probe_pi_min = pi;
+                if (pi > s_probe_pi_max) s_probe_pi_max = pi;
+            }
+            s_probe_used++;
+            s_probe_pi_sum    += pi;
+            s_probe_dc_sum    += ac_mean;
+            s_probe_acrms_sum += ac_rms;
+            if (sqi_passed)   s_probe_good_sqi++;
+            if (bpm_in_range) {
+                s_probe_in_range++;
+                s_probe_bpm_sum   += raw_bpm;
+                s_probe_bpm_sumsq += raw_bpm * raw_bpm;
+                s_probe_bpm_n++;
+            }
+        }
+    }
+
     if (!sqi_passed)   return kalman.x;
     if (!bpm_in_range) return kalman.x;
     return kalman.update(raw_bpm);
+}
+
+void dsp_probe_start(void)
+{
+    s_probe_windows   = 0;
+    s_probe_used      = 0;
+    s_probe_pi_sum    = 0.0f;
+    s_probe_pi_min    = 0.0f;
+    s_probe_pi_max    = 0.0f;
+    s_probe_dc_sum    = 0.0f;
+    s_probe_acrms_sum = 0.0f;
+    s_probe_good_sqi  = 0;
+    s_probe_in_range  = 0;
+    s_probe_bpm_sum   = 0.0f;
+    s_probe_bpm_sumsq = 0.0f;
+    s_probe_bpm_n     = 0;
+    s_probe_active    = true;   // arm last so a half-reset window isn't counted
+}
+
+void dsp_probe_finish_and_log(void)
+{
+    s_probe_active = false;     // disarm before reading the accumulators
+    int n = s_probe_used;
+    if (n <= 0) {
+        LOG_INF("=== PPG PROBE: no usable windows "
+                "(signal too poor or capture too short) ===");
+        return;
+    }
+
+    int m = (n < PROBE_PI_CAP) ? n : PROBE_PI_CAP;
+    // Insertion sort the captured PI values for the median (small m).
+    for (int i = 1; i < m; i++) {
+        float key = s_probe_pi_vals[i];
+        int j = i - 1;
+        while (j >= 0 && s_probe_pi_vals[j] > key) {
+            s_probe_pi_vals[j + 1] = s_probe_pi_vals[j];
+            j--;
+        }
+        s_probe_pi_vals[j + 1] = key;
+    }
+    float median = (m & 1)
+        ? s_probe_pi_vals[m / 2]
+        : 0.5f * (s_probe_pi_vals[m / 2 - 1] + s_probe_pi_vals[m / 2]);
+
+    float pi_mean    = s_probe_pi_sum / (float)n;
+    float dc_mean    = s_probe_dc_sum / (float)n;
+    float acrms_mean = s_probe_acrms_sum / (float)n;
+    float bpm_mean   = s_probe_bpm_n ? (s_probe_bpm_sum / (float)s_probe_bpm_n) : 0.0f;
+    float bpm_std    = 0.0f;
+    if (s_probe_bpm_n > 1) {
+        float v = s_probe_bpm_sumsq / (float)s_probe_bpm_n - bpm_mean * bpm_mean;
+        bpm_std = (v > 0.0f) ? sqrtf(v) : 0.0f;
+    }
+    const char *hint = (pi_mean >= 0.5f) ? "STRONG"
+                     : (pi_mean >= 0.1f) ? "MODERATE"
+                                         : "WEAK";
+
+    LOG_INF("=== PPG PROBE RESULT (%d windows used) ===", n);
+    LOG_INF("  Perfusion Index: mean=%.4f%% median=%.4f%% min=%.4f%% max=%.4f%%",
+            (double)pi_mean, (double)median,
+            (double)s_probe_pi_min, (double)s_probe_pi_max);
+    LOG_INF("  DC level mean=%.0f   AC RMS mean=%.1f",
+            (double)dc_mean, (double)acrms_mean);
+    LOG_INF("  Good-SQI windows=%d/%d (%d%%)   BPM in-range=%d/%d",
+            s_probe_good_sqi, n, (n ? s_probe_good_sqi * 100 / n : 0),
+            s_probe_in_range, n);
+    LOG_INF("  BPM mean=%.1f stddev=%.1f", (double)bpm_mean, (double)bpm_std);
+    LOG_INF("  SIGNAL HINT: %s  (wrist PI ref: <0.1%%=weak >0.5%%=strong; "
+            "compare positions by mean/median PI)", hint);
+    LOG_INF("==========================================");
 }
 
 float WearableDSP::runAutocorrelation(float* ppg) {

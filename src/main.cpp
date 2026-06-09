@@ -488,6 +488,11 @@ static const struct device *console_uart =
 // because a stray "old" value just delays the action by one poll cycle.
 static volatile uint8_t pending_cmd = 0;
 
+// PPG quality probe request.  Set by the 'q' console command, consumed
+// by the power state thread (so all MAX/acq/power manipulation stays on
+// one thread).  See run_ppg_probe().
+static volatile bool probe_requested = false;
+
 // Tap calibration mode -- set by the 'c' serial command.  When true,
 // every chip-tap event logs extra diagnostic info (current TAP_THS
 // value, activity-gate state).  Helps tune TAP_THS empirically per
@@ -573,6 +578,10 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
         } else if (c == '-') {
             // Raise TAP_THS by 2 LSB (~125 mg) -- less sensitive.
             pending_cmd = '-';
+        } else if (c == 'q' || c == 'Q') {
+            // PPG quality probe -- 20 s capture + perfusion-index
+            // scorecard for finalising the band wear position.
+            pending_cmd = 'q';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -603,6 +612,7 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'm'=force mouse test mode (wasd=move, 1/2=click, ,/.=scroll, m again exits)");
     LOG_INF("  'c'=toggle chip-tap calibration logging");
     LOG_INF("  '+'=lower TAP_THS (more sensitive)   '-'=raise TAP_THS (less sensitive)");
+    LOG_INF("  'q'=PPG quality probe (20s perfusion-index capture for wear position)");
 
     /* Per-step cursor delta for the mouse-test injects.  10 pixels
      * per press gives a clearly visible cursor jump on the host. */
@@ -750,6 +760,15 @@ void reset_thread_entry(void *, void *, void *) {
                 LOG_INF("TAP_THS raised to 0x%02x (~%d mg) -- less sensitive",
                         new_ths, new_ths * 62);
             }
+        } else if (cmd == 'q') {
+            pending_cmd = 0;
+            // Hand the probe to the power state thread (it owns MAX /
+            // acq / power transitions -- doing them here would race).
+            // Wake the power loop out of run_idle()'s k_poll so it
+            // picks up the request promptly.
+            LOG_INF("PPG probe requested -- power thread will run a 20s capture");
+            probe_requested = true;
+            k_sem_give(&motion_wake_sem);
         }
         k_sleep(K_MSEC(50));
     }
@@ -1226,6 +1245,31 @@ static void run_workout(void) {
     }
 }
 
+// PPG quality probe ----------------------------------------------------
+//
+// Runs entirely on the power-state thread so MAX / acq / power-state
+// manipulation stays single-threaded.  Reuses the tested
+// transition_to_snapshot() (wake MAX, start acq, PS_SNAPSHOT) and
+// transition_to_idle() (shut MAX, restore IDLE) so no new power
+// sequencing is introduced -- the only difference from a normal
+// snapshot is the fixed duration and the probe accumulation.
+#define PPG_PROBE_DURATION_MS  20000
+
+static void run_ppg_probe(void) {
+    LOG_INF("=== PPG PROBE: %d s capture -- hold still, forearm at heart height ===",
+            PPG_PROBE_DURATION_MS / 1000);
+    transition_to_snapshot();   // wake MAX, start acq, stop snapshot_tick
+    dsp_probe_start();
+
+    int64_t deadline = k_uptime_get() + PPG_PROBE_DURATION_MS;
+    while (k_uptime_get() < deadline) {
+        k_sleep(K_MSEC(250));
+    }
+
+    dsp_probe_finish_and_log();
+    transition_to_idle();       // shut MAX, restore IDLE, restart snapshot_tick
+}
+
 // State machine thread -------------------------------------------------
 
 void power_state_thread_entry(void *, void *, void *) {
@@ -1234,6 +1278,14 @@ void power_state_thread_entry(void *, void *, void *) {
     transition_to_idle();
 
     while (1) {
+        // PPG probe takes priority over normal power-state servicing.
+        // probe_requested is set by the 'q' console command, which also
+        // gives motion_wake_sem to break run_idle() out of its k_poll.
+        if (probe_requested) {
+            probe_requested = false;
+            run_ppg_probe();
+            continue;
+        }
         switch (power_state) {
             case PS_IDLE:           run_idle();           break;
             case PS_SNAPSHOT:       run_snapshot();       break;

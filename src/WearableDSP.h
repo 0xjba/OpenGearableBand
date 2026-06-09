@@ -155,3 +155,18 @@ public:
         return wear_state == WEAR_WORN && last_motion != STATIONARY;
     }
 };
+
+// --- PPG quality probe (wear-position finalisation tool) -----------------
+// Aggregates per-window Perfusion Index (PI = AC_RMS / DC * 100%) plus
+// DC level, SQI-pass fraction and BPM stability across a capture window.
+// Used to compare band wear positions (volar / dorsal / radial / ulnar)
+// on an objective signal-quality metric.  Driven by the 'q' serial
+// command via the power state machine; see run_ppg_probe() in main.cpp.
+//
+// dsp_probe_start() resets the accumulators and arms collection inside
+// WearableDSP::processHeartRate(); dsp_probe_finish_and_log() disarms and
+// prints a one-shot scorecard.  Both are safe to call from the power-loop
+// thread (collection happens in the DSP thread; the first window is
+// skipped to drop the buffer-fill + band-pass startup transient).
+void dsp_probe_start(void);
+void dsp_probe_finish_and_log(void);
