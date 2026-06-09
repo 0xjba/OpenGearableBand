@@ -622,12 +622,14 @@ EOF
 
 ---
 
-## Task 5: Cadenced double-tap detector for SURFACE
+## Task 5: Cadenced double-tap detector (all modes)
 
 **Files:**
 - Modify: `src/gesture_mode.cpp` — add inter-tap timing constraint helper
 
-**Rationale:** SURFACE mode entry requires a deliberate double-tap with 150-300 ms inter-tap spacing. Reuses existing multi-tap counter, adds a timing filter.
+**Rationale:** ALL three modes (AIR_MOUSE, DICTATION, SURFACE) require a deliberate cadenced double-tap (150-300 ms inter-tap spacing) for mode entry. Single tap was rejected by the user (2026-06-10 evening) as too easy to produce accidentally — even in a deliberate pose, an incidental bump could trigger mode entry. Cadence is the deliberate-intent filter; double-tap is the v0 minimum (triple-tap is a one-constant alternative if accidental triggers are observed).
+
+This task adds the timing primitive only. Task 8 uses it for all three mode-entry paths.
 
 - [ ] **Step 1: Add cadence constants**
 
@@ -919,52 +921,45 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
         return;
     }
 
-    /* Apply per-pose gesture rules. */
+    /* Common pre-check: ALL modes require cadenced double-tap. */
+    if (count < 2) {
+        LOG_INF("Mode entry rejected (%s): need double-tap "
+                "(got count=%d)", pose_name(armed), count);
+        goto disarm;
+    }
+    int interval = last_two_tap_interval_ms();
+    if (!is_cadenced_double_tap_window(interval)) {
+        LOG_INF("Mode entry rejected (%s): inter-tap=%d ms outside "
+                "cadence window [%d, %d]",
+                pose_name(armed), interval,
+                CADENCE_MIN_MS, CADENCE_MAX_MS);
+        goto disarm;
+    }
+
+    /* Apply per-pose extra checks then trigger mode entry. */
     switch (armed) {
     case POSE_AIR_MOUSE:
-        if (count >= 1) {
-            LOG_INF("MODE ENTRY: AIR_MOUSE (pose + %d-tap gesture)",
-                    count);
-            /* TODO when integrating: trigger actual mode transition
-             * here.  For now log only so the pose+gesture path is
-             * verified before touching the power state machine.  See
-             * existing 't'/'y' serial commands for the mode-entry
-             * pattern. */
-        }
+        LOG_INF("MODE ENTRY: AIR_MOUSE (pose + cadenced double-tap)");
+        /* TODO (future task): wire to power state machine -- see 't'/'y'
+         * serial commands for the AIR_MOUSE entry pattern.  Logged-only
+         * for now to verify pose+gesture path empirically first. */
         break;
 
     case POSE_DICTATION:
-        if (count >= 1) {
-            LOG_INF("MODE ENTRY: DICTATION (pose + %d-tap gesture)",
-                    count);
-            /* Dictation mode does not exist yet (its own spec).
-             * Log only.  Will wire when dictation feature lands. */
-        }
+        LOG_INF("MODE ENTRY: DICTATION (pose + cadenced double-tap)");
+        /* Dictation mode does not exist yet (its own spec).  Log only;
+         * will wire when dictation feature lands. */
         break;
 
     case POSE_SURFACE:
-        /* Require count >= 2 AND cadenced double-tap interval AND
-         * spectral surface confirmation. */
-        if (count < 2) {
-            LOG_INF("SURFACE entry rejected: need double-tap "
-                    "(got count=%d)", count);
-            break;
-        }
-        {
-            int interval = last_two_tap_interval_ms();
-            if (!is_cadenced_double_tap_window(interval)) {
-                LOG_INF("SURFACE entry rejected: inter-tap=%d ms "
-                        "outside cadence window [%d, %d]",
-                        interval, CADENCE_MIN_MS, CADENCE_MAX_MS);
-                break;
-            }
-        }
+        /* SURFACE has an extra check: tap must show desk-feedback
+         * spectral signature (hard surface, not lap). */
         if (!surface_spectral_confirms_hard_surface()) {
             LOG_INF("SURFACE entry rejected: spectral signature "
                     "indicates soft surface (mid_band=%.0f < %.0f)",
                     (double)last_tap_mid_band_energy,
                     (double)SURFACE_RESONANCE_MID_BAND_THRESH);
-            break;
+            goto disarm;
         }
         LOG_INF("MODE ENTRY: SURFACE (pose + cadenced double-tap + "
                 "hard-surface spectral confirmed)");
@@ -972,10 +967,10 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
         break;
 
     default:
-        LOG_INF("Multi-tap commit ABORT: unknown armed pose %d",
-                (int)armed);
+        LOG_INF("Mode entry ABORT: unknown armed pose %d", (int)armed);
         break;
     }
+disarm:;
 
     /* Disarm pose after a gesture attempt (whether successful or
      * not) -- one shot per arm window. */
@@ -990,27 +985,32 @@ Expected: clean build.
 
 - [ ] **Step 4: Hardware test — full pose-gated mode-entry flow**
 
-Flash and test each mode:
+Flash and test each mode.  ALL modes require cadenced double-tap (single tap is rejected).  Gesture variants (tap-on-band vs index-tap-on-desk vs finger-snap) are not yet discriminated — any chip-tap event with the right timing counts.
 
-**AIR_MOUSE entry path:**
-1. Raise wrist deliberately (motion-into-pose), hold ~0.5 sec in raised forward position.
-2. Within 3 sec, single-tap the band.
-3. Expected logs in order:
+**AIR_MOUSE entry path (correct):**
+1. Raise wrist forward, band volar facing screen.
+2. Within 3 sec, cadenced double-tap (150-300 ms inter-tap).  Use any variant (tap-on-band with other hand, or finger-snap).
+3. Expected logs:
    ```
    Pose ARMED: AIR_MOUSE (...)
-   Chip single-tap: ...
-   Multi-tap commit: 1 (...)
-   MODE ENTRY: AIR_MOUSE (pose + 1-tap gesture)
+   Chip single-tap: ... count=1 ...
+   Chip single-tap: ... count=2 ...
+   Multi-tap commit: 2 (...)
+   MODE ENTRY: AIR_MOUSE (pose + cadenced double-tap)
    ```
 
-**DICTATION pose path:**
+**AIR_MOUSE rejected — single tap:**
+1. Raise pose, single tap.
+2. Expected: `Mode entry rejected (AIR_MOUSE): need double-tap (got count=1)`.
+
+**DICTATION entry path:**
 1. Raise + rotate toward mouth.
-2. Single tap.
-3. Expected: `MODE ENTRY: DICTATION ...`
+2. Cadenced double-tap.
+3. Expected: `MODE ENTRY: DICTATION (pose + cadenced double-tap)`.
 
 **SURFACE entry path (correct):**
-1. Lower wrist to desk surface, dwell.
-2. Within 3 sec, double-tap on the band with ~200 ms inter-tap spacing.
+1. Wrist on desk surface (or already on desk before flashing).
+2. Cadenced double-tap (any variant — tap on band, index-tap on desk surface).
 3. Expected:
    ```
    Pose ARMED: SURFACE (...)
@@ -1020,22 +1020,23 @@ Flash and test each mode:
    MODE ENTRY: SURFACE (pose + cadenced double-tap + hard-surface spectral confirmed)
    ```
 
-**SURFACE entry path (rejected — wrong gesture):**
-1. Lower wrist to desk, single-tap.
-2. Expected: `SURFACE entry rejected: need double-tap (got count=1)`.
+**SURFACE rejected — single tap:**
+1. Wrist on desk, single tap.
+2. Expected: `Mode entry rejected (SURFACE): need double-tap (got count=1)`.
 
-**SURFACE entry path (rejected — wrong cadence):**
-1. Lower wrist to desk, do two taps with > 400 ms between them.
-2. Expected: `SURFACE entry rejected: inter-tap=... ms outside cadence window`.
+**SURFACE rejected — wrong cadence:**
+1. Wrist on desk, two taps with > 400 ms between them.
+2. Expected: `Mode entry rejected (SURFACE): inter-tap=... ms outside cadence window`.
 
-**SURFACE entry path (rejected — soft surface):**
-1. Rest wrist on lap (or pillow), do cadenced double-tap.
+**SURFACE rejected — soft surface:**
+1. Rest wrist on lap (or pillow), cadenced double-tap.
 2. Expected: `SURFACE entry rejected: spectral signature indicates soft surface ...`.
 
-This last one is the key defence test. If it fires correctly, the surface-spectral check is working. If lap-rest with cadenced double-tap STILL triggers SURFACE entry, we'll need to tune `SURFACE_RESONANCE_MID_BAND_THRESH` upward.
+This is the key defence test.  If it fires correctly, the surface-spectral check is working.  If lap-rest with cadenced double-tap STILL triggers SURFACE entry, we'll need to tune `SURFACE_RESONANCE_MID_BAND_THRESH` upward.
 
 **Negative tests:**
-- Skin tap near band without pose: still IGNORED (Task 7 behaviour preserved).
+- Cadenced double-tap WITHOUT any pose armed: IGNORED (Task 7 behaviour preserved).
+- Skin tap near band without pose: still IGNORED.
 - Random ambient slap (desk hit while not wearing band on desk): IGNORED.
 
 Report: which paths worked, which need threshold tuning, any surprises.
@@ -1045,14 +1046,21 @@ Report: which paths worked, which need threshold tuning, any surprises.
 ```bash
 git add src/gesture_mode.cpp
 git commit -m "$(cat <<'EOF'
-poses: wire mode entry from armed pose + matched gesture
+poses: wire mode entry from armed pose + cadenced double-tap
 
 Replaces the multi-tap commit handler to trigger mode entry based on
-which pose was armed plus the gesture shape:
-  AIR_MOUSE  ← armed pose + single tap
-  DICTATION  ← armed pose + single tap (no mode wired yet; log-only)
-  SURFACE    ← armed pose + cadenced double-tap (150-300 ms) +
+armed pose + cadenced double-tap.  ALL modes require cadenced double-
+tap (150-300 ms inter-tap):
+  AIR_MOUSE  ← armed pose + cadenced double-tap
+  DICTATION  ← armed pose + cadenced double-tap (no mode wired yet)
+  SURFACE    ← armed pose + cadenced double-tap +
               hard-surface spectral confirmation (mid_band > thresh)
+
+Single tap is rejected for all modes -- single tap is too easy to
+produce accidentally even in a deliberate pose (user request
+2026-06-10).  Gesture variants (tap-on-band vs index-tap-on-desk vs
+finger-snap) are not yet discriminated; documented as future work
+(spec §11.1).
 
 Pose is disarmed after each gesture attempt (success or fail), so
 each pose-arm is one-shot.
@@ -1263,6 +1271,116 @@ docs/superpowers/specs/2026-06-10-gesture-trigger-redesign-design.md.
 EOF
 )"
 ```
+
+---
+
+## Future Work (after Task 10)
+
+These items are deferred from the current 10-task plan.  Each
+becomes its own brainstorm + design spec + plan when picked up;
+they're listed here so they're not forgotten.
+
+### F1. Gesture-variant discrimination (tap-on-band / desk-tap / snap)
+
+**Requested by user 2026-06-10 evening.**
+
+At the firmware level today, three physically-distinct user actions
+all produce indistinguishable chip-tap events:
+
+1. **Tap on the band** — other hand strikes the band housing
+2. **Tap with index finger on the desk** — vibration transmits
+   hand → wrist → IMU
+3. **Finger snap** — same hand fingers + bone-conducted impulse
+
+All three trigger the chip's tap engine because any sufficient
+impulse to the wrist registers.  Discriminating between them
+unlocks:
+
+- Different in-mode actions (e.g., snap = click vs tap = right-click
+  inside AIR_MOUSE)
+- More natural ergonomics (user picks the variant comfortable for
+  context — hands-busy → index-on-desk; one-handed → snap)
+- Per-mode preferred variants (e.g., DICTATION naturally pairs with
+  snap since the band is volar-toward-mouth; awkward to tap with the
+  other hand)
+
+Approach (brainstorm-it-out when picked up):
+
+- **Acoustic discrimination via PDM mic** (GestEar-class).  Snap has
+  a well-characterised acoustic signature at 1.5-3.5 kHz peak; tap-
+  on-band and tap-on-desk are mostly mechanical.  Mic + IMU fusion.
+- **Higher IMU ODR** (1.66-3.33 kHz) for spectral analysis of the
+  impulse waveform itself (ViBand-class).
+- **Hybrid**: mic detects snap; spectral analysis distinguishes tap-
+  on-band vs index-on-desk by feedback ringing duration.
+
+Power profile: mic is in-session only (privacy + power); IMU spectral
+work already has infrastructure (the FFT pipeline we built).
+
+### F2. Mode-transition wire-up to existing power state machine
+
+Task 8 of the current plan logs `MODE ENTRY: ...` but does NOT
+actually transition the power state.  Reason: deliberately verify
+pose+gesture path empirically before touching the power-state-machine
+plumbing.
+
+After empirical verification, wire each LOG_INF MODE ENTRY through
+to the actual mode entry path.  See `t` (AIR_MOUSE simulation) and
+`y` (SURFACE simulation) serial commands in `src/main.cpp` for the
+existing wire-up pattern.
+
+### F3. NVS calibration storage + per-user calibration ritual
+
+Canonical pose values, tolerance cones, cadence window, surface-
+spectral threshold all stored in NVS keyed per-user.  Companion app
+walks the user through a calibration ritual that captures their
+natural pose centers and gesture intensity.
+
+See memory `project_productionization_gesture_calibration_2026_06_09`.
+
+### F4. PPG firmness check for SURFACE pose
+
+Briefly wake MAX30102 during pose-arm window to read DC contact
+level + AC amplitude.  Firm surface (desk) compresses skin against
+band → distinct PPG signature vs. lap (soft tissue) or free air.
+
+Reference: WF-PPG dataset (Nature Scientific Data 2025), force-
+sensing PPG patent US10874348.
+
+Deferred because: requires stable strap baseline (housing-dependent),
+adds power and complexity.  Strap variability would dominate the
+signal in current open-PCB + duct-tape mount.
+
+### F5. Altimetry / barometer + optical proximity sensor
+
+Hardware additions for SURFACE-vs-lap absolute disambiguation.  Both
+documented in memory `project_productionization_altimetry_evaluation`.
+
+### F6. In-session snap-vs-tap discrimination
+
+Same mechanism as F1 but used inside an active mode (e.g., inside
+AIR_MOUSE, distinguish click-gesture from scroll-gesture by snap-vs-
+tap).  May share infrastructure with F1.
+
+### F7. Re-tune all thresholds against housed-device data
+
+When production housing arrives, re-tune:
+
+- Canonical pose values (`gesture_poses.cpp` k_canonical_poses)
+- Tolerance cones (`tolerance_cos` per pose)
+- Cadence timing (`CADENCE_MIN_MS` / `CADENCE_MAX_MS`)
+- Spectral surface threshold (`SURFACE_RESONANCE_MID_BAND_THRESH`)
+- Activity gate threshold (`ACTIVITY_GATE_THRESH`)
+
+Per-user calibration (F3) addresses cross-user variance; this item
+addresses the single-user housing transition.
+
+### F8. Triple-tap as a deliberate-intent alternative
+
+If hardware testing shows accidental double-tap triggers, bumping to
+triple-tap is a one-constant change (count requirement + cadence
+detection across three events instead of two).  Document as a tuning
+parameter to try if double-tap proves insufficient.
 
 ---
 

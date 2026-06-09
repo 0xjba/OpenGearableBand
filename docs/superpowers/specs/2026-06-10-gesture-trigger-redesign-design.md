@@ -100,27 +100,42 @@ Three canonical poses recognised, each with a tolerance cone:
 | DICTATION-raise | volar facing user's mouth, forearm raised+rotated | ±30° | Dictation |
 | SURFACE-rest | volar facing up, wrist horizontal | ±20° (tighter to reduce lap FP) | SURFACE |
 
-Pose match requires both:
+Pose match requires:
 
-- Gravity vector within tolerance cone of the canonical pose, AND
-- A **motion-into-pose transition** detected within the last ~500 ms
-  (Apple-style: smooth motion towards pose + dwell still in pose)
+- Gravity vector within tolerance cone of the canonical pose.
 
-The motion-into-pose check is critical.  Simply being in a pose without
-having transitioned into it doesn't arm anything.  This prevents
-wrist-already-on-desk states from auto-arming, and matches the user's
-intent ("user assumes or is almost in the pose to assume").
+Pose alone arms the FSM and selects WHICH mode is being entered;
+the deliberate-intent signal is the GESTURE (Stage 2).  An earlier
+draft of this spec required a motion-into-pose transition, but
+that broke the natural case of "user already has wrist on desk
+and wants to enter SURFACE" -- they shouldn't have to lift-and-
+replace the wrist to earn the right to gesture.  Removed
+2026-06-10 evening after user feedback.
 
 ### Stage 2: armed gesture window
 
 Once a pose is matched, gesture detection is armed for 3 seconds.  The
-required gesture depends on the mode:
+required gesture for every mode is a **cadenced double-tap** (two
+impulse events 150-300 ms apart, Apple VoiceOver convention):
 
-| Mode | Required gesture | Why this gesture |
-|------|------------------|------------------|
-| AIR_MOUSE | single tap (or snap, indistinguishable) | Raise pose is rare in incidental activity; single tap acceptable. |
-| DICTATION | single tap (or snap, indistinguishable) | Raise+rotate pose is highly distinctive (band volar flips to face user); single tap acceptable. |
-| SURFACE | cadenced double-tap (150-300 ms inter-tap) **AND** tap-spectral surface check pass | Horizontal pose has lap/desk ambiguity; double-tap cadence rejects most incidental impacts; tap spectral signature confirms hard-surface (desk feedback ringing in mid-band). |
+| Mode | Required gesture | Why |
+|------|------------------|-----|
+| AIR_MOUSE | cadenced double-tap (150-300 ms inter-tap) | Single tap is too easy to produce accidentally even in pose (incidental bump while wrist is raised); cadence is the deliberate-intent signal. |
+| DICTATION | cadenced double-tap | Same reason as AIR_MOUSE — even though raise+rotate pose is distinctive, an incidental impact during the pose shouldn't fire mode entry. |
+| SURFACE | cadenced double-tap **AND** tap-spectral surface check pass | Horizontal pose has lap/desk ambiguity; double-tap cadence rejects most incidental impacts; tap spectral signature confirms hard-surface (desk feedback ringing in mid-band). |
+
+The cadence count is fixed at 2 for v0 (tunable via `MULTI_TAP_COUNT`
+in firmware if accidental triggers are observed during testing).
+Triple-tap as a stricter alternative is a one-constant change.
+
+**Gesture variant ambiguity**: at the firmware level we cannot
+currently distinguish between "tap on band" (other hand strikes the
+band), "tap with index finger on the desk" (vibration transmits
+through hand→wrist→IMU), and "finger snap" (same hand) -- all three
+produce indistinguishable chip-tap events.  Discriminating between
+these is documented as future work (see §11) and would require mic +
+IMU fusion (GestEar-class) or much higher IMU ODR for the impulse
+waveform.  For v0, all three are accepted as valid trigger impulses.
 
 If the armed window expires without a matching gesture, return to IDLE
 silently (no false trigger).
@@ -188,24 +203,24 @@ existing tap detector.
 
 ## 7. Components to build
 
-### 7.1 Gravity-vector + motion tracker
+### 7.1 Gravity-vector tracker
 
-A continuous background task that maintains:
-
-- Current gravity-LPF vector (already done in existing code as
-  `gravity_lpf_x/y/z`).
-- Recent motion history: short ring buffer of motion-residual samples,
-  ~500 ms worth.
-- "In motion-into-pose" flag: triggered when motion-residual was high
-  recently then dropped quickly to near zero AND the gravity vector is
-  close to a canonical pose.
+A continuous background task that maintains the current gravity-LPF
+vector (already done in existing code as `gx_filt/gy_filt/gz_filt`).
+Used directly by the pose classifier.
 
 ### 7.2 Pose state machine
 
 - States: `NONE`, `AIR_MOUSE_ARMED`, `DICTATION_ARMED`, `SURFACE_ARMED`.
-- Transitions: NONE → *_ARMED when motion-into-pose + canonical match.
-- *_ARMED → NONE after 3 seconds without matching gesture (timeout).
-- *_ARMED → mode entry when matching gesture arrives.
+- Transitions: NONE → *_ARMED when gravity matches a canonical pose
+  (with tolerance).
+- Refresh: while armed, every sample that re-confirms the same pose
+  refreshes the arm timestamp — user stays armed as long as they hold
+  the pose.
+- *_ARMED → NONE after 3 seconds of NOT matching the armed pose
+  (lazy timeout on next query).
+- *_ARMED → mode entry when matching gesture arrives within the
+  armed window.
 
 ### 7.3 Cadenced double-tap detector (for SURFACE)
 
@@ -247,37 +262,71 @@ else is untouched.
 ### Productionization improvements
 
 These all strengthen the trigger.  Implement in any order based on
-hardware availability:
+hardware availability and scope.  All are deferred beyond the v0
+plan's 10 tasks; each gets its own brainstorm + design spec when
+picked up.
 
-1. **PPG firmness check** (housed + properly strapped device).  Briefly
-   wake MAX30102 during pose-arm window to read DC contact level.
-   Confirmed by literature (`WF-PPG dataset 2025`, force-sensing patent
-   US10874348).  Requires stable strap baseline.
-2. **Altimetry / barometer** for absolute height (desk vs lap).
-   Documented as `project_productionization_altimetry_evaluation`.
-3. **Optical proximity sensor** for direct surface contact detection.
-   Documented same place.
-4. **Per-user calibration ritual** via companion app.  Documented in
+1. **Gesture-variant discrimination (tap-on-band vs index-tap-on-desk
+   vs finger-snap)**.  At firmware level today, all three produce
+   indistinguishable chip-tap events.  Discriminating between them
+   unlocks richer in-mode gesture vocabulary (e.g. snap = click vs
+   tap = scroll within AIR_MOUSE).  Approach: GestEar-class mic + IMU
+   fusion in-session, or higher IMU ODR for impulse-waveform
+   spectral analysis.  **Tier 1 productionization item; user
+   explicitly requested this be documented as future work
+   2026-06-10.**
+
+2. **Mode-transition wire-up to power state machine**.  Task 8 of the
+   current plan logs mode entry but does NOT actually transition the
+   power state.  Reason: deliberately verify pose+gesture path
+   empirically before touching the power-state-machine plumbing.
+   Once empirically verified, wire `MODE ENTRY: AIR_MOUSE` through to
+   the existing AIR_MOUSE entry path (see `t`/`y` serial-command
+   simulation paths for the wire-up pattern).
+
+3. **NVS calibration storage + per-user calibration ritual** via
+   companion app.  Stores tolerance cones and canonical pose centers
+   per-user.  Documented in
    `project_productionization_gesture_calibration_2026_06_09`.
-5. **Re-tune all thresholds** against housed-device data once
-   production hardware revision ships.
-6. **In-session snap-vs-tap discrimination** via mic + IMU fusion
-   (GestEar-class) for richer in-mode gestures.  Architecture roadmap
-   Item 7+ timeframe.
+
+4. **PPG firmness check** (housed + properly strapped device).
+   Briefly wake MAX30102 during pose-arm window to read DC contact
+   level.  Confirmed viable by literature (`WF-PPG dataset 2025`,
+   force-sensing patent US10874348) but heavily strap-dependent --
+   needs stable wear baseline.  Strengthens SURFACE-vs-lap.
+
+5. **Altimetry / barometer** for absolute height disambiguation.
+   Documented as `project_productionization_altimetry_evaluation`.
+   Best signal for SURFACE-vs-lap.
+
+6. **Optical proximity sensor** for direct surface contact detection.
+   Documented with altimetry.
+
+7. **Re-tune all thresholds** against housed-device data once
+   production hardware revision ships.  Includes canonical pose
+   centers (currently hand-tuned for open PCB), spectral surface
+   threshold (`SURFACE_RESONANCE_MID_BAND_THRESH`), cadence timing
+   window, and pose tolerance cones.
+
+8. **In-session snap-vs-tap via mic + IMU fusion** (GestEar-class).
+   Same mechanism as Item 1 but used for in-mode actions (e.g. inside
+   AIR_MOUSE, snap = click vs tap = right-click).  May share
+   infrastructure with Item 1.
 
 ## 10. Open implementation questions (for the plan stage)
 
 These don't change the design but need empirical work:
 
-- **Motion-into-pose threshold values**: how high must motion-residual
-  be before it counts as "user is moving into pose"?
-- **Dwell duration**: 300 ms? 500 ms? Tuning empirically.
 - **Pose tolerance cone angles**: ±30° / ±20° are guesses; verify with
   hardware.
+- **Canonical pose values**: AIR_MOUSE (0, -1, 0), DICTATION (0.5,
+  -0.866, 0), SURFACE (0, 0, 1) are physics-derived; verify against
+  actual band-frame gravity readings.
 - **Cadenced double-tap timing window**: 150-300 ms inter-tap is from
-  Apple VoiceOver convention; may need tuning for this user.
+  Apple VoiceOver convention; may need tuning for this user.  Triple-
+  tap is a one-constant alternative if double has accidental triggers.
 - **Surface-resonance spectral threshold**: needs desk-tap + lap-tap
-  data collection.
+  data collection on housed hardware.
 
 ## 11. Risks
 
