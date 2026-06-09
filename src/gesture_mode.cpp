@@ -326,6 +326,31 @@ static int64_t last_chip_tap_time_ms = 0;
  * value so the gate is open at boot. */
 static int     samples_since_activity = ACTIVITY_GATE_DWELL;
 
+/* Motion-into-pose detection.  We track the last ~500 ms of motion-
+ * residual samples to detect a "moved into pose" event: residual was
+ * elevated, then dropped to near-zero, AND the current gravity vector
+ * matches a canonical pose.
+ *
+ * 50 samples at 100 Hz = 500 ms ring buffer.  Each entry is the
+ * motion-residual magnitude (already computed in update_accel). */
+#define MOTION_HISTORY_SAMPLES   50
+static float    motion_history_buf[MOTION_HISTORY_SAMPLES];
+static int      motion_history_idx = 0;
+
+/* Threshold above which a sample counts as "user moving into pose"
+ * activity.  Tuned conservatively: well above sensor noise floor,
+ * below sustained gait/typing motion. */
+#define MOTION_INTO_POSE_ACTIVITY_THRESH   1.5f   /* m/s^2 */
+
+/* Minimum activity samples to count as "user was just moving". */
+#define MOTION_INTO_POSE_MIN_ACTIVE        5
+
+/* Maximum residual to count as "now still in pose". */
+#define MOTION_INTO_POSE_STILL_THRESH      0.4f   /* m/s^2 */
+
+/* Number of recent samples that must be still to count as "settled". */
+#define MOTION_INTO_POSE_STILL_DWELL       30     /* 300 ms at 100 Hz */
+
 /* Cooldown after a cursor mode exits via orientation-drop.  During
  * the cooldown window, the user can return to the same mode by
  * holding the expected pose for COOLDOWN_REENGAGE_DWELL samples --
@@ -420,6 +445,42 @@ static float flick_burst_sign = 0.0f;
 /*
  * --- Internal helpers --------------------------------------------------
  */
+
+/* Returns true if the recent motion history shows a "moved into
+ * pose" pattern: at least MOTION_INTO_POSE_MIN_ACTIVE older samples
+ * had activity, AND the most recent MOTION_INTO_POSE_STILL_DWELL
+ * samples are all still.
+ *
+ * This is the "user just moved and then settled" signal. */
+static bool motion_into_pose_detected(void)
+{
+    int active_count = 0;
+    int recent_still_count = 0;
+
+    /* Walk the ring buffer from oldest to newest.  Index just before
+     * motion_history_idx is the newest sample. */
+    for (int i = 0; i < MOTION_HISTORY_SAMPLES; i++) {
+        int real_idx = (motion_history_idx + i) % MOTION_HISTORY_SAMPLES;
+        float r = motion_history_buf[real_idx];
+        int samples_from_newest =
+            MOTION_HISTORY_SAMPLES - 1 - i;  /* 0 = newest */
+
+        if (samples_from_newest < MOTION_INTO_POSE_STILL_DWELL) {
+            /* Tail of buffer = recent samples; require these still. */
+            if (r < MOTION_INTO_POSE_STILL_THRESH) {
+                recent_still_count++;
+            }
+        } else {
+            /* Older part of buffer = where activity should have been. */
+            if (r >= MOTION_INTO_POSE_ACTIVITY_THRESH) {
+                active_count++;
+            }
+        }
+    }
+
+    return (active_count >= MOTION_INTO_POSE_MIN_ACTIVE) &&
+           (recent_still_count >= MOTION_INTO_POSE_STILL_DWELL);
+}
 
 static const char *_mode_str(GestureMode m)
 {
@@ -689,6 +750,10 @@ void gesture_mode_init(void)
     multi_tap_first_sign = '?';
     last_chip_tap_time_ms = 0;
     samples_since_activity = ACTIVITY_GATE_DWELL;
+    for (int i = 0; i < MOTION_HISTORY_SAMPLES; i++) {
+        motion_history_buf[i] = 0.0f;
+    }
+    motion_history_idx = 0;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -771,6 +836,10 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         } else if (samples_since_activity < ACTIVITY_GATE_DWELL) {
             samples_since_activity++;
         }
+        /* Push into motion history ring buffer for motion-into-pose
+         * detection. */
+        motion_history_buf[motion_history_idx] = r_mag;
+        motion_history_idx = (motion_history_idx + 1) % MOTION_HISTORY_SAMPLES;
     }
 
     /* Multi-tap commit-on-timeout MOVED to a k_work_delayable
