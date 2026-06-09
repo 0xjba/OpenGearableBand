@@ -338,31 +338,6 @@ static int64_t last_chip_tap_time_ms = 0;
  * value so the gate is open at boot. */
 static int     samples_since_activity = ACTIVITY_GATE_DWELL;
 
-/* Motion-into-pose detection.  We track the last ~500 ms of motion-
- * residual samples to detect a "moved into pose" event: residual was
- * elevated, then dropped to near-zero, AND the current gravity vector
- * matches a canonical pose.
- *
- * 50 samples at 100 Hz = 500 ms ring buffer.  Each entry is the
- * motion-residual magnitude (already computed in update_accel). */
-#define MOTION_HISTORY_SAMPLES   50
-static float    motion_history_buf[MOTION_HISTORY_SAMPLES];
-static int      motion_history_idx = 0;
-
-/* Threshold above which a sample counts as "user moving into pose"
- * activity.  Tuned conservatively: well above sensor noise floor,
- * below sustained gait/typing motion. */
-#define MOTION_INTO_POSE_ACTIVITY_THRESH   1.5f   /* m/s^2 */
-
-/* Minimum activity samples to count as "user was just moving". */
-#define MOTION_INTO_POSE_MIN_ACTIVE        5
-
-/* Maximum residual to count as "now still in pose". */
-#define MOTION_INTO_POSE_STILL_THRESH      0.4f   /* m/s^2 */
-
-/* Number of recent samples that must be still to count as "settled". */
-#define MOTION_INTO_POSE_STILL_DWELL       30     /* 300 ms at 100 Hz */
-
 /* Cooldown after a cursor mode exits via orientation-drop.  During
  * the cooldown window, the user can return to the same mode by
  * holding the expected pose for COOLDOWN_REENGAGE_DWELL samples --
@@ -458,42 +433,6 @@ static float flick_burst_sign = 0.0f;
  * --- Internal helpers --------------------------------------------------
  */
 
-/* Returns true if the recent motion history shows a "moved into
- * pose" pattern: at least MOTION_INTO_POSE_MIN_ACTIVE older samples
- * had activity, AND the most recent MOTION_INTO_POSE_STILL_DWELL
- * samples are all still.
- *
- * This is the "user just moved and then settled" signal. */
-static bool motion_into_pose_detected(void)
-{
-    int active_count = 0;
-    int recent_still_count = 0;
-
-    /* Walk the ring buffer from oldest to newest.  Index just before
-     * motion_history_idx is the newest sample. */
-    for (int i = 0; i < MOTION_HISTORY_SAMPLES; i++) {
-        int real_idx = (motion_history_idx + i) % MOTION_HISTORY_SAMPLES;
-        float r = motion_history_buf[real_idx];
-        int samples_from_newest =
-            MOTION_HISTORY_SAMPLES - 1 - i;  /* 0 = newest */
-
-        if (samples_from_newest < MOTION_INTO_POSE_STILL_DWELL) {
-            /* Tail of buffer = recent samples; require these still. */
-            if (r < MOTION_INTO_POSE_STILL_THRESH) {
-                recent_still_count++;
-            }
-        } else {
-            /* Older part of buffer = where activity should have been. */
-            if (r >= MOTION_INTO_POSE_ACTIVITY_THRESH) {
-                active_count++;
-            }
-        }
-    }
-
-    return (active_count >= MOTION_INTO_POSE_MIN_ACTIVE) &&
-           (recent_still_count >= MOTION_INTO_POSE_STILL_DWELL);
-}
-
 /* Internal: check pose-arm timeout and disarm if expired.  Shared
  * by gesture_mode_armed_pose() (the public query) and
  * pose_fsm_update() (the per-sample updater).  Logs the expiry
@@ -517,11 +456,19 @@ pose_id_t gesture_mode_armed_pose(void)
 }
 
 /* Update pose FSM based on current gravity vector.  Called every
- * accel sample from gesture_mode_update_accel().  Transitions:
- *   - NONE -> *_ARMED when motion-into-pose detected AND gravity
- *     matches a canonical pose
- *   - *_ARMED -> NONE handled lazily via pose_check_timeout() on
- *     every sample, or via explicit gesture acceptance (next task) */
+ * accel sample from gesture_mode_update_accel().
+ *
+ * Pose arming is purely "currently matching a canonical pose":
+ *   - If currently armed AND still matching the same pose: refresh
+ *     the arm timestamp so the window stays open as long as the
+ *     user holds the pose.
+ *   - If not armed AND a canonical pose matches: arm.
+ *
+ * The deliberate-intent filter is the gesture (single tap or
+ * cadenced double-tap) added in later tasks -- the pose alone just
+ * selects which mode is being entered.  Requiring motion-into-pose
+ * was over-engineering: it broke the natural case of "user already
+ * has wrist on desk and wants to enter SURFACE." */
 static void pose_fsm_update(float gx, float gy, float gz)
 {
     /* Flush expired arm first. */
@@ -534,8 +481,7 @@ static void pose_fsm_update(float gx, float gy, float gz)
 
     if (pose_armed_state != POSE_NONE) {
         /* Already armed.  If the user is still in the SAME pose,
-         * refresh the arm timestamp so they stay armed as long as
-         * they hold the position.  Otherwise leave the existing
+         * refresh the arm timestamp.  Otherwise leave the existing
          * arm alone (don't break user intent on a transient
          * mis-classification or wrist wobble). */
         if (best == pose_armed_state) {
@@ -544,11 +490,7 @@ static void pose_fsm_update(float gx, float gy, float gz)
         return;
     }
 
-    /* Not armed.  Require motion-into-pose AND a canonical pose
-     * match to start arming. */
-    if (!motion_into_pose_detected()) {
-        return;
-    }
+    /* Not armed.  Pose match is sufficient to arm. */
     if (best == POSE_NONE) {
         return;
     }
@@ -830,10 +772,6 @@ void gesture_mode_init(void)
     multi_tap_first_sign = '?';
     last_chip_tap_time_ms = 0;
     samples_since_activity = ACTIVITY_GATE_DWELL;
-    for (int i = 0; i < MOTION_HISTORY_SAMPLES; i++) {
-        motion_history_buf[i] = 0.0f;
-    }
-    motion_history_idx = 0;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -916,15 +854,9 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         } else if (samples_since_activity < ACTIVITY_GATE_DWELL) {
             samples_since_activity++;
         }
-        /* Push into motion history ring buffer for motion-into-pose
-         * detection. */
-        motion_history_buf[motion_history_idx] = r_mag;
-        motion_history_idx = (motion_history_idx + 1) % MOTION_HISTORY_SAMPLES;
     }
 
-    /* Update pose state machine.  Uses gravity_lpf for the canonical-
-     * pose comparison and the motion-history ring buffer for the
-     * motion-into-pose check. */
+    /* Update pose state machine.  Arms on canonical pose match alone. */
     pose_fsm_update(gx_filt, gy_filt, gz_filt);
 
     /* Multi-tap commit-on-timeout MOVED to a k_work_delayable
