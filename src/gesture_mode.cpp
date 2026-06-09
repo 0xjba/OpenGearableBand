@@ -494,19 +494,25 @@ static bool motion_into_pose_detected(void)
            (recent_still_count >= MOTION_INTO_POSE_STILL_DWELL);
 }
 
+/* Internal: check pose-arm timeout and disarm if expired.  Shared
+ * by gesture_mode_armed_pose() (the public query) and
+ * pose_fsm_update() (the per-sample updater).  Logs the expiry
+ * event so the cause of a silent drop is visible. */
+static void pose_check_timeout(void)
+{
+    if (pose_armed_state == POSE_NONE) return;
+    int64_t now = k_uptime_get();
+    int64_t elapsed = now - pose_armed_time_ms;
+    if (elapsed > POSE_ARM_WINDOW_MS) {
+        LOG_INF("Pose arm expired (%s, %lld ms elapsed) -> NONE",
+                pose_name(pose_armed_state), (long long)elapsed);
+        pose_armed_state = POSE_NONE;
+    }
+}
+
 pose_id_t gesture_mode_armed_pose(void)
 {
-    if (pose_armed_state == POSE_NONE) return POSE_NONE;
-
-    /* Auto-disarm if window expired. */
-    int64_t now = k_uptime_get();
-    if ((now - pose_armed_time_ms) > POSE_ARM_WINDOW_MS) {
-        LOG_INF("Pose arm expired (%s, %d ms elapsed) -> NONE",
-                pose_name(pose_armed_state),
-                (int)(now - pose_armed_time_ms));
-        pose_armed_state = POSE_NONE;
-        return POSE_NONE;
-    }
+    pose_check_timeout();
     return pose_armed_state;
 }
 
@@ -514,31 +520,37 @@ pose_id_t gesture_mode_armed_pose(void)
  * accel sample from gesture_mode_update_accel().  Transitions:
  *   - NONE -> *_ARMED when motion-into-pose detected AND gravity
  *     matches a canonical pose
- *   - *_ARMED -> NONE handled lazily in gesture_mode_armed_pose()
- *     via timeout, or via explicit gesture acceptance (next task) */
+ *   - *_ARMED -> NONE handled lazily via pose_check_timeout() on
+ *     every sample, or via explicit gesture acceptance (next task) */
 static void pose_fsm_update(float gx, float gy, float gz)
 {
-    /* Lazy timeout: re-query to flush expired arm. */
-    (void)gesture_mode_armed_pose();
+    /* Flush expired arm first. */
+    pose_check_timeout();
 
-    if (pose_armed_state != POSE_NONE) {
-        /* Already armed; nothing to do here. */
-        return;
-    }
-
-    /* Check both conditions: motion-into-pose recently AND in a
-     * canonical pose now.  motion_into_pose_detected() looks at the
-     * ring buffer; pose_classify_best() looks at the current gravity
-     * vector. */
-    if (!motion_into_pose_detected()) {
-        return;  /* not moving into anything */
-    }
-
+    /* Classify current gravity. */
     float score = 0.0f;
     pose_id_t best = pose_classify_best(gx, gy, gz,
                                           POSE_MATCH_THRESH, &score);
+
+    if (pose_armed_state != POSE_NONE) {
+        /* Already armed.  If the user is still in the SAME pose,
+         * refresh the arm timestamp so they stay armed as long as
+         * they hold the position.  Otherwise leave the existing
+         * arm alone (don't break user intent on a transient
+         * mis-classification or wrist wobble). */
+        if (best == pose_armed_state) {
+            pose_armed_time_ms = k_uptime_get();
+        }
+        return;
+    }
+
+    /* Not armed.  Require motion-into-pose AND a canonical pose
+     * match to start arming. */
+    if (!motion_into_pose_detected()) {
+        return;
+    }
     if (best == POSE_NONE) {
-        return;  /* not in a canonical pose */
+        return;
     }
 
     pose_armed_state = best;
