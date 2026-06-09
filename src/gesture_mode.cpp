@@ -455,6 +455,14 @@ static bool  cursor_reference_valid = false;
 /* Acquisition-request callback registered by main.cpp. */
 static gesture_acq_request_cb_t s_acq_request_cb = NULL;
 
+/* Most recent tap's mid_band_energy, updated by bio_acoustic_worker
+ * after each FFT.  Read by surface_spectral_confirms_hard_surface()
+ * to gate SURFACE mode entry.  Declared here (before
+ * gesture_mode_init) so the init reset compiles without a forward
+ * reference; the companion constant and predicate live further down
+ * near the bio-acoustic section. */
+static float last_tap_mid_band_energy = 0.0f;
+
 /* Was the previous mode a "needs IMU continuously" mode?  Tracks the
  * acq-request edges so we only call the callback on transitions. */
 static bool s_prev_needs_acq = false;
@@ -827,6 +835,7 @@ void gesture_mode_init(void)
     samples_since_activity = ACTIVITY_GATE_DWELL;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
+    last_tap_mid_band_energy = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
 }
 
@@ -1612,6 +1621,33 @@ static void _compute_band_energies(const uint8_t *buf,
 #define MIN_PEAK_SUM             20000  /* |x|+|y|+|z| at peak;
                                             below this is too weak
                                             to be a real tap/snap */
+
+/* Surface-spectral confirmation -- v0 proxy.
+ *
+ * Literature-backed discriminator (PMC 2016, surface-stiffness
+ * acceleration analysis): hard surfaces produce LONGER-DURATION
+ * ringing -- more oscillation cycles before energy decays.  Soft
+ * surfaces damp quickly.  The proper feature is post-event
+ * ring-down duration.
+ *
+ * Our current FFT pipeline doesn't directly measure ring-down
+ * duration -- the 512-sample capture is mostly PRE-impact, with
+ * the impact at the end.  Instead we use mid_band_energy as a
+ * proxy: hard surfaces couple some of their ringing into the
+ * mid frequencies that ARE in our window (via reflected feedback
+ * during the tap itself), giving elevated mid_band.  Soft
+ * surfaces don't.
+ *
+ * This is imperfect; future work (F9, see plan) is to capture a
+ * post-event window for direct ring-down measurement.
+ *
+ * Empirical threshold from desk-tap-vs-lap-tap data collection (to
+ * be tuned during integration test).  Conservative initial value.
+ *
+ * IMPORTANT: this signal is housing-dependent.  Current value tuned
+ * for open PCB; will need recalibration when housing arrives. */
+#define SURFACE_RESONANCE_MID_BAND_THRESH   5e7f
+
 static char _classify(const struct tap_features *f)
 {
     uint32_t total_abs = (uint32_t)f->peak_x_abs +
@@ -1629,6 +1665,15 @@ static char _classify(const struct tap_features *f)
         return 'B';  /* band-tap */
     }
     return '?';  /* boundary zone */
+}
+
+/* Returns true if the most recently captured tap shows desk-feedback
+ * spectral content (mid_band above threshold).  Used to confirm
+ * SURFACE entry: hard surface (desk) gives elevated mid_band from
+ * resonance feedback; soft surface (lap) damps it. */
+static bool surface_spectral_confirms_hard_surface(void)
+{
+    return last_tap_mid_band_energy >= SURFACE_RESONANCE_MID_BAND_THRESH;
 }
 
 /* Worker thread entry.  Blocks on tap_capture_sem, processes one
@@ -1680,6 +1725,8 @@ static void bio_acoustic_worker(void *, void *, void *)
                 (double)f.mid_band_energy,
                 (double)f.low_band_ratio,
                 (unsigned)f.peak_sample_idx, (unsigned)n);
+
+        last_tap_mid_band_energy = f.mid_band_energy;
 
         atomic_set(&tap_capture_busy, 0);
     }
