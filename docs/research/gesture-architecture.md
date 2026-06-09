@@ -307,18 +307,50 @@ after Stage D ship):**
   gestures to work first.  Surface-tap, finger-flick, palm-tap
   come after.
 
+**Update 2026-06-10 (post-empirical correction)**: my initial
+classifier used `pre_event_energy` (sum-of-deltas in a window
+preceding the impulse) as primary feature.  Empirical hardware
+testing on 2026-06-09/10 revealed this feature is unreliable in
+real-world use because every user moves their wrist into position
+before tapping -- the "stationary wrist before impact" assumption
+was wrong.  Pre_event_energy is being deprecated as the primary
+feature.  Switching to **spectral features at higher ODR** (the
+ViBand approach), implementing as Path A in the bio-acoustic
+classifier.  See `decision_ppg_fusion_session_only_2026_06_10`
+memory for the architectural reasoning that ruled out PPG fusion
+at trigger time (power constraint -- MAX30102 cannot be always-on
+during the always-listening trigger phase).
+
+**Power-vs-discrimination architectural split (2026-06-10)**:
+
+| Phase | Sensors active | Use for gesture discrimination |
+|---|---|---|
+| **Trigger detection** (always listening for mode entry) | IMU only (LSM6DSL); MAX30102 in shutdown | IMU spectral features (Path A).  Realistic v0 accuracy ceiling ~75-80% per multimodal-IMU literature with simple DSP features. |
+| **Active session** (inside AIR_MOUSE / SURFACE / dictation) | IMU + MAX30102 + PDM as needed | PPG fusion (Apple Watch-class) available for in-session gestures (pinch click, surface re-engage, etc.).  Different gesture vocabulary than trigger phase. |
+
+The two phases have different power profiles; the gesture
+vocabulary and feature extraction differ accordingly.  PPG-fused
+pinch (architecture-doc roadmap Item 7) is exclusively an
+in-session gesture, not a trigger gesture.
+
 **Discrimination question**: the chip's binary engine cannot
 distinguish band-tap (with other hand) from finger snap (same hand)
 -- both fire DOUBLE_TAP for the same hardware reason.  With raw
 samples at high ODR, the discriminating features are:
 
-- Dominant axis: tap is perpendicular to band face; snap propagates
-  through forearm with broader axis distribution
-- Rise time / jerk profile: direct mechanical impact vs bone-conducted
 - Spectral content: tap excites PCB / case resonance (1-3 kHz);
-  snap is body-low-passed
-- Pre-event acceleration: snap involves anticipatory hand motion;
-  tap does not
+  snap is body-low-passed (20-300 Hz dominant).  **Best feature
+  for v0.**
+- Rise time / jerk profile: direct mechanical impact vs
+  bone-conducted; secondary feature requiring high temporal
+  resolution
+- Dominant axis: tap location-dependent (user might tap rim or
+  face); snap propagates through bones to Z-perpendicular.  Useful
+  but pose-dependent.
+- Pre-event acceleration: **NOT reliable in real-world use** --
+  every user moves their wrist into position before tapping, so
+  this feature carries user-positioning motion not just gesture
+  intent.
 
 Sources: [Patent US 8442797 (directional tap detection)](https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/8442797),
 [Enabling Hand Gesture Customization on Wrist-Worn Devices (CHI 2022)](https://dl.acm.org/doi/fullHtml/10.1145/3491102.3501904),
