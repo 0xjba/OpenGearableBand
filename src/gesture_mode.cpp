@@ -1227,10 +1227,22 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
 {
     /* Stage C (2026-06-08): firmware multi-tap counter.  Each
      * SINGLE_TAP arrival from the chip is gated by ringing-
-     * rejection refractory, then activity gate, then folded into
-     * a running count.  The k_work_delayable commit handler
-     * commits the accumulated count to a 1/2/3-tap action
-     * MULTI_TAP_WINDOW_MS after the last arrival. */
+     * rejection refractory, then the POSE gate, then folded into a
+     * running count.  The k_work_delayable commit handler commits
+     * the accumulated count to a mode-entry decision
+     * MULTI_TAP_WINDOW_MS after the last arrival.
+     *
+     * NOTE (2026-06-10): the old motion "activity gate" was REMOVED
+     * from this path.  It rejected taps when accel motion-residual
+     * was high recently -- but a tap's own impulse IS a large accel
+     * transient, so the gate rejected the very taps it was meant to
+     * pass (hardware test: every cadenced double-tap got "GATED by
+     * recent motion (0 ms ago)").  The pose gate below + the cadence
+     * requirement in the commit handler are strictly stronger
+     * deliberate-intent filters, so the activity gate is now
+     * redundant (taps without a pose are rejected by the pose gate
+     * anyway) and was actively blocking legitimate triggers.  See
+     * the pose-gated trigger redesign spec. */
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
     int64_t now = k_uptime_get();
@@ -1252,19 +1264,6 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
      * gap between the two most-recent events. */
     prev_chip_tap_time_ms = last_chip_tap_time_ms;
     last_chip_tap_time_ms = now;
-
-    /* Activity gate: reject the event if motion residual was high
-     * recently.  Kills gait + typing false-positives that the chip's
-     * SHOCK+QUIET windows alone won't filter (those are debounce
-     * within a tap, not "is this a tap or background motion"). */
-    if (samples_since_activity < ACTIVITY_GATE_DWELL) {
-        LOG_INF("Chip single-tap GATED by recent motion "
-                "(%d ms ago, axis=%c sign=%c mode=%s)",
-                samples_since_activity * 10,
-                peak_axis, tap_sign,
-                _mode_str(current_mode));
-        return;
-    }
 
     /* Pose gate: chip-tap is only a mode-entry candidate if we're
      * currently in a pose-armed state.  Without an armed pose, the
