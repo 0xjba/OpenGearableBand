@@ -922,6 +922,11 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         motion_history_idx = (motion_history_idx + 1) % MOTION_HISTORY_SAMPLES;
     }
 
+    /* Update pose state machine.  Uses gravity_lpf for the canonical-
+     * pose comparison and the motion-history ring buffer for the
+     * motion-into-pose check. */
+    pose_fsm_update(gx_filt, gy_filt, gz_filt);
+
     /* Multi-tap commit-on-timeout MOVED to a k_work_delayable
      * scheduled from gesture_mode_on_chip_single_tap().  Reason:
      * gesture_mode_update_accel runs from the acq pipeline, which
