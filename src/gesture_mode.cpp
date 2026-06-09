@@ -1465,6 +1465,24 @@ int gesture_mode_get_cursor_cooldown_remaining(void)
 void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb)
 {
     s_acq_request_cb = cb;
+
+    /* Kick the acq-request evaluation NOW that the callback is wired.
+     *
+     * Root cause of the 2026-06-10 "pose only arms during SNAPSHOT"
+     * bug: _update_acq_request() is otherwise only called from
+     * _transition_to() (mode changes) and the cooldown-expiry edge.
+     * In the IDLE steady state neither fires, so gesture_needs_acq
+     * stayed false, acq stopped after each SNAPSHOT, and
+     * gesture_mode_update_accel() never ran in IDLE -- freezing the
+     * gravity LPF and the pose FSM.
+     *
+     * Under the always-on policy (_update_acq_request now always
+     * returns needs=true), this one call at boot sets
+     * gesture_needs_acq=true and starts acquisition.  From then on
+     * stop_acquisition() defers indefinitely (gesture_needs_acq
+     * stays true), so acq runs continuously and the pose FSM gets
+     * accel samples in every power state. */
+    _update_acq_request();
 }
 
 /*
