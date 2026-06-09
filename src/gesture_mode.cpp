@@ -1,4 +1,5 @@
 #include "gesture_mode.h"
+#include "gesture_poses.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -284,6 +285,17 @@ static float surface_motion_peak = 0.0f;
 static int   surface_motion_log_counter = 0;
 #define      SURFACE_MOTION_LOG_PERIOD   200    /* 2 s at 100 Hz */
 
+/* Pose FSM state.  Updated each accel sample from update_accel. */
+static pose_id_t pose_armed_state = POSE_NONE;
+static int64_t   pose_armed_time_ms = 0;
+
+/* Pose-arm window: gesture must arrive within this many milliseconds
+ * of pose-arm to count as a trigger. */
+#define POSE_ARM_WINDOW_MS   3000
+
+/* Minimum pose-match score to consider the user in a pose. */
+#define POSE_MATCH_THRESH    0.5f
+
 /* Multi-tap counter state.  See MULTI_TAP_WINDOW_MS comment block. */
 static int     multi_tap_count = 0;
 static int64_t multi_tap_last_time_ms = 0;
@@ -480,6 +492,60 @@ static bool motion_into_pose_detected(void)
 
     return (active_count >= MOTION_INTO_POSE_MIN_ACTIVE) &&
            (recent_still_count >= MOTION_INTO_POSE_STILL_DWELL);
+}
+
+pose_id_t gesture_mode_armed_pose(void)
+{
+    if (pose_armed_state == POSE_NONE) return POSE_NONE;
+
+    /* Auto-disarm if window expired. */
+    int64_t now = k_uptime_get();
+    if ((now - pose_armed_time_ms) > POSE_ARM_WINDOW_MS) {
+        LOG_INF("Pose arm expired (%s, %d ms elapsed) -> NONE",
+                pose_name(pose_armed_state),
+                (int)(now - pose_armed_time_ms));
+        pose_armed_state = POSE_NONE;
+        return POSE_NONE;
+    }
+    return pose_armed_state;
+}
+
+/* Update pose FSM based on current gravity vector.  Called every
+ * accel sample from gesture_mode_update_accel().  Transitions:
+ *   - NONE -> *_ARMED when motion-into-pose detected AND gravity
+ *     matches a canonical pose
+ *   - *_ARMED -> NONE handled lazily in gesture_mode_armed_pose()
+ *     via timeout, or via explicit gesture acceptance (next task) */
+static void pose_fsm_update(float gx, float gy, float gz)
+{
+    /* Lazy timeout: re-query to flush expired arm. */
+    (void)gesture_mode_armed_pose();
+
+    if (pose_armed_state != POSE_NONE) {
+        /* Already armed; nothing to do here. */
+        return;
+    }
+
+    /* Check both conditions: motion-into-pose recently AND in a
+     * canonical pose now.  motion_into_pose_detected() looks at the
+     * ring buffer; pose_classify_best() looks at the current gravity
+     * vector. */
+    if (!motion_into_pose_detected()) {
+        return;  /* not moving into anything */
+    }
+
+    float score = 0.0f;
+    pose_id_t best = pose_classify_best(gx, gy, gz,
+                                          POSE_MATCH_THRESH, &score);
+    if (best == POSE_NONE) {
+        return;  /* not in a canonical pose */
+    }
+
+    pose_armed_state = best;
+    pose_armed_time_ms = k_uptime_get();
+    LOG_INF("Pose ARMED: %s (score=%.2f, gravity=(%.2f, %.2f, %.2f))",
+            pose_name(best), (double)score,
+            (double)gx, (double)gy, (double)gz);
 }
 
 static const char *_mode_str(GestureMode m)
@@ -744,6 +810,8 @@ void gesture_mode_init(void)
     surface_motion_burst_dwell = 0;
     surface_motion_peak = 0.0f;
     surface_motion_log_counter = 0;
+    pose_armed_state = POSE_NONE;
+    pose_armed_time_ms = 0;
     multi_tap_count = 0;
     multi_tap_last_time_ms = 0;
     multi_tap_first_axis = '?';

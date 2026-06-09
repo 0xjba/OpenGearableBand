@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "gesture_poses.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -172,6 +173,11 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign);
  * counter (stage C) when 3 single-taps land inside the window.
  */
 void gesture_mode_on_chip_triple_tap(void);
+
+/* Pose state machine query.  Returns the currently-armed pose, or
+ * POSE_NONE if no pose is armed.  Used by the chip-tap path to
+ * decide whether to accept a tap as a mode-entry trigger. */
+pose_id_t gesture_mode_armed_pose(void);
 
 /*
  * Read the current mode.  Thread-safe (uses atomic_t internally).
