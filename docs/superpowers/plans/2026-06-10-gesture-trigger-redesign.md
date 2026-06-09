@@ -637,12 +637,26 @@ Near the existing `MULTI_TAP_WINDOW_MS` constant in gesture_mode.cpp:
 
 ```c
 /* Cadenced double-tap: deliberate user-driven double-tap with inter-
- * tap interval in a specific window.  Two impacts within
- * MULTI_TAP_WINDOW_MS but with at least CADENCE_MIN_MS apart and at
- * most CADENCE_MAX_MS apart.  Apple VoiceOver convention is ~250 ms;
- * we accept ±100 ms around that. */
+ * tap interval in a specific window.  Values research-grounded
+ * 2026-06-10:
+ *
+ *   - Apple VoiceOver: default 250 ms, user-adjustable 200-500 ms
+ *     in 50 ms steps.
+ *   - Patent literature on natural double-tap behavior: normal
+ *     150-180 ms; fast (in a hurry) 80-90 ms; slow/deliberate
+ *     250-480 ms.
+ *
+ * CADENCE_MIN_MS = 150 matches the natural-double-tap floor;
+ * sub-150 ms intervals are statistically unusual and likely
+ * involuntary double-bumps, so rejecting them strengthens the
+ * deliberate-intent filter.
+ *
+ * CADENCE_MAX_MS = 500 matches Apple's slowest tunable setting and
+ * covers the 250-480 ms slow-deliberate range.  Earlier value of
+ * 300 ms was too restrictive -- would reject deliberate slow
+ * double-taps. */
 #define CADENCE_MIN_MS   150
-#define CADENCE_MAX_MS   300
+#define CADENCE_MAX_MS   500
 ```
 
 - [ ] **Step 2: Add `last_two_tap_interval_ms()` helper**
@@ -724,11 +738,24 @@ EOF
 In the section where `SNAP_LOW_RATIO_THRESH` and friends are defined:
 
 ```c
-/* Surface-spectral confirmation: when a tap occurs with the wrist
- * resting on a HARD surface (desk, glass table), the impact energy
- * reflects back through the surface → hand → wrist → IMU, producing
- * detectable mid-band content.  On a SOFT surface (lap, jeans), this
- * feedback is absorbed and mid-band stays low.
+/* Surface-spectral confirmation -- v0 proxy.
+ *
+ * Literature-backed discriminator (PMC 2016, surface-stiffness
+ * acceleration analysis): hard surfaces produce LONGER-DURATION
+ * ringing -- more oscillation cycles before energy decays.  Soft
+ * surfaces damp quickly.  The proper feature is post-event
+ * ring-down duration.
+ *
+ * Our current FFT pipeline doesn't directly measure ring-down
+ * duration -- the 512-sample capture is mostly PRE-impact, with
+ * the impact at the end.  Instead we use mid_band_energy as a
+ * proxy: hard surfaces couple some of their ringing into the
+ * mid frequencies that ARE in our window (via reflected feedback
+ * during the tap itself), giving elevated mid_band.  Soft
+ * surfaces don't.
+ *
+ * This is imperfect; future work (F9, see plan) is to capture a
+ * post-event window for direct ring-down measurement.
  *
  * Empirical threshold from desk-tap-vs-lap-tap data collection (to
  * be tuned during integration test).  Conservative initial value.
@@ -1381,6 +1408,24 @@ If hardware testing shows accidental double-tap triggers, bumping to
 triple-tap is a one-constant change (count requirement + cadence
 detection across three events instead of two).  Document as a tuning
 parameter to try if double-tap proves insufficient.
+
+### F9. Post-event ring-down for proper surface discrimination
+
+The Task 6 mid_band_energy threshold is a proxy for hard-vs-soft
+surface discrimination, not the optimal feature.  Per literature
+(surface-stiffness acceleration analysis), the cleaner discriminator
+is **post-event ring-down duration** -- count of oscillation cycles
+or sum-of-energy in a 50-100 ms window AFTER the impact peak.  Hard
+surfaces ring longer; soft surfaces damp quickly.
+
+Our current FFT pipeline captures 512 samples ending AT the impact,
+so the post-event window isn't in our analysis frame.  To implement
+properly: either capture a window AROUND the impact (250 ms before
++ 250 ms after) or wait ~100 ms post-impact and read a fresh
+post-event window.
+
+Deferred because: requires FIFO read timing model change.  v0 uses
+mid_band_energy as a defensible proxy; F9 is the proper fix.
 
 ---
 
