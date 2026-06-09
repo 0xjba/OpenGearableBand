@@ -14,26 +14,33 @@ static const canonical_pose_t k_canonical_poses[POSE_COUNT] = {
     /* POSE_NONE: never matches; placeholder. */
     { POSE_NONE,      0.0f,  0.0f,  0.0f,  2.0f, "NONE" },
 
+    /* Canonicals re-measured 2026-06-10 in the FINAL mount: RIGHT
+     * wrist, VOLAR, THUMB-SIDE (radial).  See hardware_wear_position
+     * memory.  Each value is the normalized mean of several held 'g'
+     * readings; gravity reads ~+9.8 m/s^2 on the dominant axis,
+     * normalized here to a unit vector (pose_score normalizes the
+     * OBSERVED vector but assumes the canonical is already unit). */
+
     /* POSE_AIR_MOUSE: forearm raised forward, band volar facing
-     * screen (away from user's face).  Gravity vector is along the
-     * band's NEGATIVE Y axis (pointing toward the floor through the
-     * band's edge).  Tolerance ±30°. */
-    { POSE_AIR_MOUSE, 0.0f, -1.0f,  0.0f,  0.866f, "AIR_MOUSE" },
+     * screen.  Gravity points along band +X (Y≈0).  Measured across
+     * 4 raised angles: X +0.92..+0.99, Y -0.02..+0.05, Z -0.13..+0.38;
+     * family spans ~16° from this centre, inside the ±30° cone. */
+    { POSE_AIR_MOUSE, 0.99f, 0.01f, 0.12f, 0.866f, "AIR_MOUSE" },
 
-    /* POSE_DICTATION: forearm raised + rotated, band volar facing
-     * user's mouth.  Compared to AIR_MOUSE this is a roll about the
-     * forearm axis -- band Y axis still points downward but band X
-     * has rotated; gravity now has a non-trivial X component.
-     * Approx (gx, gy, gz) = (+0.5, -0.85, 0).  Tolerance ±30°.
-     *
-     * Empirically verify and re-tune during hardware integration. */
-    { POSE_DICTATION, 0.5f, -0.866f, 0.0f, 0.866f, "DICTATION" },
+    /* POSE_DICTATION: forearm raised + rotated so band volar faces
+     * the mouth.  Same +X dominance as AIR_MOUSE but with a clear +Y
+     * roll (0.30..0.45).  NOTE: only ~23° from AIR_MOUSE, so the user
+     * must roll distinctly or a weak-roll dictation attempt falls
+     * back to AIR_MOUSE (correct/safe -- AIR_MOUSE is the live mode;
+     * DICTATION is log-only until the dictation feature lands).
+     * pose_classify_best picks the nearer canonical. */
+    { POSE_DICTATION, 0.92f, 0.39f, 0.03f, 0.866f, "DICTATION" },
 
-    /* POSE_SURFACE: wrist horizontal, band volar facing up (palm-
-     * down rest position).  Gravity is along band POSITIVE Z (the
-     * band is being "looked at from above").  Tolerance tighter
+    /* POSE_SURFACE: wrist horizontal on desk, band volar facing up.
+     * Gravity along band +Z with a slight +X lean (measured centre
+     * [0.18, 0.08, 0.98]; family spans ~11°).  Tolerance tighter
      * (±20°) to reduce lap false positives. */
-    { POSE_SURFACE,   0.0f,  0.0f,  1.0f,  0.940f, "SURFACE" },
+    { POSE_SURFACE,   0.18f, 0.08f, 0.98f, 0.940f, "SURFACE" },
 };
 
 float pose_score(const canonical_pose_t *p,
