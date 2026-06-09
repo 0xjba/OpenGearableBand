@@ -463,6 +463,18 @@ static gesture_acq_request_cb_t s_acq_request_cb = NULL;
  * near the bio-acoustic section. */
 static float last_tap_mid_band_energy = 0.0f;
 
+/* Threshold for hard-surface spectral confirmation.  Hard surfaces
+ * (desk) resonate into the mid band during the tap; soft surfaces
+ * (lap) damp it.  Constant hoisted here so multi_tap_commit_handler
+ * (defined earlier in the file) can reference it without a forward
+ * #define.  See the full comment near surface_spectral_confirms_hard_surface
+ * for calibration notes. */
+#define SURFACE_RESONANCE_MID_BAND_THRESH   5e7f
+
+/* Forward declaration -- implementation lives near the bio-acoustic
+ * section later in the file. */
+static bool surface_spectral_confirms_hard_surface(void);
+
 /* Was the previous mode a "needs IMU continuously" mode?  Tracks the
  * acq-request edges so we only call the callback on transitions. */
 static bool s_prev_needs_acq = false;
@@ -1283,36 +1295,89 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
  * already takes care of cancel-and-restart races. */
 static void multi_tap_commit_handler(struct k_work *work_arg)
 {
-    if (multi_tap_count == 0) {
-        return;
-    }
-    int n = multi_tap_count;
-    char first_axis = multi_tap_first_axis;
-    char first_sign = multi_tap_first_sign;
+    ARG_UNUSED(work_arg);
+
+    int count = multi_tap_count;
+    char axis = multi_tap_first_axis;
+    char sign = multi_tap_first_sign;
+
+    /* Snapshot armed pose at commit time. */
+    pose_id_t armed = gesture_mode_armed_pose();
+
+    /* Reset multi-tap counter regardless of outcome.  Pose disarm
+     * happens at the bottom of this function for cleanliness. */
     multi_tap_count = 0;
-    multi_tap_last_time_ms = 0;
     multi_tap_first_axis = '?';
     multi_tap_first_sign = '?';
 
-    if (n == 1) {
-        /* Lone single tap.  Currently no action -- the surface-tap
-         * re-engage path will hook here later once feature
-         * extraction (Stage E) can confirm the tap is a surface-tap
-         * (not a stray band-tap). */
-        LOG_INF("Multi-tap commit: 1 (lone single, axis=%c sign=%c "
-                "-- no action wired yet)",
-                first_axis, first_sign);
-    } else if (n == 2) {
-        LOG_INF("Multi-tap commit: 2 (axis=%c sign=%c -> AIR_MOUSE "
-                "entry via chip-double-tap path)",
-                first_axis, first_sign);
-        gesture_mode_on_chip_double_tap();
-    } else { /* 3 or more */
-        LOG_INF("Multi-tap commit: %d (axis=%c sign=%c -> SURFACE "
-                "entry via chip-triple-tap path)",
-                n, first_axis, first_sign);
-        gesture_mode_on_chip_triple_tap();
+    if (armed == POSE_NONE) {
+        /* Should not happen (the pose gate in on_chip_single_tap
+         * should have rejected these taps), but defensive. */
+        LOG_INF("Multi-tap commit ABORT: no pose armed (count=%d, "
+                "axis=%c sign=%c)", count, axis, sign);
+        return;
     }
+
+    /* Common pre-check: ALL modes require cadenced double-tap.
+     * Single tap is rejected as too easy to produce accidentally
+     * even in a deliberate pose. */
+    int interval = 0;  /* declared before any goto to avoid jump-crosses-init */
+    if (count < 2) {
+        LOG_INF("Mode entry rejected (%s): need double-tap "
+                "(got count=%d)", pose_name(armed), count);
+        goto disarm;
+    }
+    interval = last_two_tap_interval_ms();
+    if (!is_cadenced_double_tap_window(interval)) {
+        LOG_INF("Mode entry rejected (%s): inter-tap=%d ms outside "
+                "cadence window [%d, %d]",
+                pose_name(armed), interval,
+                CADENCE_MIN_MS, CADENCE_MAX_MS);
+        goto disarm;
+    }
+
+    /* Apply per-pose extra checks then trigger mode entry. */
+    switch (armed) {
+    case POSE_AIR_MOUSE:
+        LOG_INF("MODE ENTRY: AIR_MOUSE (pose + cadenced double-tap)");
+        /* TODO (future task F2): wire to power state machine -- see
+         * 't'/'y' serial commands in main.cpp for the AIR_MOUSE entry
+         * pattern.  Logged-only for now to verify pose+gesture path
+         * empirically first. */
+        break;
+
+    case POSE_DICTATION:
+        LOG_INF("MODE ENTRY: DICTATION (pose + cadenced double-tap)");
+        /* Dictation mode does not exist yet (its own spec).  Log
+         * only; will wire when dictation feature lands. */
+        break;
+
+    case POSE_SURFACE:
+        /* SURFACE has an extra check: tap must show desk-feedback
+         * spectral signature (hard surface, not lap). */
+        if (!surface_spectral_confirms_hard_surface()) {
+            LOG_INF("SURFACE entry rejected: spectral signature "
+                    "indicates soft surface (mid_band=%.0f < %.0f)",
+                    (double)last_tap_mid_band_energy,
+                    (double)SURFACE_RESONANCE_MID_BAND_THRESH);
+            goto disarm;
+        }
+        LOG_INF("MODE ENTRY: SURFACE (pose + cadenced double-tap + "
+                "hard-surface spectral confirmed)");
+        /* TODO: trigger mode transition (future task F2). */
+        break;
+
+    default:
+        LOG_INF("Mode entry ABORT: unknown armed pose %d", (int)armed);
+        break;
+    }
+
+disarm:
+    /* Disarm pose after a gesture attempt (whether successful or
+     * not) -- one shot per arm window.  Forces user to re-pose
+     * for the next attempt, which prevents accidentally chaining
+     * gestures. */
+    pose_armed_state = POSE_NONE;
 }
 
 void gesture_mode_on_chip_triple_tap(void)
@@ -1660,8 +1725,11 @@ static void _compute_band_energies(const uint8_t *buf,
  * be tuned during integration test).  Conservative initial value.
  *
  * IMPORTANT: this signal is housing-dependent.  Current value tuned
- * for open PCB; will need recalibration when housing arrives. */
-#define SURFACE_RESONANCE_MID_BAND_THRESH   5e7f
+ * for open PCB; will need recalibration when housing arrives.
+ *
+ * SURFACE_RESONANCE_MID_BAND_THRESH is defined near the top of the
+ * static-variable block (before multi_tap_commit_handler) so it is
+ * visible to that function without a forward reference. */
 
 static char _classify(const struct tap_features *f)
 {
