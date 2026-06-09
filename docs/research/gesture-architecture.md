@@ -1180,6 +1180,65 @@ meaningful inference speedup.
 
 ---
 
+## 10.5 Trigger architecture (2026-06-10 redesign)
+
+**Replaces**: previous single-event chip-tap → multi-tap commit →
+mode entry path.
+
+**Reason**: hardware testing revealed the chip-tap engine fires on
+incidental impulse events (skin taps 1-2 cm from band, desk slaps,
+thigh slaps, lap fidgets).  Per the engineering principle (memory:
+`principle_real_world_grounding_before_engineering`), this is a
+fundamental property of bio-acoustic sensing on a wrist-worn
+device; enumerating all possible accidental triggers is unbounded.
+The disciplined approach is to design gestures with deliberate
+signatures.
+
+**Architecture**: pose-gated two-stage trigger.
+
+- **Stage 1: pose detection** (always running) -- continuous
+  gravity-LPF monitoring + canonical-pose classification via
+  cosine-similarity score in `gesture_poses.cpp`.  Three canonical
+  poses recognised (AIR_MOUSE, DICTATION, SURFACE), each with a
+  tolerance cone (±30° for raises, ±20° for SURFACE).  When the
+  observed gravity vector matches a canonical pose with score
+  above POSE_MATCH_THRESH (0.5), the FSM arms that pose for 3
+  seconds.  The arm timestamp refreshes every sample the user
+  remains in the same pose -- "as long as you stay posed, you
+  stay armed."
+
+- **Stage 2: armed gesture window** -- when the FSM is armed, the
+  chip-tap path is unmuted (`gesture_mode_on_chip_single_tap`
+  ignores taps without an armed pose).  ALL modes require a
+  cadenced double-tap with inter-tap interval 150-500 ms
+  (research-grounded: matches patent literature on natural
+  double-tap timing + Apple VoiceOver's adjustable range).
+  Single tap is rejected as too easy to produce accidentally.
+  SURFACE additionally requires a spectral surface check
+  (mid_band_energy proxy for hard-surface ringing) to reject
+  cadenced taps on lap or other soft surfaces.
+
+**Three canonical poses**: AIR_MOUSE (forearm raised forward, volar
+facing screen), DICTATION (forearm raised+rotated, volar facing
+mouth), SURFACE (wrist horizontal, palm-down rest).  Pose carries
+mode info; gesture carries deliberate-intent signal.
+
+**Snap-vs-tap discrimination at trigger is deprecated.**  Both
+produce indistinguishable chip-tap events at firmware level; pose
+disambiguates the mode.  Snap-vs-tap discrimination moves to
+in-session use (future task F6, mic + IMU fusion per GestEar).
+
+**v0 known limits**: SURFACE/lap false-positive is a documented
+edge case requiring additional sensors (PPG firmness, altimetry,
+optical proximity) -- catalogued in productionization tasks
+F3-F5.  Spectral surface check is a v0 proxy; literature-correct
+feature is post-event ring-down duration (F9 future task).
+
+See spec: `docs/superpowers/specs/2026-06-10-gesture-trigger-redesign-design.md`
+See plan: `docs/superpowers/plans/2026-06-10-gesture-trigger-redesign.md`
+
+---
+
 ## 11. References
 
 ### Commercial reference products
