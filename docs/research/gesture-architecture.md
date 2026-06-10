@@ -1236,6 +1236,9 @@ feature is post-event ring-down duration (F9 future task).
 
 See spec: `docs/superpowers/specs/2026-06-10-gesture-trigger-redesign-design.md`
 See plan: `docs/superpowers/plans/2026-06-10-gesture-trigger-redesign.md`
+See findings (orientation filter + roll-based AIR_MOUSE/DICTATION split,
+gyro-integral failure, bias measurement, references): `docs/research/orientation-and-pose-discrimination-findings.md`
+See cursor foundation spec: `docs/research/cursor-drift-mitigation.md`
 
 ---
 
