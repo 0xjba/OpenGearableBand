@@ -29,10 +29,13 @@ static const canonical_pose_t k_canonical_poses[POSE_COUNT] = {
      *   right    [0.906, +0.409, -0.113]
      * All are +X-dominant (gravity ~along the forearm axis) with the
      * perpendicular (Y,Z) components spreading up to ~36° as the wrist
-     * leans.  Centred on the pure forearm axis [1,0,0] with a wide
-     * cone (tol 0.60 ≈ ±53°, arms within ~37° at the 0.5 threshold)
-     * to cover the whole lean range.  Stays clear of SURFACE (80°
-     * away) and NEUTRAL (~46°).
+     * leans.  Centred on the pure forearm axis [1,0,0].  Tolerance
+     * 0.45 -> arms within ~43.5° of the axis at the 0.5 score
+     * threshold.  Widened from 0.60 (37°) on 2026-06-10 because
+     * INCLINED raises (high-Y, ~38° off-axis -- "wrist not straight
+     * up") were clipped just outside the old 37° boundary and failed
+     * to arm.  43.5° catches them while still rejecting NEUTRAL
+     * (~48-54° off-axis) and SURFACE (~80° away).
      *
      * IMPORTANT: this pose is "raised arm", which is air-mouse AND
      * dictation BOTH.  Gravity CANNOT separate them -- measured proof
@@ -44,7 +47,7 @@ static const canonical_pose_t k_canonical_poses[POSE_COUNT] = {
      * double-tap -> AIR_MOUSE; voice -> DICTATION (see
      * decision_dictation_voice_gated_entry memory).  DICTATION is
      * disabled below until voice detection exists. */
-    { POSE_AIR_MOUSE, 1.0f, 0.0f, 0.0f, 0.60f, "AIR_MOUSE" },
+    { POSE_AIR_MOUSE, 1.0f, 0.0f, 0.0f, 0.45f, "AIR_MOUSE" },
 
     /* POSE_DICTATION: DISABLED (tolerance 2.0 => pose_score always 0,
      * never matches).  Gravity cannot distinguish dictation from an
