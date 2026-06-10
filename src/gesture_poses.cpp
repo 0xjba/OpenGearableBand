@@ -21,20 +21,40 @@ static const canonical_pose_t k_canonical_poses[POSE_COUNT] = {
      * normalized here to a unit vector (pose_score normalizes the
      * OBSERVED vector but assumes the canonical is already unit). */
 
-    /* POSE_AIR_MOUSE: forearm raised forward, band volar facing
-     * screen.  Gravity points along band +X (Y≈0).  Measured across
-     * 4 raised angles: X +0.92..+0.99, Y -0.02..+0.05, Z -0.13..+0.38;
-     * family spans ~16° from this centre, inside the ±30° cone. */
-    { POSE_AIR_MOUSE, 0.99f, 0.01f, 0.12f, 0.866f, "AIR_MOUSE" },
+    /* POSE_AIR_MOUSE: the RAISED-arm hemisphere.  Re-measured
+     * 2026-06-10 across straight + max forward/left/right leans:
+     *   straight [0.995, 0.008, -0.098]
+     *   forward  [0.861, 0.189, +0.472]
+     *   left     [0.919, -0.292, 0.265]
+     *   right    [0.906, +0.409, -0.113]
+     * All are +X-dominant (gravity ~along the forearm axis) with the
+     * perpendicular (Y,Z) components spreading up to ~36° as the wrist
+     * leans.  Centred on the pure forearm axis [1,0,0] with a wide
+     * cone (tol 0.60 ≈ ±53°, arms within ~37° at the 0.5 threshold)
+     * to cover the whole lean range.  Stays clear of SURFACE (80°
+     * away) and NEUTRAL (~46°).
+     *
+     * IMPORTANT: this pose is "raised arm", which is air-mouse AND
+     * dictation BOTH.  Gravity CANNOT separate them -- measured proof
+     * 2026-06-10: an air-mouse max-right-lean [0.906,0.409,-0.113] is
+     * only ~4° from a dictation pose [0.905,0.421,-0.045] (leaning the
+     * raised hand right rolls the band the same way supinating for
+     * dictation does -- same axis, same gravity).  So the MODE is
+     * decided by the confirming gesture, not the pose: cadenced
+     * double-tap -> AIR_MOUSE; voice -> DICTATION (see
+     * decision_dictation_voice_gated_entry memory).  DICTATION is
+     * disabled below until voice detection exists. */
+    { POSE_AIR_MOUSE, 1.0f, 0.0f, 0.0f, 0.60f, "AIR_MOUSE" },
 
-    /* POSE_DICTATION: forearm raised + rotated so band volar faces
-     * the mouth.  Same +X dominance as AIR_MOUSE but with a clear +Y
-     * roll (0.30..0.45).  NOTE: only ~23° from AIR_MOUSE, so the user
-     * must roll distinctly or a weak-roll dictation attempt falls
-     * back to AIR_MOUSE (correct/safe -- AIR_MOUSE is the live mode;
-     * DICTATION is log-only until the dictation feature lands).
-     * pose_classify_best picks the nearer canonical. */
-    { POSE_DICTATION, 0.92f, 0.39f, 0.03f, 0.866f, "DICTATION" },
+    /* POSE_DICTATION: DISABLED (tolerance 2.0 => pose_score always 0,
+     * never matches).  Gravity cannot distinguish dictation from an
+     * air-mouse raise (see AIR_MOUSE note above -- ~4° apart).  The
+     * raised pose is shared; dictation will be split out at the
+     * GESTURE stage via voice presence (band at the lips), not by a
+     * separate gravity pose.  Re-enable as a real discriminator only
+     * when voice-gated entry is built (decision_dictation_voice_gated_
+     * entry memory). */
+    { POSE_DICTATION, 0.92f, 0.39f, 0.03f, 2.0f, "DICTATION" },
 
     /* POSE_SURFACE: wrist horizontal on desk, band volar facing up.
      * Gravity along band +Z with a slight +X lean (measured centre
