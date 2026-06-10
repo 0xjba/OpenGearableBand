@@ -10,6 +10,7 @@ target_sources(app PRIVATE
     src/power_ctrl.cpp
     src/gesture_mode.cpp
     src/gesture_poses.cpp
+    src/orientation.cpp
     src/ble_hid.cpp
     src/cursor_pipeline.cpp
 )

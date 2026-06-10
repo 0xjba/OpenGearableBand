@@ -1,5 +1,6 @@
 #include "gesture_mode.h"
 #include "gesture_poses.h"
+#include "orientation.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -519,6 +520,11 @@ static float flick_burst_sign = 0.0f;
 static float gyro_hist[GYRO_HIST_SAMPLES][3];
 static int   gyro_hist_idx = 0;
 
+/* Latest raw accel (m/s^2), stashed by gesture_mode_update_accel so the
+ * orientation filter can fuse it with the gyro sample that arrives in
+ * the immediately-following gesture_mode_update_gyro() call. */
+static float last_raw_ax = 0.0f, last_raw_ay = 0.0f, last_raw_az = 9.81f;
+
 /* Integrate the gyro buffer -> net rotation (deg) and peak rate (dps)
  * about each band axis over the last ~1.5 s. */
 static void gyro_signature(float *net_deg, float *peak_dps)
@@ -621,6 +627,19 @@ static void pose_fsm_update(float gx, float gy, float gz)
     LOG_INF("  GYRO-SIG net_deg[X=%.0f Y=%.0f Z=%.0f] peak_dps[X=%.0f Y=%.0f Z=%.0f]",
             (double)net_deg[0], (double)net_deg[1], (double)net_deg[2],
             (double)peak_dps[0], (double)peak_dps[1], (double)peak_dps[2]);
+
+    /* Orientation-filter estimate at arm.  YAW (relative to the last
+     * rest re-zero) is the path-independent dictation-vs-air-mouse
+     * discriminator we're testing: a palm-to-face flip should land at a
+     * very different yaw than a palm-to-screen raise, regardless of the
+     * path taken to get there.  pitch/roll are gravity-locked. */
+    orientation_state_t ori;
+    orientation_get(&ori);
+    LOG_INF("  ORI pitch=%.0f roll=%.0f yaw=%.0f at_rest=%d bias_dps[%.1f %.1f %.1f]",
+            (double)ori.pitch_deg, (double)ori.roll_deg, (double)ori.yaw_deg,
+            (int)ori.at_rest,
+            (double)ori.gyro_bias_dps[0], (double)ori.gyro_bias_dps[1],
+            (double)ori.gyro_bias_dps[2]);
 }
 
 static const char *_mode_str(GestureMode m)
@@ -929,12 +948,21 @@ void gesture_mode_init(void)
         gyro_hist[i][2] = 0.0f;
     }
     gyro_hist_idx = 0;
+    last_raw_ax = 0.0f; last_raw_ay = 0.0f; last_raw_az = 9.81f;
+    orientation_init();
     last_tap_mid_band_energy = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
 }
 
 void gesture_mode_update_accel(float ax, float ay, float az)
 {
+    /* Stash raw accel for the orientation filter (fused with the gyro
+     * sample in the update_gyro call that immediately follows).  Done
+     * before any early return so it's always current. */
+    last_raw_ax = ax;
+    last_raw_ay = ay;
+    last_raw_az = az;
+
     /* Seed the LP filter with the first sample so we don't have to
      * wait ~5 time constants for the filter to converge. */
     if (!filter_initialised) {
@@ -1217,6 +1245,11 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
      * For now we only act on flicks from a cursor mode -> IDLE
      * (the cancel direction).  Future extensions could add directional
      * flicks for app-side commands. */
+
+    /* Update the orientation filter, fusing this gyro sample with the
+     * accel stashed in the immediately-preceding update_accel call. */
+    orientation_update(last_raw_ax, last_raw_ay, last_raw_az,
+                       gx_rps, gy_rps, gz_rps);
 
     /* Push into the rotation-signature ring buffer (dictation-flip
      * prototype).  Stored in rad/s; gyro_signature() converts. */
