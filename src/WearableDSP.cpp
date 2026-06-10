@@ -240,6 +240,19 @@ float WearableDSP::processHeartRate(float* ppg_buffer, float* imu_smv) {
     //    paths hold Kalman -- the caller is expected to signal the
     //    user to hold still via needsSteady().  See the feature/
     //    motion-path-experiments branch for the chained-NLMS work.
+    //
+    // TODO (HR motion-branch optimization): when the MICRO/HEAVY
+    //    motion-artifact-cancellation work lands here, ALSO rework the
+    //    workout-verification trigger to be commercial-grade (Apple
+    //    Watch / Fitbit / Garmin style) instead of the current crude
+    //    "significant-motion engine fires -> WORKOUT_VERIFY" heuristic
+    //    (main.cpp transition_to_workout_verify).  Commercial auto-
+    //    workout-detect uses accelerometer ACTIVITY RECOGNITION
+    //    (walk/run/cycle classifiers, cadence/periodicity) AND sustained
+    //    HR ELEVATION above resting, required over MINUTES, not the
+    //    seconds-long motion burst we use now.  This branch is where the
+    //    motion classification + motion-tolerant HR needed for that gate
+    //    will live.  See project_workout_trigger_rework memory.
     float raw_bpm = 0.0f;
     float ac_bpm = 0.0f;
     float fft_bpm = 0.0f;

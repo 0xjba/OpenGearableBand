@@ -1016,6 +1016,11 @@ static void transition_to_snapshot(void) {
 }
 
 static void transition_to_workout_verify(void) {
+    // TODO (HR motion-branch optimization): this significant-motion ->
+    // WORKOUT_VERIFY trigger is a crude heuristic.  Rework it commercial-
+    // grade (activity recognition + sustained HR elevation over minutes,
+    // Apple Watch / Fitbit style) alongside the MICRO/HEAVY motion HR
+    // work in WearableDSP.cpp.  See project_workout_trigger_rework memory.
     LOG_INF("PowerState: %s -> WORKOUT_VERIFY", power_state_str(power_state));
     k_timer_stop(&snapshot_tick);
     lsm6dsl_disable_sign_motion();      // we're tracking motion ourselves now
