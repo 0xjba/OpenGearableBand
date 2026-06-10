@@ -179,6 +179,12 @@ void gesture_mode_on_chip_triple_tap(void);
  * decide whether to accept a tap as a mode-entry trigger. */
 pose_id_t gesture_mode_armed_pose(void);
 
+/* True if the user is mid-gesture: a pose is currently armed OR a
+ * chip-tap occurred within RECENT_GESTURE_GUARD_MS.  The power state
+ * machine uses this to suppress the significant-motion -> WORKOUT_VERIFY
+ * transition during gestures (rapid taps must not read as exercise). */
+bool gesture_mode_recent_activity(void);
+
 /*
  * Read the current mode.  Thread-safe (uses atomic_t internally).
  * Cheap; safe to call from any thread including ISRs.

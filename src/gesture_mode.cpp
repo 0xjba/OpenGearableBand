@@ -307,6 +307,20 @@ pose_id_t gesture_mode_armed_pose(void)
     return pose_armed_state;
 }
 
+bool gesture_mode_recent_activity(void)
+{
+    /* Mid-gesture if a pose is armed... */
+    if (gesture_mode_armed_pose() != POSE_NONE) {
+        return true;
+    }
+    /* ...or a chip-tap landed within the guard window. */
+    if (last_chip_tap_time_ms != 0 &&
+        (k_uptime_get() - last_chip_tap_time_ms) < RECENT_GESTURE_GUARD_MS) {
+        return true;
+    }
+    return false;
+}
+
 /* Update pose FSM based on current gravity vector.  Called every
  * accel sample from gesture_mode_update_accel().
  *

@@ -121,6 +121,14 @@
  * housing). */
 #define RINGING_REFRACTORY_MS           50
 
+/* Recent-gesture guard: while a pose is armed OR a chip-tap occurred within
+ * this window, the significant-motion engine's WORKOUT_VERIFY transition is
+ * SUPPRESSED — rapid gesture taps must not be mistaken for the sustained
+ * motion of exercise (they otherwise preempt the gesture mid-sequence).
+ * Covers the gesture sequence + margin; workout auto-detect only delays
+ * during/just-after a gesture.  [USER] */
+#define RECENT_GESTURE_GUARD_MS         3000
+
 /* Activity gate (NO LONGER used in the trigger path — superseded by the pose
  * gate; kept for reference / possible in-session reuse).  Motion residual
  * above THRESH (m/s^2) resets the dwell; a tap was accepted only when the

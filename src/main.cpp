@@ -1108,10 +1108,23 @@ static void run_idle(void) {
         // Sig-motion event: standard workout-verify path.  We only
         // honour sig-motion when it actually fired (not just because
         // a stale wake from earlier left the semaphore set).
+        //
+        // BUT: suppress it during gesture activity.  Rapid gesture taps
+        // fire the chip's significant-motion engine, which would
+        // otherwise yank us into WORKOUT_VERIFY mid-gesture and drop the
+        // rest of the tap sequence (the dispatcher only runs in IDLE).
+        // A pose-armed or recently-tapped state means "this is a
+        // gesture, not exercise" -- stay in IDLE.  Reading FUNC_SRC1
+        // above already cleared the sig-motion latch, so no re-fire.
         if (sigm_fired) {
-            k_sem_reset(&snapshot_tick_sem);  // ignore tick we didn't service
-            transition_to_workout_verify();
-            return;
+            if (gesture_mode_recent_activity()) {
+                LOG_INF("Sig-motion suppressed -- recent gesture activity "
+                        "(not a workout)");
+            } else {
+                k_sem_reset(&snapshot_tick_sem);  // ignore tick we didn't service
+                transition_to_workout_verify();
+                return;
+            }
         }
 
         // Neither bit set: stale signal, just stay in IDLE and let
