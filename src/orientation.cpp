@@ -1,6 +1,9 @@
 #include "orientation.h"
 
 #include <math.h>
+#include <zephyr/logging/log.h>
+
+LOG_MODULE_REGISTER(orientation, LOG_LEVEL_INF);
 
 /* Sample period: acq runs at ~100 Hz. */
 #define ORI_DT          0.01f
@@ -32,6 +35,59 @@ static int  still_count = 0;
 static bool at_rest = false;
 static bool was_rest = false;
 
+/* Stationary gyro-bias trace state (deg/s accumulation). */
+static bool     trace_active = false;
+static uint32_t trace_remaining = 0;
+static uint32_t trace_total = 0;
+static double   trace_sum[3]   = {0, 0, 0};
+static double   trace_sumsq[3] = {0, 0, 0};
+static float    trace_min[3]   = {0, 0, 0};
+static float    trace_max[3]   = {0, 0, 0};
+
+void orientation_bias_trace_start(uint32_t n_samples)
+{
+    trace_active = true;
+    trace_remaining = n_samples;
+    trace_total = n_samples;
+    for (int a = 0; a < 3; a++) {
+        trace_sum[a] = 0.0; trace_sumsq[a] = 0.0;
+        trace_min[a] = 1e9f; trace_max[a] = -1e9f;
+    }
+    LOG_INF("BIAS-TRACE: hold PERFECTLY still -- collecting %u samples "
+            "(~%u s)...", n_samples, n_samples / 100u);
+}
+
+/* Accumulate one raw-gyro sample (deg/s) into the trace; log + stop
+ * when the count is reached. */
+static void bias_trace_sample(float gx_dps, float gy_dps, float gz_dps)
+{
+    float v[3] = {gx_dps, gy_dps, gz_dps};
+    for (int a = 0; a < 3; a++) {
+        trace_sum[a]   += (double)v[a];
+        trace_sumsq[a] += (double)v[a] * (double)v[a];
+        if (v[a] < trace_min[a]) trace_min[a] = v[a];
+        if (v[a] > trace_max[a]) trace_max[a] = v[a];
+    }
+    if (--trace_remaining == 0) {
+        trace_active = false;
+        double n = (double)trace_total;
+        double mean[3], sd[3];
+        for (int a = 0; a < 3; a++) {
+            mean[a] = trace_sum[a] / n;
+            double var = trace_sumsq[a] / n - mean[a] * mean[a];
+            sd[a] = (var > 0.0) ? sqrt(var) : 0.0;
+        }
+        LOG_INF("=== BIAS-TRACE RESULT (%u samples, dps) ===", trace_total);
+        LOG_INF("  bias(mean): X=%.3f Y=%.3f Z=%.3f", mean[0], mean[1], mean[2]);
+        LOG_INF("  noise(std): X=%.3f Y=%.3f Z=%.3f", sd[0], sd[1], sd[2]);
+        LOG_INF("  min:        X=%.3f Y=%.3f Z=%.3f",
+                (double)trace_min[0], (double)trace_min[1], (double)trace_min[2]);
+        LOG_INF("  max:        X=%.3f Y=%.3f Z=%.3f",
+                (double)trace_max[0], (double)trace_max[1], (double)trace_max[2]);
+        LOG_INF("============================================");
+    }
+}
+
 static float raw_yaw_deg(void)
 {
     return atan2f(2.0f * (q0 * q3 + q1 * q2),
@@ -56,6 +112,12 @@ void orientation_rezero_yaw(void)
 void orientation_update(float ax, float ay, float az,
                         float gx, float gy, float gz)
 {
+    /* Stationary bias trace samples the RAW gyro (deg/s) before any
+     * bias correction below. */
+    if (trace_active) {
+        bias_trace_sample(gx * RAD2DEG, gy * RAD2DEG, gz * RAD2DEG);
+    }
+
     /* --- Stillness detection: gate on BOTH linear and angular quiet,
      * per the ZUPT review (a too-loose detector injects error). --- */
     float amag = sqrtf(ax * ax + ay * ay + az * az);

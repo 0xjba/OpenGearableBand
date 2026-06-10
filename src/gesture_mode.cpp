@@ -324,6 +324,13 @@ static int64_t   pose_armed_time_ms = 0;
 /* Minimum pose-match score to consider the user in a pose. */
 #define POSE_MATCH_THRESH    0.5f
 
+/* Roll (= atan2(gy,gz), deg) above which a raised pose is DICTATION
+ * (palm supinated toward face) rather than AIR_MOUSE (palm to screen).
+ * Validated from settled-pose data 2026-06-10: air-mouse ~30-64 deg,
+ * dictation ~105-117 deg.  Drift-free (gravity-derived).  Tunable;
+ * per-user calibration is a productionization item. */
+#define DICTATION_ROLL_THRESH_DEG   85.0f
+
 /* Multi-tap counter state.  See MULTI_TAP_WINDOW_MS comment block. */
 static int     multi_tap_count = 0;
 static int64_t multi_tap_last_time_ms = 0;
@@ -594,6 +601,26 @@ static void pose_fsm_update(float gx, float gy, float gz)
     float score = 0.0f;
     pose_id_t best = pose_classify_best(gx, gy, gz,
                                           POSE_MATCH_THRESH, &score);
+
+    /* Roll-based AIR_MOUSE/DICTATION split (validated 2026-06-10).
+     * The raised hemisphere is one canonical (POSE_AIR_MOUSE); within
+     * it, SUPINATION distinguishes dictation (palm to face) from
+     * air-mouse (palm to screen).  Supination shows up as ROLL =
+     * atan2(gy, gz), which is gravity-derived and DRIFT-FREE.  Measured
+     * settled poses: air-mouse roll ~+30..+64 deg, dictation ~+105..+117
+     * deg.  Threshold 85 deg (signed -- dictation is POSITIVE high roll;
+     * a left lean is negative roll and stays air-mouse).
+     *
+     * Known edge case: a heavily-supinated / max-right air-mouse lean
+     * (roll > 85) reads as DICTATION.  Rare for screen-pointing; voice
+     * gating is the future backstop (decision_dictation_voice_gated_
+     * entry).  DICTATION is log-only until its feature exists. */
+    if (best == POSE_AIR_MOUSE) {
+        float roll_deg = atan2f(gy, gz) * (180.0f / 3.14159265f);
+        if (roll_deg >= DICTATION_ROLL_THRESH_DEG) {
+            best = POSE_DICTATION;
+        }
+    }
 
     if (pose_armed_state != POSE_NONE) {
         /* Already armed.  If the user is still in the SAME pose,

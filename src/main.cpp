@@ -20,6 +20,7 @@
 #include "gesture_mode.h"
 #include "ble_hid.h"
 #include "cursor_pipeline.h"
+#include "orientation.h"
 #include <zephyr/settings/settings.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -595,6 +596,9 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // PPG quality probe -- 20 s capture + perfusion-index
             // scorecard for finalising the band wear position.
             pending_cmd = 'q';
+        } else if (c == 'z' || c == 'Z') {
+            // Stationary gyro-bias trace -- hold still, logs bias/noise.
+            pending_cmd = 'z';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -626,6 +630,7 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'c'=toggle chip-tap calibration logging");
     LOG_INF("  '+'=lower TAP_THS (more sensitive)   '-'=raise TAP_THS (less sensitive)");
     LOG_INF("  'q'=PPG quality probe (20s perfusion-index capture for wear position)");
+    LOG_INF("  'z'=gyro bias trace (hold still 60s -> bias/noise per axis)");
 
     /* Per-step cursor delta for the mouse-test injects.  10 pixels
      * per press gives a clearly visible cursor jump on the host. */
@@ -782,6 +787,13 @@ void reset_thread_entry(void *, void *, void *) {
             LOG_INF("PPG probe requested -- power thread will run a 20s capture");
             probe_requested = true;
             k_sem_give(&motion_wake_sem);
+        } else if (cmd == 'z') {
+            pending_cmd = 0;
+            // Stationary gyro-bias trace.  Accumulation happens in the
+            // orientation filter (fed from the acq thread), so this just
+            // arms it; acq must be running (it is, always-on).  60 s at
+            // 100 Hz = 6000 samples.
+            orientation_bias_trace_start(6000);
         }
         k_sleep(K_MSEC(50));
     }

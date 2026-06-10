@@ -2,6 +2,7 @@
 #define ORIENTATION_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,14 @@ void orientation_get(orientation_state_t *out);
 /* Force a yaw re-zero (ZUPT-style).  Also invoked automatically the
  * moment the filter detects the wrist has come to rest. */
 void orientation_rezero_yaw(void);
+
+/* Stationary gyro-bias trace.  Hold the device perfectly still and
+ * call this; it accumulates raw gyro for n_samples (~100 Hz) and logs
+ * mean (= bias, deg/s), stddev (= noise), and min/max per axis.  Run
+ * warm AND cold to get this unit's real numbers before trusting the
+ * filter's stillness / bias thresholds (per cursor-drift-mitigation
+ * spec, section 8). */
+void orientation_bias_trace_start(uint32_t n_samples);
 
 #ifdef __cplusplus
 }
