@@ -507,6 +507,38 @@ static inline int _exit_dwell_for(GestureMode m)
 static int flick_burst_samples_remaining = 0;
 static float flick_burst_sign = 0.0f;
 
+/* Gyro rotation-signature buffer (dictation-flip prototype, 2026-06-10).
+ * Rolling ~1.5 s window of gyro samples in rad/s.  At pose-arm we
+ * integrate it to report the net rotation about each band axis during
+ * the move-into-pose -- the supination flip (roll about band X, the
+ * forearm axis) for dictation should show a large net X that an
+ * air-mouse lean does not.  150 samples * 3 * 4 B = 1800 B. */
+#define GYRO_HIST_SAMPLES   150          /* 1.5 s at 100 Hz */
+#define GYRO_DT_S           0.01f        /* 100 Hz sample period */
+#define RAD_TO_DEG          57.29578f
+static float gyro_hist[GYRO_HIST_SAMPLES][3];
+static int   gyro_hist_idx = 0;
+
+/* Integrate the gyro buffer -> net rotation (deg) and peak rate (dps)
+ * about each band axis over the last ~1.5 s. */
+static void gyro_signature(float *net_deg, float *peak_dps)
+{
+    float sum[3] = {0, 0, 0};
+    float peak[3] = {0, 0, 0};
+    for (int i = 0; i < GYRO_HIST_SAMPLES; i++) {
+        for (int a = 0; a < 3; a++) {
+            float w = gyro_hist[i][a];
+            sum[a] += w;
+            float m = fabsf(w);
+            if (m > peak[a]) peak[a] = m;
+        }
+    }
+    for (int a = 0; a < 3; a++) {
+        net_deg[a]  = sum[a] * GYRO_DT_S * RAD_TO_DEG;
+        peak_dps[a] = peak[a] * RAD_TO_DEG;
+    }
+}
+
 /*
  * --- Internal helpers --------------------------------------------------
  */
@@ -578,6 +610,17 @@ static void pose_fsm_update(float gx, float gy, float gz)
     LOG_INF("Pose ARMED: %s (score=%.2f, gravity=(%.2f, %.2f, %.2f))",
             pose_name(best), (double)score,
             (double)gx, (double)gy, (double)gz);
+
+    /* Dictation-flip prototype: dump the gyro rotation signature for
+     * the move-into-pose.  net[X] is the net roll about the forearm
+     * axis (supination) -- expected LARGE for a dictation flip, SMALL
+     * for an air-mouse raise/lean.  Collect raises vs flips and compare
+     * net_X / peak_X to design the discriminator. */
+    float net_deg[3], peak_dps[3];
+    gyro_signature(net_deg, peak_dps);
+    LOG_INF("  GYRO-SIG net_deg[X=%.0f Y=%.0f Z=%.0f] peak_dps[X=%.0f Y=%.0f Z=%.0f]",
+            (double)net_deg[0], (double)net_deg[1], (double)net_deg[2],
+            (double)peak_dps[0], (double)peak_dps[1], (double)peak_dps[2]);
 }
 
 static const char *_mode_str(GestureMode m)
@@ -880,6 +923,12 @@ void gesture_mode_init(void)
     samples_since_activity = ACTIVITY_GATE_DWELL;
     flick_burst_samples_remaining = 0;
     flick_burst_sign = 0.0f;
+    for (int i = 0; i < GYRO_HIST_SAMPLES; i++) {
+        gyro_hist[i][0] = 0.0f;
+        gyro_hist[i][1] = 0.0f;
+        gyro_hist[i][2] = 0.0f;
+    }
+    gyro_hist_idx = 0;
     last_tap_mid_band_energy = 0.0f;
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
 }
@@ -1168,6 +1217,13 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
      * For now we only act on flicks from a cursor mode -> IDLE
      * (the cancel direction).  Future extensions could add directional
      * flicks for app-side commands. */
+
+    /* Push into the rotation-signature ring buffer (dictation-flip
+     * prototype).  Stored in rad/s; gyro_signature() converts. */
+    gyro_hist[gyro_hist_idx][0] = gx_rps;
+    gyro_hist[gyro_hist_idx][1] = gy_rps;
+    gyro_hist[gyro_hist_idx][2] = gz_rps;
+    gyro_hist_idx = (gyro_hist_idx + 1) % GYRO_HIST_SAMPLES;
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
 

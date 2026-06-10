@@ -283,10 +283,23 @@ void acq_thread_entry(void *, void *, void *) {
         float az = (float)sensor_value_to_double(&accel_z);
         float smv = sqrtf(ax * ax + ay * ay + az * az);
 
+        // Read the gyro from the same fetch (gyro enabled in prj.conf).
+        // Zephyr returns rad/s -- gesture_mode_update_gyro expects rad/s
+        // (flick detector + the new flip-signature buffer convert to
+        // deg internally as needed).
+        struct sensor_value gyro_x = {0}, gyro_y = {0}, gyro_z = {0};
+        sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_X, &gyro_x);
+        sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_Y, &gyro_y);
+        sensor_channel_get(imu_dev, SENSOR_CHAN_GYRO_Z, &gyro_z);
+        float gx_rps = (float)sensor_value_to_double(&gyro_x);
+        float gy_rps = (float)sensor_value_to_double(&gyro_y);
+        float gz_rps = (float)sensor_value_to_double(&gyro_z);
+
         // Feed the gesture-mode detector at the sample rate.  Cheap
         // (1 IIR per axis + a classifier branch); does its own dwell
         // counting internally so we don't need to gate it ourselves.
         gesture_mode_update_accel(ax, ay, az);
+        gesture_mode_update_gyro(gx_rps, gy_rps, gz_rps);
 
         // In gesture-only mode we're done with this tick -- no PPG to
         // store, no DSP to drive.
