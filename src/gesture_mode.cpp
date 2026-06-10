@@ -1,6 +1,7 @@
 #include "gesture_mode.h"
 #include "gesture_poses.h"
 #include "orientation.h"
+#include "gesture_thresholds.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -15,252 +16,14 @@
 
 LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 
-/*
- * --- Tuning constants ----------------------------------------------------
- *
- * Picked deliberately for our acquisition rate (100 Hz) and the human
- * timing of wrist movements.  Defined here at the top so they can be
- * located and tweaked in one place; mostly NOT exposed via Kconfig
- * because gesture-mode tuning is an internal detail, not a build-time
- * option.
- */
-
-/*
- * Gravity-vector low-pass filter alpha.
- *
- * Implemented as g[n] = (1 - alpha) * g[n-1] + alpha * a[n].  At
- * alpha = 0.01 and 100 Hz sample rate, the effective time constant
- * is ~1 s (1 / (alpha * fs) = 1 / 1 = 1 s).  That's slow enough to
- * filter out cardiac micro-motion and high-frequency jitter while
- * still tracking deliberate orientation changes within ~1 second.
- */
-#define GRAVITY_LP_ALPHA            0.01f
-
-/*
- * Dominant-axis dwell required before declaring a new orientation.
- * Prevents flicker when the wrist is in a borderline position --
- * orientation only switches if the new classification holds for at
- * least DWELL_SAMPLES consecutive samples (~250 ms at 100 Hz).
- */
-#define ORIENTATION_DWELL_SAMPLES   25
-
-/*
- * The dominant axis must be at least this many times larger than the
- * next-largest axis to count as truly dominant.  1.3x ~ 30 % gap.
- *
- * Without this, a pose like (4.5, 4.5, 6.0) would be classified as
- * Z-dominant; with it, three-axis-balanced poses correctly resolve
- * to NEUTRAL.
- *
- * NOTE on the lack of an absolute magnitude threshold:
- *   Earlier versions also gated on the dominant axis's absolute
- *   magnitude.  The threshold value (5.0 m/s^2) was a guess at "how
- *   tilted does a pose have to be to count as intentional?" and
- *   dropping it in favour of just the ratio is more principled --
- *   the ratio answers the right question ("is one axis meaningfully
- *   larger than the others?") without picking an arbitrary number.
- *   Gravity always sums to ~9.81 m/s^2 in magnitude; the ratio
- *   handles balanced poses correctly regardless of where along the
- *   tilt-from-vertical spectrum the wrist is.
- */
-#define DOMINANCE_RATIO             1.3f
-
-/*
- * Cooldown window after exiting a cursor mode via orientation-drop.
- * During this window, returning to the same mode's pose auto-re-
- * engages without requiring another tap trigger.  Outside this
- * window, an explicit tap is required.
- *
- * Sized for the realistic case of a user actively using a cursor
- * mode who steps away briefly (rest a fatigued arm for AIR_MOUSE;
- * lift hand off the desk for SURFACE) then comes back.  Shoulder
- * fatigue recovery during sustained sub-shoulder-height pointing is
- * roughly 15-30 s; 2000 samples = 20 s at 100 Hz lands in the middle
- * of that range and works for both modes.
- *
- * Tradeoff: too short and a tired user has to re-tap to resume.
- * Too long and an unrelated movement (lifting hand to drink coffee,
- * etc.) accidentally re-engages.  The 500 ms re-engage dwell
- * (COOLDOWN_REENGAGE_DWELL) protects against casual movements
- * regardless of cooldown length, so we lean toward "longer" here.
- */
-#define CURSOR_COOLDOWN_SAMPLES     2000
-
-/*
- * Orientation dwell required during cooldown to re-engage.  Shorter
- * than the cold-start raise dwell because the user already signalled
- * intent recently.  50 samples = 500 ms.
- */
-#define COOLDOWN_REENGAGE_DWELL     50
-
-/*
- * Per-mode dwell required for orientation-drop exit.  Pose must NOT
- * be the mode's expected one (UP_RAISED for AIR_MOUSE, DOWN_FLAT
- * for SURFACE) for this many consecutive samples before the FSM
- * transitions out.
- *
- * AIR_MOUSE_EXIT_DWELL = 50 (500 ms):
- *   Lowering the wrist out of the raised pose is a slow, deliberate
- *   motion -- "I'm done air-mousing".  Half a second of dwell
- *   tolerates brief unintentional tilts without bouncing out.
- *
- * SURFACE_EXIT_DWELL = 0 (~250 ms effective due to ORIENTATION_DWELL):
- *   The model is "lift the mouse 1-2 cm to reposition" -- a real
- *   optical mouse pauses tracking within ~50 ms of leaving the
- *   surface.  We can't match 50 ms because the orientation classifier
- *   has its own 250 ms dwell; setting SURFACE_EXIT_DWELL to 0 makes
- *   the orientation dwell the only delay (~250 ms total), which is
- *   the closest we get to mouse-like tactile response.
- *
- *   This means SURFACE exits and starts cooldown almost the instant
- *   the user lifts their wrist, mimicking a mouse losing surface
- *   contact.  The 20 s cooldown then handles "they'll come back."
- */
-#define AIR_MOUSE_EXIT_DWELL        50
-#define SURFACE_EXIT_DWELL          0
-
-/*
- * SURFACE motion-burst exit detector.
- *
- * Problem the orientation-drop exit alone doesn't solve: a wrist
- * palm-down on a desk and a wrist palm-down on the user's lap have
- * the SAME gravity-vector signature (both are Z+ dominant ->
- * WRIST_DOWN_FLAT).  So moving the wrist from desk to lap without
- * rotating the palm doesn't change orientation_current, and SURFACE
- * stays engaged when it should exit.
- *
- * We have no altimeter and accel dead-reckoning drifts in seconds,
- * so we can't measure "height."  But the TRANSITION from desk to
- * lap involves a brief acceleration burst (lift up, translate, set
- * down) -- 2-5 m/s^2 motion residual for ~500 ms.  Steady gliding
- * on the desk (the intended SURFACE use) stays below ~1 m/s^2.
- * That gap lets us detect "the user is transporting the wrist
- * somewhere" without false-triggering on actual surface use.
- *
- * Motion residual = (a - gravity_lpf), magnitude per sample.
- * SURFACE_MOTION_BURST_THRESH (m/s^2) is the gating magnitude;
- * SURFACE_MOTION_BURST_DWELL is the consecutive-sample count the
- * residual must stay above the threshold before firing.
- *
- * Initial values are physics-motivated estimates (a 30 cm vertical
- * translation in 0.5 s requires ~2.4 m/s^2 peak); empirical tuning
- * happens after first hardware test.  The exit log prints the
- * actual peak magnitude so the user can read it back and we can
- * tighten.
- */
-#define SURFACE_MOTION_BURST_THRESH 2.0f
-#define SURFACE_MOTION_BURST_DWELL  15      /* 150 ms at 100 Hz */
-
-/*
- * Firmware multi-tap counter (Stage C, 2026-06-08).
- *
- * The chip is now configured in SDT=0 mode -- it emits ONLY
- * SINGLE_TAP events, one per shock.  Firmware groups consecutive
- * arrivals within MULTI_TAP_WINDOW_MS into multi-tap sequences:
- *   1 tap, no follow-up    -> currently no-op (surface-tap re-engage
- *                              will hook here in a later stage)
- *   2 taps within window   -> chained to gesture_mode_on_chip_double_tap
- *                              (AIR_MOUSE entry)
- *   3+ taps within window  -> chained to gesture_mode_on_chip_triple_tap
- *                              (SURFACE entry)
- *
- * The window value follows industry guidance (Agent 3 research:
- * iOS VoiceOver 250 ms default, Arduino 101 CurieIMU 250 ms,
- * Apple accessibility 500 ms).  250 ms is the human-comfortable
- * default.
- *
- * Commit-on-timeout pattern: each tap arrival updates last_tap_time
- * and increments count.  The per-sample update polls "has
- * MULTI_TAP_WINDOW_MS elapsed since the last tap?"  If yes, commits
- * the sequence and resets.  This gives the disambiguation latency
- * documented in Choice 3 (Stage A): action fires ~250 ms after the
- * last tap, accepting that delay so a third tap can still upgrade
- * the sequence.
- */
-#define MULTI_TAP_WINDOW_MS         250
-
-/* Cadenced double-tap: deliberate user-driven double-tap with inter-
- * tap interval in a specific window.  Values research-grounded
- * 2026-06-10:
- *
- *   - Apple VoiceOver: default 250 ms, user-adjustable 200-500 ms
- *     in 50 ms steps.
- *   - Patent literature on natural double-tap behavior: normal
- *     150-180 ms; fast (in a hurry) 80-90 ms; slow/deliberate
- *     250-480 ms.
- *
- * CADENCE_MIN_MS lowered 150 -> 60 (2026-06-10 hardware test): the
- * textbook 150 ms floor rejected THIS user's natural double-taps,
- * which measured 78 ms (AIR_MOUSE) and 123 ms (SURFACE) -- only the
- * one slow 210 ms DICTATION tap passed.  Real-world grounding wins
- * over the textbook: tune to the user's actual cadence.  60 ms is
- * still safely above the 50 ms ringing refractory (so mechanical
- * echoes, which fire ~14 ms after a tap, are filtered before they
- * could be mistaken for the second tap), while comfortably
- * accepting fast deliberate double-taps.  Per-user calibration of
- * this window is a productionization item (F3).
- *
- * CADENCE_MAX_MS = 500 matches Apple's slowest tunable setting and
- * covers the 250-480 ms slow-deliberate range. */
-#define CADENCE_MIN_MS   60
-#define CADENCE_MAX_MS   500
-
-/*
- * Activity gate (Choice 4, Stage C, 2026-06-08).
- *
- * Reject chip-tap events if motion residual was high in the
- * preceding ~500 ms.  Kills the dominant false-positive source
- * documented in patent literature (gait impacts, wrist-on-surface
- * micro-contacts during typing).  See AN5040 / ADXL367 AN-2554.
- *
- * Implementation: each per-sample update where motion residual
- * exceeds ACTIVITY_GATE_THRESH resets samples_since_activity to 0.
- * Otherwise it ticks up.  A tap is accepted only if
- * samples_since_activity >= ACTIVITY_GATE_DWELL.
- */
-/* Initial value was 1.0 m/s^2 -- too aggressive.  Hardware test
- * 2026-06-09 showed natural arm motion (lowering wrist from
- * AIR_MOUSE pose) was gating legitimate snap events.  Bumped to
- * 2.0 m/s^2 to match SURFACE_MOTION_BURST_THRESH (already
- * empirically validated as a clean separator between gliding and
- * transport motion).  Tune lower again only if gait-driven
- * false positives reappear. */
-#define ACTIVITY_GATE_THRESH        2.0f   /* m/s^2 motion residual */
-#define ACTIVITY_GATE_DWELL         50     /* 500 ms at 100 Hz */
-
-/*
- * Per-mode entry-grace window after a cursor mode is entered while
- * NOT already in the expected pose.  Counted down per accel sample.
- * If it hits zero before the user reaches the expected pose, the
- * FSM bounces back to IDLE without ever arming exit detection.
- *
- * AIR_MOUSE_ENTRY_GRACE = 500 (5 s):
- *   Raising the arm to shoulder height takes deliberate effort plus
- *   settling time.  5 s leaves margin for repositioning, getting
- *   comfortable in the pose, or hesitation before commitment.
- *
- * SURFACE_ENTRY_GRACE = 300 (3 s):
- *   Placing the wrist flat on a desk is faster -- typically a single
- *   motion from wherever the hand was.  3 s is enough for the user
- *   to settle the wrist into a comfortable touchpad position.
- */
-#define AIR_MOUSE_ENTRY_GRACE       500
-#define SURFACE_ENTRY_GRACE         300
+/* Tuning constants are centralized in gesture_thresholds.h (included above).
+ * See that header for rationale, tags, and the productionization catalog. */
 
 /* (Previously: FLAT_DWELL_SAMPLES = 100 -- auto-triggered SURFACE
  * mode from DOWN_FLAT pose dwell.  Removed: user feedback established
  * SURFACE entry is explicit via triple-tap, matching the AIR_MOUSE
  * double-tap entry pattern, so no orientation auto-trigger.) */
 
-
-/*
- * Wrist-flick cancel trigger: gyro magnitude burst followed by
- * reverse-direction motion within a short window.  FLICK_BURST_THRESH
- * is the peak gyro magnitude (rad/s) for the burst; FLICK_WINDOW is
- * the number of samples within which the reversal must complete.
- */
-#define FLICK_BURST_THRESH_RPS      8.0f
-#define FLICK_WINDOW_SAMPLES        25
 
 /*
  * --- Internal state ----------------------------------------------------
@@ -317,21 +80,7 @@ static int   surface_motion_log_counter = 0;
 static pose_id_t pose_armed_state = POSE_NONE;
 static int64_t   pose_armed_time_ms = 0;
 
-/* Pose-arm window: gesture must arrive within this many milliseconds
- * of pose-arm to count as a trigger. */
-#define POSE_ARM_WINDOW_MS   3000
-
-/* Minimum pose-match score to consider the user in a pose. */
-#define POSE_MATCH_THRESH    0.5f
-
-/* Roll (= atan2(gy,gz), deg) above which a raised pose is DICTATION
- * (palm supinated toward face) rather than AIR_MOUSE (palm to screen).
- * Validated from settled-pose data 2026-06-10: air-mouse ~30-64 deg,
- * dictation ~105-117 deg.  Drift-free (gravity-derived).  Tunable;
- * per-user calibration is a productionization item. */
-#define DICTATION_ROLL_THRESH_DEG   85.0f
-
-/* Multi-tap counter state.  See MULTI_TAP_WINDOW_MS comment block. */
+/* Multi-tap counter state.  See MULTI_TAP_WINDOW_MS in gesture_thresholds.h. */
 static int     multi_tap_count = 0;
 static int64_t multi_tap_last_time_ms = 0;
 /* Diagnostic: last tap's axis/sign characters, included in the
@@ -351,18 +100,6 @@ static void multi_tap_commit_handler(struct k_work *work_arg);
 static K_WORK_DELAYABLE_DEFINE(multi_tap_commit_work,
                                multi_tap_commit_handler);
 
-/* Firmware ringing-rejection refractory.  At higher ODR the chip's
- * QUIET window shrinks proportionally (14.4 ms at 833 Hz vs ~29 ms
- * at 416 Hz).  Band housing mechanical ringing post-impact can
- * survive shorter QUIET windows and cause double-firing of the
- * same physical tap.  This firmware-side guard rejects any chip-
- * tap event arriving within RINGING_REFRACTORY_MS of the previous
- * one -- treating it as ringing duplicate, not a real second tap.
- *
- * 50 ms is comfortably above the ~3-30 ms ringing we observed at
- * 1.66 kHz, and well below the ~150-250 ms minimum human inter-tap
- * gap, so real double-taps are unaffected. */
-#define RINGING_REFRACTORY_MS    50
 static int64_t last_chip_tap_time_ms = 0;
 
 /* Time of the chip-tap event before the current one.  Used by
@@ -476,14 +213,6 @@ static gesture_acq_request_cb_t s_acq_request_cb = NULL;
  * reference; the companion constant and predicate live further down
  * near the bio-acoustic section. */
 static float last_tap_mid_band_energy = 0.0f;
-
-/* Threshold for hard-surface spectral confirmation.  Hard surfaces
- * (desk) resonate into the mid band during the tap; soft surfaces
- * (lap) damp it.  Constant hoisted here so multi_tap_commit_handler
- * (defined earlier in the file) can reference it without a forward
- * #define.  See the full comment near surface_spectral_confirms_hard_surface
- * for calibration notes. */
-#define SURFACE_RESONANCE_MID_BAND_THRESH   5e7f
 
 /* Forward declaration -- implementation lives near the bio-acoustic
  * section later in the file. */
@@ -1761,11 +1490,10 @@ static void _extract_peak(const uint8_t *buf, uint16_t sample_count,
  *     impacts (tap on band housing) have more energy here.
  *
  * Discriminator: low_ratio = low / (low + mid).  Snap -> ratio
- * high (~0.7+); tap -> ratio lower (~0.5 or less). */
-#define FFT_BIN_LOW_START   12     /* ~19.5 Hz */
-#define FFT_BIN_LOW_END     122    /* ~199 Hz, exclusive */
-#define FFT_BIN_MID_START   122    /* ~199 Hz */
-#define FFT_BIN_MID_END     246    /* ~400 Hz, exclusive */
+ * high (~0.7+); tap -> ratio lower (~0.5 or less).
+ *
+ * Band-edge constants (FFT_BIN_LOW_START/END, FFT_BIN_MID_START/END)
+ * come from gesture_thresholds.h. */
 
 static void _compute_band_energies(const uint8_t *buf,
                                    uint16_t sample_count,

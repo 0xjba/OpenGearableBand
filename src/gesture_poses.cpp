@@ -1,4 +1,5 @@
 #include "gesture_poses.h"
+#include "gesture_thresholds.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -47,7 +48,7 @@ static const canonical_pose_t k_canonical_poses[POSE_COUNT] = {
      * double-tap -> AIR_MOUSE; voice -> DICTATION (see
      * decision_dictation_voice_gated_entry memory).  DICTATION is
      * disabled below until voice detection exists. */
-    { POSE_AIR_MOUSE, 1.0f, 0.0f, 0.0f, 0.45f, "AIR_MOUSE" },
+    { POSE_AIR_MOUSE, POSE_AIRMOUSE_GX, POSE_AIRMOUSE_GY, POSE_AIRMOUSE_GZ, POSE_AIRMOUSE_TOL, "AIR_MOUSE" },
 
     /* POSE_DICTATION: DISABLED (tolerance 2.0 => pose_score always 0,
      * never matches).  Gravity cannot distinguish dictation from an
@@ -57,13 +58,13 @@ static const canonical_pose_t k_canonical_poses[POSE_COUNT] = {
      * separate gravity pose.  Re-enable as a real discriminator only
      * when voice-gated entry is built (decision_dictation_voice_gated_
      * entry memory). */
-    { POSE_DICTATION, 0.92f, 0.39f, 0.03f, 2.0f, "DICTATION" },
+    { POSE_DICTATION, POSE_DICTATION_GX, POSE_DICTATION_GY, POSE_DICTATION_GZ, POSE_DICTATION_TOL, "DICTATION" },
 
     /* POSE_SURFACE: wrist horizontal on desk, band volar facing up.
      * Gravity along band +Z with a slight +X lean (measured centre
      * [0.18, 0.08, 0.98]; family spans ~11°).  Tolerance tighter
      * (±20°) to reduce lap false positives. */
-    { POSE_SURFACE,   0.18f, 0.08f, 0.98f, 0.940f, "SURFACE" },
+    { POSE_SURFACE,   POSE_SURFACE_GX, POSE_SURFACE_GY, POSE_SURFACE_GZ, POSE_SURFACE_TOL, "SURFACE" },
 };
 
 float pose_score(const canonical_pose_t *p,

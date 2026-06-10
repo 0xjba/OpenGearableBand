@@ -1,4 +1,5 @@
 #include "orientation.h"
+#include "gesture_thresholds.h"
 
 #include <math.h>
 #include <zephyr/logging/log.h>
@@ -9,17 +10,9 @@ LOG_MODULE_REGISTER(orientation, LOG_LEVEL_INF);
 #define ORI_DT          0.01f
 #define RAD2DEG         57.29578f
 
-/* Mahony gains.  TWO_KP = proportional (how fast pitch/roll lock to
- * gravity); TWO_KI = integral (gyro-bias estimation rate).  Standard
- * starting values; tune from the stationary trace if drift is high. */
-#define TWO_KP          (2.0f * 0.5f)
-#define TWO_KI          (2.0f * 0.1f)
-
-/* Stillness detection thresholds (empirical -- refine from this unit's
- * own still-vs-moving logs per the cursor spec's honesty note). */
-#define STILL_GYRO_THRESH_RPS   0.10f   /* ~5.7 deg/s total */
-#define STILL_ACC_RESID         0.80f   /* |a| within this of 9.81 m/s^2 */
-#define STILL_DWELL_SAMPLES     30      /* 300 ms of quiet -> "at rest" */
+/* Mahony gains (ORI_TWO_KP, ORI_TWO_KI) and stillness thresholds
+ * (STILL_GYRO_THRESH_RPS, STILL_ACC_RESID, STILL_DWELL_SAMPLES) come
+ * from gesture_thresholds.h. */
 
 /* Orientation quaternion (band -> world). */
 static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
@@ -147,13 +140,13 @@ void orientation_update(float ax, float ay, float az,
 
         /* Integral term tracks gyro bias (ZARU); converges hardest when
          * still (error is then pure bias, not real rotation). */
-        ifb_x += TWO_KI * ex * ORI_DT;
-        ifb_y += TWO_KI * ey * ORI_DT;
-        ifb_z += TWO_KI * ez * ORI_DT;
+        ifb_x += ORI_TWO_KI * ex * ORI_DT;
+        ifb_y += ORI_TWO_KI * ey * ORI_DT;
+        ifb_z += ORI_TWO_KI * ez * ORI_DT;
 
-        gx += ifb_x + TWO_KP * ex;
-        gy += ifb_y + TWO_KP * ey;
-        gz += ifb_z + TWO_KP * ez;
+        gx += ifb_x + ORI_TWO_KP * ex;
+        gy += ifb_y + ORI_TWO_KP * ey;
+        gz += ifb_z + ORI_TWO_KP * ez;
     }
 
     /* --- Integrate the (bias-corrected) rate into the quaternion. --- */
