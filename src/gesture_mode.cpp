@@ -188,14 +188,20 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
  *     150-180 ms; fast (in a hurry) 80-90 ms; slow/deliberate
  *     250-480 ms.
  *
- * CADENCE_MIN_MS = 150 matches the natural-double-tap floor;
- * sub-150 ms intervals are statistically unusual and likely
- * involuntary double-bumps, so rejecting them strengthens the
- * deliberate-intent filter.
+ * CADENCE_MIN_MS lowered 150 -> 60 (2026-06-10 hardware test): the
+ * textbook 150 ms floor rejected THIS user's natural double-taps,
+ * which measured 78 ms (AIR_MOUSE) and 123 ms (SURFACE) -- only the
+ * one slow 210 ms DICTATION tap passed.  Real-world grounding wins
+ * over the textbook: tune to the user's actual cadence.  60 ms is
+ * still safely above the 50 ms ringing refractory (so mechanical
+ * echoes, which fire ~14 ms after a tap, are filtered before they
+ * could be mistaken for the second tap), while comfortably
+ * accepting fast deliberate double-taps.  Per-user calibration of
+ * this window is a productionization item (F3).
  *
  * CADENCE_MAX_MS = 500 matches Apple's slowest tunable setting and
  * covers the 250-480 ms slow-deliberate range. */
-#define CADENCE_MIN_MS   150
+#define CADENCE_MIN_MS   60
 #define CADENCE_MAX_MS   500
 
 /*
