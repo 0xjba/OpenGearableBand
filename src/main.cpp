@@ -20,6 +20,7 @@
 #include "gesture_mode.h"
 #include "ble_hid.h"
 #include "cursor_pipeline.h"
+#include "cursor_track.h"
 #include "orientation.h"
 #include <zephyr/settings/settings.h>
 
@@ -69,6 +70,11 @@ K_SEM_DEFINE(dsp_process_sem, 0, 1);
 // which the power state machine (step 6) blocks on.  Binary because
 // rapid back-to-back fires (which shouldn't happen given how sig-mot
 // is designed) should not queue up wake events.
+//
+// BINARY SEM — coalescing is intentional: if the ISR fires again while the
+// semaphore is already set, k_sem_give() is a no-op, so service_chip_int1()
+// handles at most one event per wake.  Do NOT raise max-count to "fix
+// multi-tap loss" without auditing the gesture FSM's multi-tap timing first.
 K_SEM_DEFINE(motion_wake_sem, 0, 1);
 
 // Acquisition-active gate.  Set true inside start_acquisition(), cleared
@@ -199,6 +205,38 @@ static const struct bt_data sd[] = {
     BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
+/* Start (or restart) connectable advertising.  Factored out so both the
+ * initial bring-up and the post-disconnect re-advertise use identical
+ * parameters.  bt_le_adv_start returns -EALREADY if advertising is already
+ * running (benign -- e.g. a spurious double call), so that is not logged as
+ * an error. */
+static void start_advertising(void) {
+    int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad),
+                              sd, ARRAY_SIZE(sd));
+    if (err == -EALREADY) {
+        return;
+    }
+    if (err) {
+        LOG_ERR("Advertising failed to start (err %d)", err);
+        return;
+    }
+    LOG_INF("Advertising successfully started (HRS + BAS + HIDS)");
+}
+
+/* When a connection object is fully freed after a disconnect, re-arm
+ * advertising so the host can reconnect WITHOUT a device reboot.  Using the
+ * 'recycled' callback (not 'disconnected') guarantees the conn slot is free,
+ * so bt_le_adv_start won't fail with -ENOMEM.  This is the fix for "drops on
+ * supervision timeout (0x08) and then never shows up again on the host". */
+static void conn_recycled(void) {
+    LOG_INF("Connection recycled -- restarting advertising");
+    start_advertising();
+}
+
+BT_CONN_CB_DEFINE(main_conn_cb) = {
+    .recycled = conn_recycled,
+};
+
 static void bt_ready(int err) {
     if (err) {
         LOG_ERR("Bluetooth init failed (err %d)", err);
@@ -227,12 +265,7 @@ static void bt_ready(int err) {
         /* Continue anyway -- HRS still works without HID. */
     }
 
-    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-    if (err) {
-        LOG_ERR("Advertising failed to start (err %d)", err);
-        return;
-    }
-    LOG_INF("Advertising successfully started (HRS + BAS + HIDS)");
+    start_advertising();
 }
 
 // --- 100Hz Data Acquisition Thread --- //
@@ -603,6 +636,27 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // Pose-observability trace -- hold a pose, logs gravity/shadow/
             // pitch/roll to measure the roll-observability cone.
             pending_cmd = 'v';
+        } else if (c == 'u' || c == 'U') {
+            // Clear ALL stored BLE bonds.  A UF2 reflash does not erase the
+            // settings partition, so a stale bond survives and a host that
+            // re-pairs (or was "Forgotten") then mismatches keys -- the HID
+            // link fails encryption and the host drops with reason 0x13.
+            // After 'u', also Forget the device on the host, then re-pair.
+            pending_cmd = 'u';
+        } else if (c == ']') {
+            // Horizontal (X) cursor gain UP.  Per-axis because a wide screen
+            // + a roll range that differs from the pitch range need different
+            // px/deg on each axis.  Live-tune; reach = gain * wrist-range.
+            pending_cmd = ']';
+        } else if (c == '[') {
+            // Horizontal (X) cursor gain DOWN.
+            pending_cmd = '[';
+        } else if (c == '}') {
+            // Vertical (Y) cursor gain UP.
+            pending_cmd = '}';
+        } else if (c == '{') {
+            // Vertical (Y) cursor gain DOWN.
+            pending_cmd = '{';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -636,6 +690,10 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'q'=PPG quality probe (20s perfusion-index capture for wear position)");
     LOG_INF("  'z'=gyro bias trace (hold still 60s -> bias/noise per axis)");
     LOG_INF("  'v'=pose trace (hold a pose 30s -> gravity/shadow/pitch/roll)");
+    LOG_INF("  'u'=clear ALL BLE bonds (fixes reason-0x13 stale-bond drop; "
+            "then Forget on host + re-pair)");
+    LOG_INF("  ']'/'['=horizontal(X) gain up/down   "
+            "'}'/'{'=vertical(Y) gain up/down");
 
     /* Per-step cursor delta for the mouse-test injects.  10 pixels
      * per press gives a clearly visible cursor jump on the host. */
@@ -749,6 +807,38 @@ void reset_thread_entry(void *, void *, void *) {
             pending_cmd = 0;
             LOG_INF("Simulating chip double-tap event");
             gesture_mode_on_chip_double_tap();
+        } else if (cmd == 'u') {
+            pending_cmd = 0;
+            /* Wipe every stored bond.  bt_unpair with BT_ADDR_LE_ANY clears
+             * all peers for the default identity.  After this, the device
+             * has no keys, so the next host pairing starts clean -- pair
+             * fresh on the host (Forget first if it still lists the device). */
+            int unpair_err = bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+            if (unpair_err) {
+                LOG_WRN("Bond clear failed (err %d)", unpair_err);
+            } else {
+                LOG_INF("All BLE bonds cleared -- now Forget the device on "
+                        "the host and re-pair");
+            }
+        } else if (cmd == ']' || cmd == '[' || cmd == '}' || cmd == '{') {
+            pending_cmd = 0;
+            /* Per-axis multiplicative gain step.  []=horizontal(X),
+             * {}=vertical(Y).  Multiplicative so the reachable span scales
+             * smoothly; clamp each axis to a sane band. */
+            float gx, gy;
+            cursor_track_get_gain(&gx, &gy);
+            bool is_x = (cmd == ']' || cmd == '[');
+            bool is_up = (cmd == ']' || cmd == '}');
+            float factor = is_up ? 1.25f : 0.8f;
+            if (is_x) gx *= factor; else gy *= factor;
+            if (gx > 60.0f) gx = 60.0f;
+            if (gy > 60.0f) gy = 60.0f;
+            if (gx < 1.0f)  gx = 1.0f;
+            if (gy < 1.0f)  gy = 1.0f;
+            cursor_track_set_gain(gx, gy);
+            LOG_INF("Cursor gain %s %s -> X=%.1f Y=%.1f px/deg",
+                    is_x ? "X" : "Y", is_up ? "UP" : "DOWN",
+                    (double)gx, (double)gy);
         } else if (cmd == 'y') {
             pending_cmd = 0;
             LOG_INF("Simulating chip triple-tap event");
@@ -1048,6 +1138,80 @@ static void transition_to_workout(void) {
 
 // Per-state run loops --------------------------------------------------
 
+/* Demux a chip INT1 event (tap and/or sig-motion).  Factored out of run_idle
+ * so it can run in EVERY power state -- the chip tap engine must be serviced in
+ * SNAPSHOT/WORKOUT too, or gestures done during the HR snapshot are lost
+ * (see project_sig_motion_interference memory, Issue 2 / fix option 3).
+ *   handle_sigmotion: only run_idle (true) acts on sig-motion -> WORKOUT_VERIFY;
+ *     other states (false) just clear the latch (a sig-motion mid-snapshot/
+ *     workout is irrelevant -- we're already sampling).
+ * Returns true if it triggered a power-state transition (caller should return).
+ * Reads BOTH source regs regardless, so the LIR latches clear and INT1
+ * de-asserts (else the pin sticks high and the ISR never re-fires). */
+static bool service_chip_int1(bool handle_sigmotion) {
+    if (k_sem_take(&motion_wake_sem, K_NO_WAIT) != 0) {
+        return false;   // no event pending
+    }
+    uint8_t tap_src = 0, func_src1 = 0;
+    lsm6dsl_read_tap_src(&tap_src);
+    lsm6dsl_read_func_src1(&func_src1);
+
+    bool tap_fired  = (tap_src & (1U << 6)) != 0;     // TAP_IA
+    bool sigm_fired = (func_src1 & (1U << 6)) != 0;   // SIGN_MOTION_IA
+
+    if (tap_fired) {
+        char axis = (tap_src & 0x04) ? 'X' :
+                    (tap_src & 0x02) ? 'Y' :
+                    (tap_src & 0x01) ? 'Z' : '?';
+        char sign = (tap_src & 0x08) ? '-' : '+';
+        if (tap_calibration_mode) {
+            LOG_INF("[CAL] tap event: TAP_SRC=0x%02x axis=%c sign=%c "
+                    "(threshold=0x%02x ~%d mg)",
+                    tap_src, axis, sign, current_tap_ths, current_tap_ths * 62);
+        }
+        gesture_mode_bio_acoustic_on_tap();
+        gesture_mode_on_chip_single_tap(axis, sign);
+    }
+
+    if (sigm_fired && handle_sigmotion) {
+        if (gesture_mode_recent_activity()) {
+            LOG_INF("Sig-motion suppressed -- recent gesture activity "
+                    "(not a workout)");
+        } else {
+            k_sem_reset(&snapshot_tick_sem);   // ignore tick we didn't service
+            transition_to_workout_verify();
+            return true;                        // power state changed
+        }
+    }
+    /* sigm_fired && !handle_sigmotion: latch already cleared above; ignore. */
+
+    if (!tap_fired && !sigm_fired) {
+        LOG_DBG("INT1 fired but no source bit set "
+                "(TAP_SRC=0x%02x FUNC_SRC1=0x%02x)", tap_src, func_src1);
+    }
+    return false;
+}
+
+/* Sleep ~ms while promptly servicing chip taps, so the tap engine works in
+ * SNAPSHOT/WORKOUT (not just IDLE).  Wakes on motion_wake_sem and services it;
+ * otherwise returns once the full duration has elapsed.  Sig-motion is NOT
+ * acted on here (handle_sigmotion=false). */
+static void wait_servicing_taps(int64_t ms) {
+    int64_t until = k_uptime_get() + ms;
+    struct k_poll_event ev = K_POLL_EVENT_INITIALIZER(
+        K_POLL_TYPE_SEM_AVAILABLE, K_POLL_MODE_NOTIFY_ONLY, &motion_wake_sem);
+    for (;;) {
+        int64_t remain = until - k_uptime_get();
+        if (remain <= 0) return;
+        ev.state = K_POLL_STATE_NOT_READY;
+        int rc = k_poll(&ev, 1, K_MSEC(remain));
+        if (rc == 0 && ev.state == K_POLL_STATE_SEM_AVAILABLE) {
+            service_chip_int1(false);
+        }
+        /* timeout (rc == -EAGAIN): loop; the remain<=0 check returns. */
+    }
+}
+
 static void run_idle(void) {
     // Wait on either the snapshot timer or a motion wake event.  k_poll
     // lets us block on N semaphores at once; the first one signalled
@@ -1068,87 +1232,7 @@ static void run_idle(void) {
     // edge and we have to read each source register to know what
     // happened.
     if (events[1].state == K_POLL_STATE_SEM_AVAILABLE) {
-        k_sem_take(&motion_wake_sem, K_NO_WAIT);
-
-        uint8_t tap_src = 0, func_src1 = 0;
-        lsm6dsl_read_tap_src(&tap_src);
-        lsm6dsl_read_func_src1(&func_src1);
-
-        bool tap_fired = (tap_src & (1U << 6)) != 0;     // TAP_IA
-        bool sigm_fired = (func_src1 & (1U << 6)) != 0;  // SIGN_MOTION_IA
-
-        // Tap-event dispatch.  Under SINGLE_DOUBLE_TAP=0 mode the
-        // chip emits ONLY SINGLE_TAP events -- each shock that
-        // passes the chip's SHOCK+QUIET hardware debounce fires
-        // independently.  Firmware multi-tap counter in
-        // gesture_mode_on_chip_single_tap() derives double-tap
-        // (AIR_MOUSE entry) and triple-tap (SURFACE entry) from
-        // consecutive single-tap arrivals with its own ~250 ms
-        // timing window.
-        //
-        // The DOUBLE_TAP bit in TAP_SRC will never be set under
-        // SDT=0 -- we don't read it.  Reading TAP_SRC also drops
-        // the LIR latch and de-asserts INT1, freeing the chip to
-        // fire the next event.
-        //
-        // This path does NOT change power state.
-        if (tap_fired) {
-            char axis = (tap_src & 0x04) ? 'X' :
-                        (tap_src & 0x02) ? 'Y' :
-                        (tap_src & 0x01) ? 'Z' : '?';
-            char sign = (tap_src & 0x08) ? '-' : '+';
-
-            /* When calibration mode is on, dump the raw TAP_SRC byte
-             * + current threshold for empirical-tuning visibility.
-             * The gesture-mode handler will additionally log the
-             * activity-gate decision and sequence count. */
-            if (tap_calibration_mode) {
-                LOG_INF("[CAL] tap event: TAP_SRC=0x%02x axis=%c sign=%c "
-                        "(threshold=0x%02x ~%d mg)",
-                        tap_src, axis, sign,
-                        current_tap_ths,
-                        current_tap_ths * 62);
-            }
-
-            /* Snapshot the FIFO contents for bio-acoustic feature
-             * extraction.  This wakes the background worker thread
-             * which logs the classification (snap vs band-tap).
-             * Independent of the multi-tap counter path; both run
-             * for every tap event. */
-            gesture_mode_bio_acoustic_on_tap();
-
-            gesture_mode_on_chip_single_tap(axis, sign);
-        }
-
-        // Sig-motion event: standard workout-verify path.  We only
-        // honour sig-motion when it actually fired (not just because
-        // a stale wake from earlier left the semaphore set).
-        //
-        // BUT: suppress it during gesture activity.  Rapid gesture taps
-        // fire the chip's significant-motion engine, which would
-        // otherwise yank us into WORKOUT_VERIFY mid-gesture and drop the
-        // rest of the tap sequence (the dispatcher only runs in IDLE).
-        // A pose-armed or recently-tapped state means "this is a
-        // gesture, not exercise" -- stay in IDLE.  Reading FUNC_SRC1
-        // above already cleared the sig-motion latch, so no re-fire.
-        if (sigm_fired) {
-            if (gesture_mode_recent_activity()) {
-                LOG_INF("Sig-motion suppressed -- recent gesture activity "
-                        "(not a workout)");
-            } else {
-                k_sem_reset(&snapshot_tick_sem);  // ignore tick we didn't service
-                transition_to_workout_verify();
-                return;
-            }
-        }
-
-        // Neither bit set: stale signal, just stay in IDLE and let
-        // the poll loop re-arm.
-        if (!tap_fired && !sigm_fired) {
-            LOG_DBG("INT1 fired but no source bit set "
-                    "(TAP_SRC=0x%02x FUNC_SRC1=0x%02x)",
-                    tap_src, func_src1);
-        }
+        service_chip_int1(true);   // taps + guarded sig-motion; may transition
         return;
     }
     if (events[0].state == K_POLL_STATE_SEM_AVAILABLE) {
@@ -1173,7 +1257,7 @@ static void run_snapshot(void) {
     uint32_t not_worn_streak = 0;
 
     while (k_uptime_get() < deadline) {
-        k_sleep(K_MSEC(500));
+        wait_servicing_taps(500);
         uint32_t seq_now = atomic_get(&latest_window_seq);
         if (seq_now == seq_last) continue;
         seq_last = seq_now;
@@ -1210,7 +1294,7 @@ static void run_workout_verify(void) {
     uint32_t not_worn_streak = 0;
 
     while (k_uptime_get() < deadline) {
-        k_sleep(K_MSEC(500));
+        wait_servicing_taps(500);
         uint32_t seq_now = atomic_get(&latest_window_seq);
         if (seq_now == seq_last) continue;
         seq_last = seq_now;
@@ -1266,7 +1350,7 @@ static void run_workout(void) {
     uint32_t seq_last = atomic_get(&latest_window_seq);
 
     while (1) {
-        k_sleep(K_MSEC(500));
+        wait_servicing_taps(500);
         uint32_t seq_now = atomic_get(&latest_window_seq);
         if (seq_now == seq_last) continue;
         seq_last = seq_now;
@@ -1316,6 +1400,9 @@ static void run_ppg_probe(void) {
 
     int64_t deadline = k_uptime_get() + PPG_PROBE_DURATION_MS;
     while (k_uptime_get() < deadline) {
+        // Intentional plain k_sleep — NOT wait_servicing_taps.  The PPG probe
+        // is a manual 20 s diagnostic; we deliberately do not service chip taps
+        // here so a stray tap cannot dispatch a gesture or enter a mode mid-probe.
         k_sleep(K_MSEC(250));
     }
 
@@ -1410,7 +1497,8 @@ int main(void) {
     // Enable the chip-embedded tap engine.  Tap stays on for the whole
     // device lifetime -- it shares INT1 with sig-motion (routed via
     // MD1_CFG vs INT1_CTRL respectively, no register conflict), and
-    // the dispatcher in run_idle() demuxes which event source fired.
+    // service_chip_int1() demuxes which event source fired; it is called
+    // from all power states (IDLE, SNAPSHOT, WORKOUT), not just run_idle().
     //
     // Initial TAP_THS = 0x08 (~500 mg at FS=±2g): a moderate threshold
     // we'll tune empirically via calibration mode in a later stage.
