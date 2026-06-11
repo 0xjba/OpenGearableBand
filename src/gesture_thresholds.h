@@ -110,10 +110,15 @@
  * exceeds this * |gz| -- "arm up, not flat", IGNORING the gy SWEEP axis so a
  * wide air-mouse reach (gy large at the extremes) stays raised instead of
  * flapping to NEUTRAL (the 2026-06-11 sweep bug).  Part of the unified
- * gravity-component geometry (observability doc 3.5).  EMPIRICAL: observed
- * min gx/|gz| across the raised sweep ~1.31, so 1.1 leaves margin; refine
- * against cross-session adversarial traces.  Regression test: 2026-06-11
- * sweep log -> 0 UP_RAISED<->NEUTRAL transitions.  [USER] */
+ * gravity-component geometry (docs/research/observability-aware-pose-and-
+ * cursor-design.md section 3.5).
+ * EMPIRICAL: threshold = 1.1.  The observed MIN gx/|gz| across the raised
+ * sweep was ~1.31 -- i.e. the sweep stays ~0.21 ABOVE the threshold; that gap
+ * is the margin before a valid raised sweep would be clipped to not-raised.
+ * Tune DOWNWARD only, against cross-session adversarial traces.  It is softer
+ * than DOMINANCE_RATIO (1.3) on purpose: gy is already excluded here, so the
+ * single gx-vs-|gz| test is geometrically tighter than the two-axis FLAT
+ * check.  Regression test: 2026-06-11 sweep log -> 0 UP_RAISED<->NEUTRAL. [USER] */
 #define RAISED_ELEVATION_RATIO          1.1f
 
 /* ---------------------------------------------------------------------------

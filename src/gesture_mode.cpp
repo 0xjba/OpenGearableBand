@@ -425,12 +425,15 @@ static const char *_orientation_str(WristOrientation o)
 
 static WristOrientation _classify_orientation(float gx, float gy, float gz)
 {
-    /* Unified gravity-component geometry (observability-aware-pose-and-
-     * cursor-design.md 3.5): gx = forearm elevation, gy = left-right SWEEP
-     * axis, gz = volar-normal.  RAISED ignores gy so a wide air-mouse sweep
-     * (gy large at the extremes) stays UP_RAISED instead of flapping to
-     * NEUTRAL.  Thresholds are empirical (regression test: the 2026-06-11
-     * left-right sweep must produce 0 UP_RAISED<->NEUTRAL transitions). */
+    /* Unified gravity-component geometry (docs/research/observability-aware-
+     * pose-and-cursor-design.md section 3.5): gx = forearm elevation, gy =
+     * left-right SWEEP axis, gz = volar-normal.  RAISED ignores gy so a wide
+     * air-mouse sweep (gy large at the extremes) stays UP_RAISED instead of
+     * flapping to NEUTRAL.  (gy is unbounded in the RAISED test on purpose:
+     * a large gy with gx > |gz| is physically unreachable in the volar-radial
+     * wrist mount -- revisit if the mount orientation changes.)  Thresholds
+     * are empirical (regression test: the 2026-06-11 left-right sweep must
+     * produce 0 UP_RAISED<->NEUTRAL transitions). */
 
     /* RAISED: forearm up and clearly above flat (gx dominates |gz|). */
     if (gx > 0.0f && gx > RAISED_ELEVATION_RATIO * fabsf(gz)) {
