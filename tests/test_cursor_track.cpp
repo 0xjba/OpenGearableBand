@@ -92,6 +92,23 @@ int main(void)
     /* restore default gain for any later tests */
     cursor_track_set_gain(CURSOR_GAIN_X, CURSOR_GAIN_Y);
 
+    /* --- Entry calibration (Task 4) --- */
+
+    /* C1: a normal raised entry captures vert_top live. */
+    cursor_track_start(14.0f, 50.0f);
+    CHECK(fabsf(cursor_track_vert_top() - 14.0f) < 1e-3f);
+
+    /* C2: a lazy half-raise (vert above the max) is rejected -> falls back to
+     * the last good capture (14 from C1), NOT the bad 35. */
+    cursor_track_start(35.0f, 50.0f);
+    CHECK(fabsf(cursor_track_vert_top() - 14.0f) < 1e-3f);
+
+    /* C3: a fresh good capture updates the last-good. */
+    cursor_track_start(17.0f, 50.0f);
+    CHECK(fabsf(cursor_track_vert_top() - 17.0f) < 1e-3f);
+    cursor_track_start(40.0f, 50.0f);            /* lazy again */
+    CHECK(fabsf(cursor_track_vert_top() - 17.0f) < 1e-3f);  /* falls back to 17 */
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }
