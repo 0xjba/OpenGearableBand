@@ -232,3 +232,111 @@ are **unchanged** — X stays relative.
 - True absolute HID (digitizer) — the rung above this; needs a separate
   "search-and-confirm how macOS treats a BLE digitizer" pass first.
 - Host-side servo, clicks, SURFACE cursor, the tap-entry power-state fix.
+
+---
+
+# Amendment A (2026-06-11): fixed top anchor, expanded range, desk-settle exit
+
+Supersedes §4 (option-A entry-capture) and the implicit "leave UP_RAISED" exit.
+Decided with the user after the first absolute-Y build. SURFACE mode is parked
+(needs an optical sensor); we salvage its stillness/contact detection for the
+exit here.
+
+## A.1 Fixed top anchor (supersedes §4 option A)
+
+`vert_top` is now a **fixed constant** `CURSOR_VERT_TOP_DEG = 12°`, NOT captured
+at entry.
+- **Why fixed:** maximum cross-session determinism — a given inclination maps to
+  the same screen height *every* session. Removes the entry-capture, the
+  lazy-raise sanity clamp, and the last-good fallback (§4.1–4.3 no longer apply).
+- **Why 12°, not nearer vertical:** the Y signal `acos(|gx|/|g|)` amplifies
+  accelerometer noise ~`1/sin(vert)` as the forearm approaches vertical — ~11× at
+  5°, ~5× at 12°, ~1× at flat. 12° keeps screen-top out of the jitter zone while
+  using almost the full range. `[USER][HOUSING]`, tunable.
+- **Mount caveat (the cost of "fixed"):** fixed angles assume the forearm-axis
+  mounting is consistent. After a re-tape / housing change the absolute mapping
+  shifts — re-check `CURSOR_VERT_TOP_DEG`. The former §4.1 cross-session check
+  becomes the recalibration trigger.
+- `cursor_track_start` no longer captures the anchor (it still triggers the entry
+  slam). The raised entry pose (~vert 14) maps to a hair below screen-top.
+
+## A.2 Expanded range (supersedes the §8 span/bottom values)
+
+- `CURSOR_VERT_SPAN_DEG` 40 → **70** → bottom anchor ≈ `vert 82` (~8° gap from
+  flat).
+- `CURSOR_VERT_BOTTOM_MAX` 60 → **85**.
+- Effect: the full near-vertical→near-flat range maps to the screen; **lower
+  per-degree sensitivity** (finer control), NOT more reach (the absolute map
+  already covers the screen). `max_counts = GAIN_Y × 70`; retune `GAIN_Y` on HW.
+
+## A.3 Desk-settle exit (replaces the leave-UP_RAISED exit — AIR_MOUSE only)
+
+The current AIR_MOUSE exit fires when orientation leaves `UP_RAISED` (~vert 55,
+gesture_mode.cpp:909–928). That must go — it would disengage before the user
+reaches the expanded bottom. Replace it (for AIR_MOUSE; leave SURFACE's path
+intact) with a **dual-trigger exit, active only in the near-flat bottom zone.**
+
+- **Near-flat zone:** `gx_filt < CURSOR_DESK_ZONE_GX` (≈ 1.7 m/s², i.e.
+  `vert > ~80°`). The exit detection only runs here.
+- **(a) DESK PRESENT — volar contact.** A desk physically blocks the forearm at
+  flat (`gx ≈ 0`, cannot rotate past). Detect placement by an **impact
+  transient** — the already-computed motion residual `r_mag` (accel − gravity,
+  gesture_mode.cpp:795–798) spiking above `CURSOR_IMPACT_THRESH` while near-flat
+  — **followed by a stillness settle** (`samples_since_activity ≥
+  CURSOR_SETTLE_DWELL`). Impact distinguishes a *placement* from a near-flat
+  hover/click. `CURSOR_IMPACT_THRESH` is **HW-tuned from the first desk-landing
+  trace** (A.4); until tuned, trigger (b) carries the feature.
+- **(b) DESK ABSENT — past the plane.** With no desk, the forearm rotates **past
+  horizontal** (hand drops below elbow): signed `gx_filt` crosses below
+  `CURSOR_PAST_PLANE_GX` (≈ −1.0 m/s², clearly drooping, with hysteresis) for a
+  short dwell → exit. A desk rest sits near `gx ≈ 0 > −1.0`, so (b) does **not**
+  fire when resting flat on a desk — it is strictly the no-desk path.
+  - NOTE: the cursor `vert` uses `|gx|` so it folds at horizontal and cannot see
+    "past the plane"; the **signed** `gx_filt` can. Exiting at the crossing also
+    avoids the `acos` fold-back artifact in the cursor.
+- **Hover-to-point at the bottom** (`0 < gx_filt < 1.7`, no impact, not past the
+  plane) → **stays engaged**, cursor clamped at screen-bottom. This is the
+  false-positive the dual trigger avoids — neither a stillness-only nor an
+  angle-only exit could.
+- **Re-engage:** raising back to `UP_RAISED` within the cooldown re-engages
+  (existing cooldown re-engage, gesture_mode.cpp:822–849, unchanged).
+- **Entry unchanged:** still requires the raised pose + double-tap; entry-grace
+  timeout unchanged. Only the *exit* changes.
+
+## A.4 Telemetry for the HW tuning (gates A.3a)
+
+While in the near-flat zone, log `r_mag`, `gx_filt`, `samples_since_activity`,
+and which trigger fired. The first deliberate desk-landing trace sets
+`CURSOR_IMPACT_THRESH` and confirms `CURSOR_SETTLE_DWELL`. Do NOT hardcode the
+impact threshold blind — measure it (verify-first).
+
+## A.5 Constants (gesture_thresholds.h)
+
+| Constant | Value | Tag | Notes |
+|---|---|---|---|
+| `CURSOR_VERT_TOP_DEG` | `12.0f` | `[USER][HOUSING]` | fixed top anchor (deg-from-vertical) |
+| `CURSOR_VERT_SPAN_DEG` | `70.0f` | `[USER]` | was 40 |
+| `CURSOR_VERT_BOTTOM_MAX` | `85.0f` | `[USER]` | was 60 |
+| `CURSOR_DESK_ZONE_GX` | `1.7f` | `[USER]` | near-flat zone: gx below this (m/s²) |
+| `CURSOR_PAST_PLANE_GX` | `-1.0f` | `[USER]` | (b) no-desk exit: gx below this |
+| `CURSOR_PAST_PLANE_DWELL` | `15` | `[USER]` | samples gx must stay past-plane |
+| `CURSOR_IMPACT_THRESH` | HW-tuned (seed `6.0f`) | `[HOUSING]` | (a) accel-residual spike (m/s²) |
+| `CURSOR_SETTLE_DWELL` | `40` | `[USER]` | post-impact stillness samples (~400 ms) |
+
+REMOVE (obsolete under fixed anchor): `CURSOR_VERT_TOP_DEFAULT`,
+`CURSOR_VERT_TOP_MAX`.
+
+## A.6 cursor_track changes (host-testable)
+
+- `s_vert_top` becomes a fixed constant (`= CURSOR_VERT_TOP_DEG`); drop
+  `s_vert_top_good` and the capture/clamp/fallback in `cursor_track_start`
+  (start still arms the entry slam + seeds roll; its `vert` arg is no longer used
+  for the anchor). `cursor_track_vert_top()` returns the constant.
+- Remove the Task-4 calibration tests (C1–C3); replace with a test that
+  `cursor_track_vert_top() == CURSOR_VERT_TOP_DEG` regardless of entry vert, and
+  that the map/servo/slam/re-pin still behave (with the new span/anchor numbers).
+
+## A.7 Out of scope (this amendment)
+- `CURSOR_IMPACT_THRESH` final value (HW-tuned next session from A.4 trace).
+- Any SURFACE-mode revival (parked pending optical sensor).
+- Absolute-X, clicks, the tap-entry power-state fix (still deferred).
