@@ -85,6 +85,13 @@ Why each amendment:
   orientation classifier). Two thresholds (invalidate < 3.5, revalidate >
   4.5) latch the state; the every-tick `prev` re-sync guarantees no jump on
   re-entry. `BUILD_ASSERT(REVALIDATE >= INVALIDATE)`.
+  - **MANDATORY:** `shadow` MUST be computed from the **gravity-LPF
+    components** (`gx/gy/gz_filt`), NEVER from the fused quaternion. Inside
+    the cone the fused roll is carried by **gyro alone** (gravity can't
+    correct it there), so it looks plausible while slowly drifting — the
+    gate's whole job is to detect exactly that, which requires the raw
+    gravity signal. Do NOT "simplify" the gate later to a quaternion-derived
+    value; that silently defeats it.
 - **(3b) Asymmetric freeze** — `at_rest` engages slowly (its dwell, fine for
   parking) and releases immediately, but only above 5.7 °/s gyro; the per-
   tick `ang_speed` release (a smaller angle/tick) un-freezes on *slow*
@@ -107,13 +114,29 @@ right" and flip a sign if inverted.
 | `CURSOR_GAIN_X` | `8.0f` | roll Δdeg → px (signed; flip on HW if inverted) |
 | `CURSOR_ROLL_SHADOW_INVALIDATE` | `3.5f` | gate X off below this shadow |
 | `CURSOR_ROLL_SHADOW_REVALIDATE` | `4.5f` | re-enable X above this (hysteresis) |
-| `CURSOR_FREEZE_RELEASE_DELTA` | `0.15f` | per-tick \|Δangle\| (deg) that un-freezes |
+| `CURSOR_FREEZE_RELEASE_DELTA` | `0.05f` | per-tick \|Δangle\| (deg) that un-freezes |
 | `CURSOR_MAX_DELTA_DEG` | `30.0f` | discard Δ above this (wrap/glitch guard) |
 
-Initial values are starting points, tuned on hardware (per-mount). `GAIN`
-8.0 px/deg gives a brisk response (a ~1–3°/tick twist → ~8–24 px/tick at
-125 Hz); `FREEZE_RELEASE_DELTA` 0.15°/tick sits above the angle-noise floor
-(~0.05°/tick) so noise can't un-freeze, but any real move does.
+Initial values are starting points, tuned on hardware (per-mount). Two of
+them carry design implications, not just feel:
+
+- **`CURSOR_GAIN` ≈ reachable span.** In relative mode without a clutch,
+  `gain × usable-angle-range` is the total cursor travel. The sweep data
+  shows ~80° of usable twist, so 8 px/deg = ~640 px ≈ ⅓ of a 1080p width.
+  **Expect the first tuning session to roughly triple it (→ 20–25 px/deg),
+  which also amplifies tremor** — at which point the speed-dependent gain
+  curve (deferred) likely becomes necessary. Start at 8 only to confirm
+  direction + stability; don't expect it to be the final value.
+- **`CURSOR_FREEZE_RELEASE_DELTA` chooses precision vs ratchet.** At 100 Hz,
+  0.05°/tick ≈ 5°/s. Deliberate precision pointing is *slow* (a few °/s), so
+  a high threshold (e.g. the earlier 0.15 = 15°/s) would freeze the cursor
+  exactly when you're being careful. **Start LOW — just above the measured
+  per-tick \|Δangle\| noise of the still-pose traces** (so noise can't
+  un-freeze, but slow precise moves do). A *high* threshold would give a free
+  "ratchet" (twist back slowly below threshold without moving the cursor — a
+  clutch for the limited range), but **do NOT smuggle a clutch in through the
+  freeze gate**; if the limited range bites, add a deliberate ratchet gesture
+  later. Tighten this value from a still-pose noise measurement during tuning.
 
 (Shadow thresholds bracket the measured cone: vert 15 → shadow 2.4 invalid,
 vert 31 → shadow 5.0 valid. Gains/freeze tuned on feel; per-mount.)
@@ -138,9 +161,16 @@ Tune `GAIN_X/Y`, the shadow pair, and `FREEZE_RELEASE_DELTA` on feel.
 
 ## 7. Future (v2+, explicitly NOT now)
 - **Lag:** v1 deltas inherit the orientation filter's Mahony lag (~10° seen
-  during the fast sweep). If fast moves feel swimmy, the fix is **gyro-rate
-  deltas corrected by gravity (complementary)** — NOT cranking the gains
-  against a lag problem. Do not tune gains to mask lag.
+  during the fast sweep). If fast moves feel swimmy, do NOT crank gains to
+  mask it. The fix is mostly *inside the existing filter*, not a new
+  architecture: Mahony is already gyro-driven with gravity correction, so the
+  lag is a function of its correction gain — the likely fix is **tune Mahony
+  Kp** (or feed `dx/dy` directly from the gyro rates, which the filter is
+  already integrating). A separate "gyro-rate complementary" subsystem is
+  largely redundant with what `orientation.cpp` already does.
+- **Speed-dependent gain curve:** once the linear gain is tripled to reach
+  full-screen travel (see §4), tremor amplifies with it — the acceleration
+  curve (small moves precise, fast moves far) likely becomes necessary then.
 - Clicking (the in-session tap-while-moving problem,
   `finding_tap_while_moving_2026_06_11`), scroll/right-click, SURFACE cursor,
   absolute/laser-pointer mode, per-user gain calibration.
