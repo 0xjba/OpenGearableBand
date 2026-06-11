@@ -8,6 +8,14 @@
 
 LOG_MODULE_REGISTER(cursor, LOG_LEVEL_INF);
 
+/* Absolute-Y cursor (cursor_track) keeps its own position estimate in
+ * emitted-count units and assumes 1 emitted count == 1 cursor count.  So
+ * CURSOR_SENSITIVITY must stay 1.0 -- retune vertical reach via CURSOR_GAIN_Y,
+ * never sensitivity, or the band's Y position estimate silently diverges from
+ * the host cursor.  (X is relative and tolerant of sensitivity changes.) */
+BUILD_ASSERT(CURSOR_SENSITIVITY == 1.0f,
+             "absolute-Y requires CURSOR_SENSITIVITY == 1.0 (tune GAIN_Y instead)");
+
 /*
  * --- Shared state ----------------------------------------------------
  *

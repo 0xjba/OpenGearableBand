@@ -176,6 +176,15 @@ int main(void)
     cursor_track_update(30.0f, 50.0f, true, V, &dx, &dy);
     CHECK(dy > 0.0f);
 
+    /* M5: once clamped at the bottom (max_counts), a further-down vert holds
+     * (dy 0) -- the cursor parks at the bottom edge, not jitter. */
+    cursor_track_start(15.0f, 50.0f);
+    drain_slam(15.0f, 50.0f);
+    for (int i = 0; i < 25; i++) cursor_track_update(90.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(cursor_track_cur_y() - 1200.0f) < 1e-3f);   /* clamped */
+    cursor_track_update(95.0f, 50.0f, false, V, &dx, &dy);  /* even further down */
+    CHECK(fabsf(dy) < 1e-3f);                                /* parks, no motion */
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }

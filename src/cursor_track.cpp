@@ -28,6 +28,7 @@ static bool  s_started        = false;
 static float s_vert_top       = CURSOR_VERT_TOP_DEFAULT; /* top anchor (deg)        */
 static float s_vert_top_good  = CURSOR_VERT_TOP_DEFAULT; /* RAM last-good fallback  */
 static float s_cur_y          = 0.0f;                    /* counts from top         */
+static float s_target_counts  = 0.0f;                    /* last servo target, counts from top */
 static int   s_slam_remaining = 0;                       /* >0 => slamming          */
 static int   s_slam_sign      = -1;                      /* -1 up(top), +1 down     */
 static bool  s_at_top         = false;                   /* re-pin hysteresis latch */
@@ -87,7 +88,14 @@ static float target_counts(float vert_deg)
 
 /* Arm a slam burst.  sign -1 => up (to top), +1 => down (to bottom).  Size is a
  * GAIN_Y-independent floor max'd with margin*max_counts so it reaches the edge
- * even untuned; over-travel is harmless (OS clamps). */
+ * even untuned; over-travel is harmless (OS clamps).
+ * NOTE: cursor_pipeline drains pending_dy at <=127 counts per publish tick
+ * (CURSOR_PUBLISH_HZ), so an N-report slam reaches the host over ~N publish
+ * ticks -- a visible crawl to the edge, not an instant snap, and s_cur_y is
+ * zeroed (here) before the host cursor finishes moving.  The over-travel
+ * margin (SLAM_MARGIN/FLOOR) guarantees the final OS edge-clamp regardless, so
+ * the transient decouple self-reconciles.  "Cursor crawls to top on entry" is
+ * EXPECTED, not a regression. */
 static void start_slam(int sign)
 {
     float counts = CURSOR_SLAM_MARGIN * max_counts();
@@ -142,10 +150,17 @@ void cursor_track_update(float vert_deg, float roll_deg, bool at_rest,
         dy = (float)(s_slam_sign * 127);   /* emit ONLY the slam burst */
         s_slam_remaining--;
         if (s_slam_remaining == 0) {
-            s_cur_y = (s_slam_sign < 0) ? 0.0f : max_counts();  /* pinned at edge */
+            /* s_slam_sign < 0: slam to top -> pin at 0.
+             * s_slam_sign > 0: slam to bottom -> pin at max_counts().
+             * The +1 (down) path and max_counts() pin are currently
+             * unexercised -- reserved for the spec §7 bottom-re-pin
+             * upgrade.  Every current caller of start_slam() uses -1. */
+            s_cur_y = (s_slam_sign < 0) ? 0.0f : max_counts();
         }
     } else {
-        float err = target_counts(vert_deg) - s_cur_y;
+        float target = target_counts(vert_deg);
+        s_target_counts = target;
+        float err = target - s_cur_y;
         if (err >  127.0f) err =  127.0f;
         if (err < -127.0f) err = -127.0f;
         dy = err;
@@ -169,9 +184,10 @@ void cursor_track_update(float vert_deg, float roll_deg, bool at_rest,
     s_prev_roll = roll_deg;
 }
 
-bool  cursor_track_is_slamming(void) { return s_slam_remaining > 0; }
-float cursor_track_cur_y(void)       { return s_cur_y; }
-float cursor_track_vert_top(void)    { return s_vert_top; }
+bool  cursor_track_is_slamming(void)     { return s_slam_remaining > 0; }
+float cursor_track_cur_y(void)           { return s_cur_y; }
+float cursor_track_target_counts(void)   { return s_target_counts; }
+float cursor_track_vert_top(void)        { return s_vert_top; }
 
 void cursor_track_stop(void)
 {

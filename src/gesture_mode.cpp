@@ -1018,10 +1018,11 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
         static int cursor_tel_ctr = 0;
         if ((dx != 0.0f || dy != 0.0f || cursor_track_is_slamming()) &&
             (++cursor_tel_ctr % 10 == 0)) {
-            LOG_INF("[CURSOR] vert=%d vtop=%d cur_y=%d slam=%d roll=%d "
+            LOG_INF("[CURSOR] vert=%d vtop=%d cur_y=%d target=%d slam=%d roll=%d "
                     "shadow=%d dx=%d dy=%d",
                     (int)vert, (int)cursor_track_vert_top(),
-                    (int)cursor_track_cur_y(), (int)cursor_track_is_slamming(),
+                    (int)cursor_track_cur_y(), (int)cursor_track_target_counts(),
+                    (int)cursor_track_is_slamming(),
                     (int)ori.roll_deg, (int)shadow, (int)dx, (int)dy);
         }
     }

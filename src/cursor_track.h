@@ -50,8 +50,9 @@ void  cursor_track_get_gain(float *gain_x, float *gain_y);
 
 /* Introspection for telemetry + host tests. */
 bool  cursor_track_is_slamming(void);
-float cursor_track_cur_y(void);       /* Y position estimate, counts from top  */
-float cursor_track_vert_top(void);    /* captured top anchor (deg)             */
+float cursor_track_cur_y(void);           /* Y position estimate, counts from top  */
+float cursor_track_target_counts(void);   /* servo target, counts from top         */
+float cursor_track_vert_top(void);        /* captured top anchor (deg)             */
 
 #ifdef __cplusplus
 }
