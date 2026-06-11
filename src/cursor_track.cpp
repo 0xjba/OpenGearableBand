@@ -6,6 +6,12 @@
 static_assert(CURSOR_ROLL_SHADOW_REVALIDATE >= CURSOR_ROLL_SHADOW_INVALIDATE,
               "CURSOR_ROLL_SHADOW_REVALIDATE must be >= INVALIDATE (cone-gate hysteresis)");
 
+/* Threading: cursor_track_start/stop run in transition context (workqueue /
+ * power thread); cursor_track_update runs in acq_thread.  These statics are
+ * unsynchronised on purpose -- the worst race is one harmless zero-inject
+ * (the s_started guard + cursor_pipeline's own mode gate are a double guard,
+ * so no stale value reaches the host).  Revisit if cursor_track gains
+ * additional state (e.g. a smoothing filter or click-hold). */
 static float s_prev_pitch = 0.0f;
 static float s_prev_roll  = 0.0f;
 static bool  s_roll_valid = false;
