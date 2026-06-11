@@ -760,7 +760,7 @@ static void pose_trace_tick(void)
             "pitch=%.0f roll=%.0f at_rest=%d",
             (double)gx_filt, (double)gy_filt, (double)gz_filt,
             (double)shadow, (double)vert,
-            (double)ori.pitch_deg, (double)ori.roll_deg, ori.at_rest);
+            (double)ori.pitch_deg, (double)ori.roll_deg, (int)ori.at_rest);
 }
 
 void gesture_mode_update_accel(float ax, float ay, float az)
