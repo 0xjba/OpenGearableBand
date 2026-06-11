@@ -66,6 +66,48 @@ This single geometric parameter serves **both** subsystems:
 
 One concept, one threshold (lives in `gesture_thresholds.h`), whole product.
 
+## 3.5 Unified gravity-component geometry (ONE model — no parallel definitions)
+
+All pose geometry derives from the **same gravity-LPF vector**
+`(gx, gy, gz)` (the `gx_filt/gy_filt/gz_filt` 1-pole IIR), in the band
+frame. Every zone below is a test on these *same* components — there must
+not be a second, independent pose-geometry definition that can drift from
+this one. The axis roles:
+
+- **gx** — forearm axis → **elevation** (how raised the arm is).
+- **gy** — left-right / cross axis → the **SWEEP axis** (an air-mouse
+  drag across a screen swings gy large at the extremes).
+- **gz** — volar-normal (palm side) → **supination** (sign = palm past
+  edge-on toward the face).
+
+Derived zones, all on `(gx, gy, gz)`:
+
+1. **Raised (coarse orientation `UP_RAISED`):** `gx > 0` AND
+   `gx > RAISED_ELEVATION_RATIO · |gz|`. **gy is deliberately ignored** —
+   it is the sweep axis, so a wide air-mouse reach (gy large at the
+   extreme, e.g. `g=(6.0, 6.8, 0.3)`) must stay raised, not flip to
+   NEUTRAL. This replaces the old single-axis-dominance classifier whose
+   Y-dominance→NEUTRAL caused the sweep flapping (2026-06-11). `DOWN_FLAT`
+   = `gz > 0` AND `gz` dominates both `|gx|` and `|gy|`; else `NEUTRAL`.
+2. **Roll-observability cone:** the Y-Z shadow `|(gy,gz)| = √(gy²+gz²)`
+   = how far the forearm is from vertical. Small shadow → forearm near
+   vertical → roll unobservable. Used for the cursor's roll→X axis.
+3. **Supination / gz-sign:** `gz < −ε` = palm flipped past vertical (the
+   would-be dictation signal). Pose-only CANNOT discriminate air-mouse
+   from dictation (the max-right overlap, §8b), so this never decides the
+   mode — the gesture does. Documented here so the signal isn't re-used
+   as a discriminator.
+
+**Empirical thresholds, not designed:** `RAISED_ELEVATION_RATIO`, the cone
+threshold, and `ε` are all calibrated from the trace data + the adversarial
+sessions (sweeps, fast flicks, re-mounted band, different days), never
+midpoint arithmetic — same discipline as every other threshold. The
+**named regression test for `RAISED_ELEVATION_RATIO` is the 2026-06-11
+left-right sweep log**: the fix is proven when that exact trace produces
+**zero** `UP_RAISED↔NEUTRAL` transitions. Initial value ~1.1 (the observed
+min `gx/|gz|` across the raised sweep was ~1.31, so 1.1 leaves margin);
+refine against the cross-session traces.
+
 ## 4. Pose classifier plan (observability-aware) — to implement after measuring
 
 1. **Roll-validity mask (A1).** Forearm within the cone of vertical → roll

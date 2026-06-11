@@ -209,6 +209,89 @@ See 2026-06-11-pose-trigger-realignment spec."
 
 ---
 
+### Task 2b: Redefine the raised-zone (the real flapping fix)
+
+Task 2's asymmetric dwell FAILED hardware verification (a wide air-mouse
+sweep dwells ~0.8 s+ at each Y-dominant extreme — ~20 `UP_RAISED↔NEUTRAL`
+transitions in 30 s). Root cause: `_classify_orientation` maps the
+Y-dominant far-reach to NEUTRAL. Fix = redefine the raised-zone on the
+unified gravity geometry (observability doc §3.5), ignoring the gy sweep
+axis. The Task 2 dwell stays (harmless transient-rejection).
+
+**Files:**
+- Modify: `src/gesture_thresholds.h` (add `RAISED_ELEVATION_RATIO`)
+- Modify: `src/gesture_mode.cpp` (`_classify_orientation` body)
+
+- [ ] **Step 1: Add the elevation ratio constant**
+
+In `src/gesture_thresholds.h`, right after `#define DOMINANCE_RATIO 1.3f`, add:
+
+```c
+/* Raised-zone elevation ratio: UP_RAISED when gx (forearm axis, positive)
+ * exceeds this * |gz| -- "arm up, not flat", IGNORING the gy SWEEP axis so a
+ * wide air-mouse reach (gy large at the extremes) stays raised instead of
+ * flapping to NEUTRAL (the 2026-06-11 sweep bug).  Part of the unified
+ * gravity-component geometry (observability doc §3.5).  EMPIRICAL: observed
+ * min gx/|gz| across the raised sweep ~1.31, so 1.1 leaves margin; refine
+ * against cross-session adversarial traces.  Regression test: 2026-06-11
+ * sweep log -> 0 UP_RAISED<->NEUTRAL transitions.  [USER] */
+#define RAISED_ELEVATION_RATIO          1.1f
+```
+
+- [ ] **Step 2: Replace the `_classify_orientation` body**
+
+In `src/gesture_mode.cpp`, replace the ENTIRE body of `_classify_orientation`
+(the `fabsf` magnitudes, the largest-axis sort, the `DOMINANCE_RATIO` neutral
+gate, and the `switch (largest_axis)`) with:
+
+```c
+static WristOrientation _classify_orientation(float gx, float gy, float gz)
+{
+    /* Unified gravity-component geometry (observability-aware-pose-and-
+     * cursor-design.md §3.5): gx = forearm elevation, gy = left-right SWEEP
+     * axis, gz = volar-normal.  RAISED ignores gy so a wide air-mouse sweep
+     * (gy large at the extremes) stays UP_RAISED instead of flapping to
+     * NEUTRAL.  Thresholds are empirical (regression test: the 2026-06-11
+     * left-right sweep must produce 0 UP_RAISED<->NEUTRAL transitions). */
+
+    /* RAISED: forearm up and clearly above flat (gx dominates |gz|). */
+    if (gx > 0.0f && gx > RAISED_ELEVATION_RATIO * fabsf(gz)) {
+        return WRIST_UP_RAISED;
+    }
+
+    /* FLAT: volar-normal up and dominant over BOTH other axes. */
+    if (gz > 0.0f &&
+        gz > DOMINANCE_RATIO * fabsf(gx) &&
+        gz > DOMINANCE_RATIO * fabsf(gy)) {
+        return WRIST_DOWN_FLAT;
+    }
+
+    return WRIST_NEUTRAL;
+}
+```
+
+Keep the function signature and everything outside the body unchanged. The
+old per-axis comment block (the "Empirical mapping from field calibration"
+narrative) is replaced by the new comment above.
+
+- [ ] **Step 3: Build** — clean compile, FLASH ~46%. `RAISED_ELEVATION_RATIO`
+  resolves; `DOMINANCE_RATIO` still used (FLAT); `fabsf` from `<math.h>` (already included).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/gesture_mode.cpp src/gesture_thresholds.h
+git commit -m "fix: redefine raised-zone on unified gravity geometry (kills sweep flapping)
+
+UP_RAISED = gx>0 & gx>RAISED_ELEVATION_RATIO*|gz| (forearm up, not flat),
+ignoring the gy SWEEP axis -- a wide air-mouse reach (gy-dominant at the
+extreme) no longer flips to NEUTRAL. Replaces the failed asymmetric-dwell
+approach. Same gx/gy/gz signals as the cone/gz-sign (one geometric model,
+observability doc 3.5). RAISED_ELEVATION_RATIO is empirical; regression test
+is the 2026-06-11 sweep -> 0 transitions.
+See 2026-06-11-pose-trigger-realignment spec 3.2."
+```
+
 ### Task 3: Hardware verification (the real test)
 
 **Files:** none (flash + observe).

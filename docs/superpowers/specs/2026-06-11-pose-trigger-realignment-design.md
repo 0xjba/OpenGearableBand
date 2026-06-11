@@ -58,14 +58,34 @@ dictation, but the gestures (taps vs clench+voice) trivially do.
 - `POSE_DICTATION` canonical stays disabled (tol 2.0) — it is never armed
   by gravity; dictation entry is future via clench+voice, not a pose cone.
 
-### 3.2 Orientation-classifier hysteresis (fix the flapping)
-- `_classify_orientation()` / its dwell logic: add **sticky-state
-  hysteresis** — once a wrist orientation is committed, require stronger
-  and/or longer counter-evidence to leave it than to enter it (asymmetric
-  thresholds, not a single symmetric dwell).
-- **Regression test (named):** the 2026-06-11 sweep log (starts
-  `00:26:30`, the `POSE-TRACE` left-right sweep) must produce **zero**
-  spurious `UP_RAISED↔NEUTRAL` transitions (was 6 in 30 s).
+### 3.2 Redefine the raised-zone on the unified gravity geometry (fix the flapping)
+
+**Superseded approach:** asymmetric-dwell hysteresis was tried and FAILED
+hardware verification (2026-06-11) — a wide air-mouse sweep dwells ~0.8 s+
+at each Y-dominant extreme, exceeding any reasonable dwell. Root cause is
+classifier *semantics*, not dwell length.
+
+**Fix:** redefine `_classify_orientation`'s raised-zone using the **unified
+gravity-component geometry** (see `observability-aware-pose-and-cursor-
+design.md` §3.5 — same `gx/gy/gz` signals as the cone and gz-sign; do NOT
+create a second pose-geometry definition):
+- `UP_RAISED` = `gx > 0` AND `gx > RAISED_ELEVATION_RATIO · |gz|`. The **gy
+  (sweep) axis is ignored**, so a wide reach (gy large) stays raised.
+- `DOWN_FLAT` = `gz > 0` AND `gz` dominates both `|gx|` and `|gy|`.
+- else `NEUTRAL`.
+- Keep a short dwell for transient rejection (the existing
+  ENTER/LEAVE dwell from the prior attempt is fine and harmless — the
+  redefinition means NEUTRAL is no longer proposed mid-sweep, so the dwell
+  rarely fires; do not over-engineer it further).
+
+**`RAISED_ELEVATION_RATIO` is an empirical threshold** (not designed):
+initial ~1.1 (observed min `gx/|gz|` across the raised sweep ≈1.31 → margin),
+calibrated/refined against the cross-session adversarial traces.
+
+- **Regression test (named):** the 2026-06-11 `POSE-TRACE` left-right sweep
+  log must produce **zero** `UP_RAISED↔NEUTRAL` transitions. (The
+  asymmetric-dwell build still showed ~20 in 30 s — that is the baseline to
+  beat with the redefinition.)
 
 ### 3.3 Signal hygiene (so the bug class can't return)
 - Any gravity-orientation decision operates on the **gravity-LPF
