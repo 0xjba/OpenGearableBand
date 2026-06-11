@@ -193,6 +193,10 @@ static bool cursor_has_reached_pose = false;
  * the user never engaged, no point allowing quick re-engage). */
 static int entry_grace_remaining = 0;
 
+/* AIR_MOUSE desk-settle exit state (Amendment A.3). */
+static bool air_impact_seen      = false;  /* (a) volar-contact impact latched in the near-flat zone */
+static int  air_past_plane_dwell = 0;      /* (b) consecutive samples forearm is past horizontal */
+
 /* Reference gravity vector captured at the moment a cursor mode
  * first engages (cursor_has_reached_pose flips false -> true).
  *
@@ -520,6 +524,11 @@ static void _transition_to(GestureMode new_mode)
      *   - entry_grace_remaining cleared
      */
     if (_mode_needs_continuous_imu(new_mode)) {
+        /* Clear desk-settle state from any prior cursor session so a stale
+         * impact latch can't false-exit right after a fast re-engage. */
+        air_impact_seen      = false;
+        air_past_plane_dwell = 0;
+
         WristOrientation expected =
             (new_mode == MODE_AIR_MOUSE) ? WRIST_UP_RAISED
                                          : WRIST_DOWN_FLAT;
@@ -551,6 +560,8 @@ static void _transition_to(GestureMode new_mode)
     } else {
         cursor_has_reached_pose = false;
         entry_grace_remaining = 0;
+        air_impact_seen = false;
+        air_past_plane_dwell = 0;
     }
 
     /* Clear the cooldown-reengage flag unconditionally so it never
@@ -637,6 +648,8 @@ void gesture_mode_init(void)
     cursor_cooldown_mode = MODE_IDLE;
     cursor_has_reached_pose = false;
     entry_grace_remaining = 0;
+    air_impact_seen = false;
+    air_past_plane_dwell = 0;
     surface_motion_burst_dwell = 0;
     surface_motion_peak = 0.0f;
     surface_motion_log_counter = 0;
@@ -787,20 +800,16 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         }
     }
 
-    /* Activity gate maintenance.  Compute motion residual once and
-     * reset samples_since_activity to 0 if motion is "active"; tick
-     * up to the saturation point otherwise.  See ACTIVITY_GATE_*
-     * comment block for design intent. */
-    {
-        float rx = ax - gx_filt;
-        float ry = ay - gy_filt;
-        float rz = az - gz_filt;
-        float r_mag = sqrtf(rx * rx + ry * ry + rz * rz);
-        if (r_mag > ACTIVITY_GATE_THRESH) {
-            samples_since_activity = 0;
-        } else if (samples_since_activity < ACTIVITY_GATE_DWELL) {
-            samples_since_activity++;
-        }
+    /* Motion residual (accel - gravity); drives the activity gate AND the
+     * AIR_MOUSE desk-contact impact detector below. */
+    float rx_resid = ax - gx_filt;
+    float ry_resid = ay - gy_filt;
+    float rz_resid = az - gz_filt;
+    float r_mag = sqrtf(rx_resid * rx_resid + ry_resid * ry_resid + rz_resid * rz_resid);
+    if (r_mag > ACTIVITY_GATE_THRESH) {
+        samples_since_activity = 0;
+    } else if (samples_since_activity < ACTIVITY_GATE_DWELL) {
+        samples_since_activity++;
     }
 
     /* Update pose state machine.  Arms on canonical pose match alone. */
@@ -885,46 +894,83 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         }
     }
 
-    /* Exit via orientation drop: pose is no longer the expected one
-     * for _exit_dwell_for(current_mode) samples -> exit to IDLE and
-     * start the cooldown.  Only runs after the user has assumed the
-     * pose at least once.
-     *
-     * Note on per-mode exit semantics:
-     *   AIR_MOUSE: "lowering wrist" -- deliberate, slow.  Dwell = 500 ms.
-     *   SURFACE  : "lifting wrist off desk" -- like lifting a mouse to
-     *              reposition.  Dwell = 0 (only the orientation
-     *              classifier's own 250 ms dwell remains), so the mode
-     *              exits almost instantly when the wrist comes off the
-     *              desk plane.  The 20 s cooldown then lets the user
-     *              put the wrist back down and resume seamlessly.
-     *
-     *   For SURFACE specifically: the user might also LOWER (e.g. drop
-     *   arm to lap) rather than LIFT.  Either departure from DOWN_FLAT
-     *   triggers exit + cooldown; the orientation classifier doesn't
-     *   distinguish between "lifted up" and "dropped down", just
-     *   "no longer flat."  This matches how a mouse behaves: any way
-     *   of losing surface contact pauses tracking.
-     */
-    int exit_dwell_target = _exit_dwell_for(current_mode);
-    if (in_cursor_mode && cursor_has_reached_pose &&
-        orientation_current != expected) {
-        if (cursor_exit_dwell <= exit_dwell_target) {
-            cursor_exit_dwell++;
-            if (cursor_exit_dwell > exit_dwell_target) {
-                LOG_INF("%s exit: %s -- starting %d ms re-engage cooldown",
-                        _mode_str(current_mode),
-                        (current_mode == MODE_SURFACE)
-                            ? "wrist left desk plane (lift or drop)"
-                            : "wrist lowered out of raised pose",
-                        CURSOR_COOLDOWN_SAMPLES * 10);
-                cursor_cooldown_mode = current_mode;
-                cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
-                _transition_to(MODE_IDLE);
+    /* --- Exit detection (per mode) ---
+     * AIR_MOUSE (Amendment A.3): stay engaged through the full raised->near-flat
+     * range; exit only on a desk-settle in the near-flat zone -- (a) volar
+     * contact impact + settle (desk present), or (b) forearm past the
+     * horizontal plane (no desk).  SURFACE keeps its orientation-drop exit. */
+    if (in_cursor_mode && cursor_has_reached_pose) {
+        bool do_exit = false;
+        const char *exit_reason = "";
+
+        if (current_mode == MODE_AIR_MOUSE) {
+            bool near_flat = (gx_filt < CURSOR_DESK_ZONE_GX);
+
+            /* (a) desk present: an impact while near-flat, then stillness. */
+            if (!near_flat) {
+                air_impact_seen = false;          /* left the zone -> reset the latch */
+            } else if (r_mag > CURSOR_IMPACT_THRESH) {
+                air_impact_seen = true;           /* volar contact transient */
+                /* TODO(clicks): once click/tap is implemented, a tap while near-flat
+                 * also spikes r_mag and would latch this -> false desk-exit. Then
+                 * gate the impact on N consecutive samples / a decay signature to
+                 * tell a desk landing from an on-wrist tap. */
             }
+            /* desk_settled needs BOTH a prior impact latch AND subsequent quiet;
+             * quiet alone (a still near-flat hover to point at the bottom) must
+             * NOT exit. */
+            bool desk_settled = air_impact_seen &&
+                                (samples_since_activity >= CURSOR_SETTLE_DWELL);
+
+            /* (b) desk absent: signed gx crosses past horizontal (drooping). */
+            if (gx_filt < CURSOR_PAST_PLANE_GX) {
+                if (air_past_plane_dwell < CURSOR_PAST_PLANE_DWELL) air_past_plane_dwell++;
+            } else {
+                air_past_plane_dwell = 0;
+            }
+            bool past_plane = (air_past_plane_dwell >= CURSOR_PAST_PLANE_DWELL);
+
+            if (desk_settled)    { do_exit = true; exit_reason = "desk contact + settle"; }
+            else if (past_plane) { do_exit = true; exit_reason = "past horizontal plane (no desk)"; }
+
+            /* Near-flat telemetry to HW-tune CURSOR_IMPACT_THRESH (Amendment A.4). */
+            if (near_flat) {
+                static int deskdbg = 0;
+                if (++deskdbg % 10 == 0) {
+                    LOG_INF("[DESK] gx=%d r_mag=%d still=%d impact=%d ppdwell=%d",
+                            (int)gx_filt, (int)r_mag, (int)samples_since_activity,
+                            (int)air_impact_seen, air_past_plane_dwell);
+                }
+            }
+        } else {
+            /* SURFACE (and any non-AIR_MOUSE cursor mode): orientation-drop exit. */
+            int exit_dwell_target = _exit_dwell_for(current_mode);
+            if (orientation_current != expected) {
+                if (cursor_exit_dwell <= exit_dwell_target) {
+                    cursor_exit_dwell++;
+                    if (cursor_exit_dwell > exit_dwell_target) {
+                        do_exit = true;
+                        exit_reason = "wrist left desk plane (lift or drop)";
+                    }
+                }
+            } else {
+                cursor_exit_dwell = 0;
+            }
+        }
+
+        if (do_exit) {
+            LOG_INF("%s exit: %s -- starting %d ms re-engage cooldown",
+                    _mode_str(current_mode), exit_reason, CURSOR_COOLDOWN_SAMPLES * 10);
+            cursor_cooldown_mode = current_mode;
+            cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
+            air_impact_seen = false;
+            air_past_plane_dwell = 0;
+            _transition_to(MODE_IDLE);
         }
     } else {
         cursor_exit_dwell = 0;
+        air_impact_seen = false;
+        air_past_plane_dwell = 0;
     }
 
     /* SURFACE motion-burst exit detector.  See
@@ -935,14 +981,14 @@ void gesture_mode_update_accel(float ax, float ay, float az)
      * latched -- pre-engagement motion is just the user placing the
      * wrist down. */
     if (current_mode == MODE_SURFACE && cursor_has_reached_pose) {
-        float rx = ax - gx_filt;
-        float ry = ay - gy_filt;
-        float rz = az - gz_filt;
-        float r_mag = sqrtf(rx * rx + ry * ry + rz * rz);
+        float rx_s = ax - gx_filt;
+        float ry_s = ay - gy_filt;
+        float rz_s = az - gz_filt;
+        float r_mag_s = sqrtf(rx_s * rx_s + ry_s * ry_s + rz_s * rz_s);
 
         /* Track windowed peak (resets each periodic log). */
-        if (r_mag > surface_motion_peak) {
-            surface_motion_peak = r_mag;
+        if (r_mag_s > surface_motion_peak) {
+            surface_motion_peak = r_mag_s;
         }
 
         /* Periodic stats log -- a calibration stream the user can
@@ -960,14 +1006,14 @@ void gesture_mode_update_accel(float ax, float ay, float az)
             surface_motion_log_counter = 0;
         }
 
-        if (r_mag > SURFACE_MOTION_BURST_THRESH) {
+        if (r_mag_s > SURFACE_MOTION_BURST_THRESH) {
             if (surface_motion_burst_dwell < SURFACE_MOTION_BURST_DWELL) {
                 surface_motion_burst_dwell++;
                 if (surface_motion_burst_dwell == SURFACE_MOTION_BURST_DWELL) {
                     LOG_INF("SURFACE exit: motion burst |a-g|=%.2f m/s^2 "
                             "(thresh=%.2f, window peak=%.2f) -- "
                             "starting %d ms re-engage cooldown",
-                            (double)r_mag,
+                            (double)r_mag_s,
                             (double)SURFACE_MOTION_BURST_THRESH,
                             (double)surface_motion_peak,
                             CURSOR_COOLDOWN_SAMPLES * 10);
