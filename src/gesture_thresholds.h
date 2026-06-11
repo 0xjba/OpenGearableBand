@@ -56,10 +56,12 @@
 #define POSE_AIRMOUSE_TOL       0.45f
 
 /* DICTATION canonical is DISABLED for cosine matching (tol 2.0 → never
- * matches; cos can't exceed 1).  Dictation is split out of the raised
- * hemisphere by ROLL, not by a separate gravity cone — gravity cannot
- * separate it from a raised air-mouse pose.  Values kept for reference /
- * future use. */
+ * matches; cos can't exceed 1).  It was previously reached via a roll-based
+ * split from POSE_AIR_MOUSE; that mechanism was removed 2026-06-11 (a held
+ * max-right air-mouse is gravity-identical to dictation, so pose-only
+ * discrimination is impossible — the confirming gesture decides the mode).
+ * Values kept for future use when dictation entry is defined (clench + voice).
+ * See 2026-06-11-pose-trigger-realignment spec. */
 #define POSE_DICTATION_GX       0.92f
 #define POSE_DICTATION_GY       0.39f
 #define POSE_DICTATION_GZ       0.03f
