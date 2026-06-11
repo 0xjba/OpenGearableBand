@@ -109,6 +109,44 @@ int main(void)
     cursor_track_start(40.0f, 50.0f);            /* lazy again */
     CHECK(fabsf(cursor_track_vert_top() - 17.0f) < 1e-3f);  /* falls back to 17 */
 
+    /* --- Top re-pin hysteresis (Task 5) --- */
+
+    /* R1: drive down so cur_y > 0, then raise back to the top: crossing
+     * vert_top+ENTER re-arms a slam (cur_y will re-pin to 0 after it drains). */
+    cursor_track_set_gain(CURSOR_GAIN_X, CURSOR_GAIN_Y);
+    cursor_track_start(15.0f, 50.0f);
+    drain_slam(15.0f, 50.0f);
+    CHECK(fabsf(cursor_track_vert_top() - 15.0f) < 1e-3f);
+    for (int i = 0; i < 20; i++) cursor_track_update(40.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(cursor_track_cur_y() > 100.0f);        /* parked mid-screen */
+    /* still inside the leave band? we are at 40 (>> top+LEAVE) so latch is off;
+     * now raise to the top: */
+    cursor_track_update(15.0f, 50.0f, false, V, &dx, &dy);  /* <= top+ENTER -> re-pin */
+    CHECK(cursor_track_is_slamming());
+    drain_slam(15.0f, 50.0f);
+    CHECK(fabsf(cursor_track_cur_y() - 0.0f) < 1e-3f);
+
+    /* R2: hysteresis — once latched at top, a small dip below LEAVE must NOT
+     * re-fire the slam every tick (no chatter). */
+    cursor_track_start(15.0f, 50.0f);
+    drain_slam(15.0f, 50.0f);
+    cursor_track_update(15.0f, 50.0f, false, V, &dx, &dy);   /* latched at top */
+    /* nudge to within [ENTER, LEAVE] of top -> still latched, no new slam */
+    cursor_track_update(15.0f + (CURSOR_PIN_ENTER_DEG + CURSOR_PIN_LEAVE_DEG) * 0.5f,
+                        50.0f, false, V, &dx, &dy);
+    CHECK(!cursor_track_is_slamming());
+
+    /* R3: leaving past vert_top+LEAVE then returning re-arms exactly once. */
+    cursor_track_update(15.0f + CURSOR_PIN_LEAVE_DEG + 5.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(!cursor_track_is_slamming());           /* left the band, no slam on leave */
+    cursor_track_update(15.0f, 50.0f, false, V, &dx, &dy);   /* re-enter -> re-pin */
+    CHECK(cursor_track_is_slamming());
+
+    /* R3b: a SECOND tick at the same top position must NOT re-arm (latch set). */
+    drain_slam(15.0f, 50.0f);
+    cursor_track_update(15.0f, 50.0f, false, V, &dx, &dy);   /* still at top, latch true */
+    CHECK(!cursor_track_is_slamming());
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }

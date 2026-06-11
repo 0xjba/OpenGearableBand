@@ -5,6 +5,8 @@
 
 static_assert(CURSOR_ROLL_SHADOW_REVALIDATE >= CURSOR_ROLL_SHADOW_INVALIDATE,
               "CURSOR_ROLL_SHADOW_REVALIDATE must be >= INVALIDATE (cone-gate hysteresis)");
+static_assert(CURSOR_PIN_LEAVE_DEG >= CURSOR_PIN_ENTER_DEG,
+              "CURSOR_PIN_LEAVE_DEG must be >= ENTER (re-pin hysteresis)");
 
 /* Threading: cursor_track_start/stop run in transition context (workqueue /
  * power thread); cursor_track_update runs in acq_thread.  These statics are
@@ -113,6 +115,20 @@ void cursor_track_start(float vert_deg, float roll_deg)
     s_started    = true;
 }
 
+/* Top re-pin: latched hysteresis around the top anchor.  Entering the
+ * [vert_top, vert_top+ENTER] band re-arms a to-top slam ONCE; the latch clears
+ * only after leaving past vert_top+LEAVE, so a hover near the edge can't
+ * chatter.  LEAVE >= ENTER (see gesture_thresholds.h). */
+static void update_top_repin(float vert_deg)
+{
+    if (!s_at_top && vert_deg <= s_vert_top + CURSOR_PIN_ENTER_DEG) {
+        s_at_top = true;
+        start_slam(-1);
+    } else if (s_at_top && vert_deg > s_vert_top + CURSOR_PIN_LEAVE_DEG) {
+        s_at_top = false;
+    }
+}
+
 void cursor_track_update(float vert_deg, float roll_deg, bool at_rest,
                          float shadow, float *out_dx, float *out_dy)
 {
@@ -134,7 +150,7 @@ void cursor_track_update(float vert_deg, float roll_deg, bool at_rest,
         if (err < -127.0f) err = -127.0f;
         dy = err;
         s_cur_y += dy;
-        /* (Task 5 inserts the top re-pin call here.) */
+        update_top_repin(vert_deg);   /* may re-arm a to-top slam */
     }
 
     /* ---- X axis: relative roll (UNCHANGED), but SUPPRESSED during a slam so
@@ -161,4 +177,8 @@ void cursor_track_stop(void)
 {
     s_roll_valid = false;
     s_started    = false;
+    /* Note: absolute-Y state (s_at_top, s_cur_y, s_slam_remaining, s_slam_sign)
+     * is intentionally NOT reset here -- cursor_track_start resets it on the
+     * next entry.  Do not add redundant resets here; the s_started gate prevents
+     * any stale value from reaching cursor_track_update before start is called. */
 }
