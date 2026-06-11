@@ -724,6 +724,45 @@ void gesture_mode_init(void)
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
 }
 
+/* --- Pose-observability trace -------------------------------------------
+ * Periodic logger to MEASURE the roll-observability cone on the CURRENT
+ * mount (re-taped per session, so assume nothing from prior days).  Hold a
+ * pose still; logs gravity, the Y-Z "shadow" magnitude sqrt(gy^2+gz^2)
+ * (small => forearm near vertical => roll unobservable), the forearm angle
+ * from vertical, and the filter's pitch/roll.  Used to derive the cone
+ * threshold + the bring-to-face dictation signature empirically. */
+static uint32_t pose_trace_remaining = 0;
+static uint32_t pose_trace_div = 0;
+
+void gesture_mode_pose_trace_start(uint32_t n_samples)
+{
+    pose_trace_remaining = n_samples;
+    pose_trace_div = 0;
+    LOG_INF("POSE-TRACE: hold the pose STILL; logging ~%u s "
+            "(g, shadow, vert=deg-from-vertical, pitch, roll)...",
+            n_samples / 100u);
+}
+
+static void pose_trace_tick(void)
+{
+    if (pose_trace_remaining == 0) return;
+    pose_trace_remaining--;
+    if (++pose_trace_div < 20) return;   /* ~5 Hz at 100 Hz acq */
+    pose_trace_div = 0;
+
+    float mag = sqrtf(gx_filt * gx_filt + gy_filt * gy_filt + gz_filt * gz_filt);
+    float shadow = sqrtf(gy_filt * gy_filt + gz_filt * gz_filt);
+    float vert = (mag > 0.1f)
+        ? acosf(fminf(1.0f, fabsf(gx_filt) / mag)) * RAD_TO_DEG : 0.0f;
+    orientation_state_t ori;
+    orientation_get(&ori);
+    LOG_INF("POSE-TRACE g=(%.2f,%.2f,%.2f) shadow=%.2f vert=%.0f "
+            "pitch=%.0f roll=%.0f at_rest=%d",
+            (double)gx_filt, (double)gy_filt, (double)gz_filt,
+            (double)shadow, (double)vert,
+            (double)ori.pitch_deg, (double)ori.roll_deg, ori.at_rest);
+}
+
 void gesture_mode_update_accel(float ax, float ay, float az)
 {
     /* Stash raw accel for the orientation filter (fused with the gyro
@@ -747,6 +786,9 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     gx_filt += GRAVITY_LP_ALPHA * (ax - gx_filt);
     gy_filt += GRAVITY_LP_ALPHA * (ay - gy_filt);
     gz_filt += GRAVITY_LP_ALPHA * (az - gz_filt);
+
+    /* Observability-cone measurement trace (no-op unless armed via 'v'). */
+    pose_trace_tick();
 
     /* Reclassify orientation based on filtered gravity. */
     WristOrientation new_classification = _classify_orientation(

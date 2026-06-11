@@ -599,6 +599,10 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
         } else if (c == 'z' || c == 'Z') {
             // Stationary gyro-bias trace -- hold still, logs bias/noise.
             pending_cmd = 'z';
+        } else if (c == 'v' || c == 'V') {
+            // Pose-observability trace -- hold a pose, logs gravity/shadow/
+            // pitch/roll to measure the roll-observability cone.
+            pending_cmd = 'v';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -631,6 +635,7 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  '+'=lower TAP_THS (more sensitive)   '-'=raise TAP_THS (less sensitive)");
     LOG_INF("  'q'=PPG quality probe (20s perfusion-index capture for wear position)");
     LOG_INF("  'z'=gyro bias trace (hold still 60s -> bias/noise per axis)");
+    LOG_INF("  'v'=pose trace (hold a pose 30s -> gravity/shadow/pitch/roll)");
 
     /* Per-step cursor delta for the mouse-test injects.  10 pixels
      * per press gives a clearly visible cursor jump on the host. */
@@ -787,6 +792,11 @@ void reset_thread_entry(void *, void *, void *) {
             LOG_INF("PPG probe requested -- power thread will run a 20s capture");
             probe_requested = true;
             k_sem_give(&motion_wake_sem);
+        } else if (cmd == 'v') {
+            pending_cmd = 0;
+            // Pose-observability trace: ~30 s at 100 Hz, logged from the acq
+            // pipeline (runs in IDLE).  Hold the pose still.
+            gesture_mode_pose_trace_start(3000);
         } else if (cmd == 'z') {
             pending_cmd = 0;
             // Stationary gyro-bias trace.  Accumulation happens in the

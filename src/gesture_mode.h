@@ -185,6 +185,12 @@ pose_id_t gesture_mode_armed_pose(void);
  * transition during gestures (rapid taps must not read as exercise). */
 bool gesture_mode_recent_activity(void);
 
+/* Start a pose-observability trace: hold a pose still and this logs
+ * gravity + Y-Z shadow + forearm-from-vertical + pitch/roll at ~5 Hz for
+ * n_samples (100 Hz acq).  Measures the roll-observability cone on the
+ * current mount; assumes nothing from prior sessions. */
+void gesture_mode_pose_trace_start(uint32_t n_samples);
+
 /*
  * Read the current mode.  Thread-safe (uses atomic_t internally).
  * Cheap; safe to call from any thread including ISRs.
