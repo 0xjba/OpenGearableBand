@@ -784,6 +784,12 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     WristOrientation new_classification = _classify_orientation(
         gx_filt, gy_filt, gz_filt);
 
+    /* Counter caps at ORIENTATION_LEAVE_DWELL, so the NEUTRAL (leave) path
+     * can only commit if LEAVE >= ENTER.  Enforce at compile time. */
+    BUILD_ASSERT(ORIENTATION_LEAVE_DWELL >= ORIENTATION_ENTER_DWELL,
+                 "ORIENTATION_LEAVE_DWELL must be >= ORIENTATION_ENTER_DWELL "
+                 "(dwell counter caps at LEAVE)");
+
     /* Orientation dwell with HYSTERESIS: a candidate must hold before it
      * commits, and LEAVING a pose to NEUTRAL needs a longer hold than
      * entering a definite pose -- so a brief gx~=gy dip at a sweep extreme
