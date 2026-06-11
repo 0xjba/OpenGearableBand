@@ -267,4 +267,40 @@
  * ============================================================================
  */
 
+/* ---------------------------------------------------------------------------
+ *  8. Air-mouse cursor (pointing v1)
+ *  ---------------------------------------------------------------------------
+ *  See docs/superpowers/specs/2026-06-11-air-mouse-cursor-design.md.
+ *  Relative/rate: cursor moves by the per-tick CHANGE in the fused wrist
+ *  angle.  All [USER]/empirical, tuned per-mount on hardware. */
+
+/* Angle-delta -> pixels (SIGNED; flip on hardware if a direction is
+ * inverted).  gain ~= reachable span: gain * usable-angle-range = total
+ * travel.  ~80 deg usable twist * 8 = ~640 px (~1/3 of 1080p) -- EXPECT the
+ * first tuning pass to ~triple this (and then a speed-dependent gain curve,
+ * deferred, likely becomes necessary).  Start at 8 only to confirm direction
+ * + stability. */
+#define CURSOR_GAIN_Y                   8.0f
+#define CURSOR_GAIN_X                   8.0f
+
+/* Cone gate (X axis) with HYSTERESIS, on the GRAVITY-LPF shadow
+ * sqrt(gy^2+gz^2): roll is unobservable near a vertical forearm.  Below
+ * INVALIDATE -> gate X off; above REVALIDATE -> back on; between -> hold.
+ * Brackets the measured cone (vert 15 -> shadow 2.4 invalid, vert 31 ->
+ * shadow 5.0 valid).  REVALIDATE must be >= INVALIDATE (static_assert in
+ * cursor_track.cpp). */
+#define CURSOR_ROLL_SHADOW_INVALIDATE   3.5f
+#define CURSOR_ROLL_SHADOW_REVALIDATE   4.5f
+
+/* Freeze release: per-tick |Δangle| (deg) above which the freeze lets go
+ * immediately (so SLOW precision moves aren't eaten).  Start LOW, just above
+ * the still-pose per-tick angle-noise floor -- a HIGH value would freeze
+ * precision pointing (and smuggle in a 'ratchet' clutch, which we do NOT want
+ * here -- add a deliberate ratchet gesture later if the range bites). */
+#define CURSOR_FREEZE_RELEASE_DELTA     0.05f
+
+/* Discard any per-tick |Δangle| above this as a wrap/glitch (a real wrist
+ * move is far smaller per 10 ms).  Belt-and-suspenders with wrap180(). */
+#define CURSOR_MAX_DELTA_DEG            30.0f
+
 #endif /* GESTURE_THRESHOLDS_H */
