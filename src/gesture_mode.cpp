@@ -1171,6 +1171,12 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
 {
     ARG_UNUSED(work_arg);
 
+    /* The accumulation window must cover the whole cadence range, or a valid
+     * slow double-tap commits its first tap alone and is rejected. */
+    BUILD_ASSERT(MULTI_TAP_WINDOW_MS >= CADENCE_MAX_MS,
+                 "MULTI_TAP_WINDOW_MS must be >= CADENCE_MAX_MS "
+                 "(else a slow double-tap splits into two single taps)");
+
     int count = multi_tap_count;
     char axis = multi_tap_first_axis;
     char sign = multi_tap_first_sign;

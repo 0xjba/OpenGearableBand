@@ -125,9 +125,17 @@
  *  3. Gesture / tap timing (cadenced double-tap, ringing, activity)
  *  --------------------------------------------------------------------------- */
 
-/* Multi-tap accumulation window: taps within this of each other fold into one
- * sequence; commit fires this long after the last tap.  [USER] */
-#define MULTI_TAP_WINDOW_MS             250
+/* Multi-tap accumulation window: the commit is rescheduled this long after
+ * EACH tap, so a second tap must land within this window of the first to be
+ * counted.  MUST be >= CADENCE_MAX_MS (enforced by BUILD_ASSERT in
+ * gesture_mode.cpp) -- otherwise a valid-but-slow double-tap whose inter-tap
+ * exceeds this window commits the FIRST tap alone (count=1) and is rejected,
+ * even while perfectly still.  Was 250 (< the 500 cadence ceiling) -- raised
+ * 2026-06-11 after hardware showed natural doubles at ~210-243 ms sitting
+ * right at the old edge.  This is also the mode-entry latency after the last
+ * tap (a future optimization could commit immediately once count==2 with
+ * valid cadence, since triple-tap isn't a trigger).  [USER] */
+#define MULTI_TAP_WINDOW_MS             550
 
 /* Cadenced double-tap inter-tap interval [MIN, MAX] ms.  60 ms floor sits
  * above the 50 ms ringing refractory; 500 ms ceiling matches the slow-
