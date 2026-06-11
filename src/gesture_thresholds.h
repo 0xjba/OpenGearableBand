@@ -284,10 +284,21 @@
 #define CURSOR_GAIN_X                   8.0f    /* px/deg (relative roll->X) [USER][HOUSING]      */
 
 /* Vertical map calibration (deg). vert = acos(|gx|/|g|), 0=vertical..90=flat. */
-#define CURSOR_VERT_SPAN_DEG            40.0f   /* nominal comfortable down-range [USER]           */
-#define CURSOR_VERT_TOP_DEFAULT         15.0f   /* seed/fallback top anchor [USER][HOUSING]        */
-#define CURSOR_VERT_TOP_MAX             25.0f   /* reject entry above this (lazy raise) -> fallback [USER] */
-#define CURSOR_VERT_BOTTOM_MAX          60.0f   /* comfort clamp on implied bottom [USER]          */
+#define CURSOR_VERT_SPAN_DEG            70.0f   /* nominal comfortable down-range [USER]           */
+#define CURSOR_VERT_BOTTOM_MAX          85.0f   /* comfort clamp on implied bottom [USER]          */
+
+/* Fixed top anchor (deg-from-vertical).  12deg keeps screen-top out of the
+ * acos near-vertical jitter zone (~5x noise) while using almost the full
+ * range. [USER][HOUSING] -- re-check after a re-tape/housing change. */
+#define CURSOR_VERT_TOP_DEG             12.0f
+
+/* Desk-settle exit (Amendment A.3).  gx_filt is the forearm-axis gravity
+ * component in m/s^2 (~9.81 = 1g vertical, 0 = flat). */
+#define CURSOR_DESK_ZONE_GX             1.7f    /* near-flat zone: gx below this (vert>~80) [USER] */
+#define CURSOR_PAST_PLANE_GX            (-1.0f) /* (b) no-desk exit: forearm past horizontal [USER] */
+#define CURSOR_PAST_PLANE_DWELL         15      /* samples gx must stay past-plane [USER] */
+#define CURSOR_IMPACT_THRESH            6.0f    /* (a) accel-residual spike, m/s^2 -- HW-TUNED seed [HOUSING] */
+#define CURSOR_SETTLE_DWELL             40      /* post-impact stillness samples (~400ms) [USER] */
 
 /* Slam (manufactured edge clamp).  Over-travel is free (OS clamps); undershoot
  * poisons registration -> a GAIN_Y-INDEPENDENT floor guarantees the edge even

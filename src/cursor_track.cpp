@@ -25,8 +25,8 @@ static bool  s_roll_valid     = false;
 static bool  s_started        = false;
 
 /* Absolute-Y state. */
-static float s_vert_top       = CURSOR_VERT_TOP_DEFAULT; /* top anchor (deg)        */
-static float s_vert_top_good  = CURSOR_VERT_TOP_DEFAULT; /* RAM last-good fallback  */
+/* Fixed top anchor (Amendment A.1): no longer captured at entry. */
+static const float s_vert_top = CURSOR_VERT_TOP_DEG;
 static float s_cur_y          = 0.0f;                    /* counts from top         */
 static float s_target_counts  = 0.0f;                    /* last servo target, counts from top */
 static int   s_slam_remaining = 0;                       /* >0 => slamming          */
@@ -108,13 +108,10 @@ static void start_slam(int sign)
 
 void cursor_track_start(float vert_deg, float roll_deg)
 {
-    /* Capture top anchor with a lazy-raise sanity clamp -> RAM last-good. */
-    if (vert_deg <= CURSOR_VERT_TOP_MAX) {
-        s_vert_top      = vert_deg;
-        s_vert_top_good = vert_deg;
-    } else {
-        s_vert_top = s_vert_top_good;
-    }
+    /* Fixed anchor (Amendment A.1): the entry inclination no longer sets the
+     * top; vert_deg is unused here now but the arg is kept for API symmetry
+     * (the slam + roll seed below still run on entry). */
+    (void)vert_deg;
     s_prev_roll  = roll_deg;
     s_roll_valid = false;
     s_cur_y      = 0.0f;
