@@ -784,10 +784,12 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     WristOrientation new_classification = _classify_orientation(
         gx_filt, gy_filt, gz_filt);
 
-    /* Orientation dwell: only update orientation_current after the
-     * classification has held for ORIENTATION_DWELL_SAMPLES. */
+    /* Orientation dwell with HYSTERESIS: a candidate must hold before it
+     * commits, and LEAVING a pose to NEUTRAL needs a longer hold than
+     * entering a definite pose -- so a brief gx~=gy dip at a sweep extreme
+     * can't flip UP_RAISED->NEUTRAL. */
     if (new_classification == orientation_candidate) {
-        if (orientation_candidate_dwell < ORIENTATION_DWELL_SAMPLES) {
+        if (orientation_candidate_dwell < ORIENTATION_LEAVE_DWELL) {
             orientation_candidate_dwell++;
         }
     } else {
@@ -795,7 +797,11 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         orientation_candidate_dwell = 1;
     }
 
-    if (orientation_candidate_dwell >= ORIENTATION_DWELL_SAMPLES &&
+    int required_dwell = (orientation_candidate == WRIST_NEUTRAL)
+        ? ORIENTATION_LEAVE_DWELL    /* leaving a pose: sticky */
+        : ORIENTATION_ENTER_DWELL;   /* entering UP_RAISED/DOWN_FLAT: responsive */
+
+    if (orientation_candidate_dwell >= required_dwell &&
         orientation_candidate != orientation_current) {
         WristOrientation old_o = orientation_current;
         orientation_current = orientation_candidate;

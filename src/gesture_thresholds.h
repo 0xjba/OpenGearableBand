@@ -94,9 +94,14 @@
  * estimate used by pose detection.  [STRUCTURAL] */
 #define GRAVITY_LP_ALPHA                0.01f
 
-/* Orientation classifier dwell (samples @100 Hz) before a NEUTRAL/UP_RAISED/
- * DOWN_FLAT reclassification commits.  [STRUCTURAL] */
-#define ORIENTATION_DWELL_SAMPLES       25
+/* Orientation classifier dwell, asymmetric (hysteresis, samples @100 Hz).
+ * Entering a DEFINITE pose (UP_RAISED/DOWN_FLAT) is responsive; LEAVING a
+ * pose to NEUTRAL is sticky, so a brief gx~=gy excursion mid air-mouse sweep
+ * cannot flip UP_RAISED->NEUTRAL (the 2026-06-11 flapping bug).  LEAVE is the
+ * regression-tuned knob: raise it until the sweep log shows 0 spurious
+ * transitions.  [USER] */
+#define ORIENTATION_ENTER_DWELL         15
+#define ORIENTATION_LEAVE_DWELL         80
 
 /* Axis-dominance ratio for the coarse orientation classifier.  [STRUCTURAL] */
 #define DOMINANCE_RATIO                 1.3f
