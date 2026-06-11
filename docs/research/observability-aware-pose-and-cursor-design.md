@@ -179,10 +179,21 @@ The MODE decision rides entirely on the confirming gesture.
 bring-to-face pose + **CLENCH** (the deliberate act) → powers the mic →
 listens for voice. The clench (a) separates dictation from gravity-identical
 poses like max-right, and (b) gates mic power so it isn't always-on (answers
-the battery + ambient-voice concerns). Clench detection is FUTURE work — lean
-IMU/bio-acoustic (tendon micro-motion / high-ODR), NOT PPG, so the gate stays
-cheap and available while IMU-only in IDLE. Dictation stays log-only until
-clench + voice exist.
+the battery + ambient-voice concerns).
+
+**Clench detection = PPG, NOT IMU (corrected 2026-06-11, search-verified).**
+A held clench is *isometric* → the accelerometer sees ~no mechanical work,
+so IMU-alone can't detect it. PPG can: the "white-knuckle" effect (gripping
+pushes blood from the hand + shifts forearm tendons under the volar sensor)
+perturbs the PPG — the documented basis for PPG grip/finger gesture
+recognition. So clench-gated dictation belongs with the **PPG-GESTURES
+phase**, not this IMU trigger layer. PPG is off in IDLE
+(decision_ppg_fusion_session_only), so the **power ladder** is: bring-to-face
+POSE (IMU, cheap, runs in IDLE) → wake PPG → check clench → wake mic → voice.
+The pose is the cheap IDLE gate that authorizes PPG; PPG-off-in-IDLE is
+preserved. Dictation stays log-only until the PPG-gestures phase builds it.
+Refs: PPG finger-gesture (Rutgers WINLAB); EMG-vs-IMU isometric limitation
+(arXiv 2512.07997).
 
 ## 9. Status / next
 
