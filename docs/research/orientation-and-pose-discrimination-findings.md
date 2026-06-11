@@ -1,7 +1,20 @@
 # Orientation Estimation & Pose Discrimination — Findings
 
+> **⚠️ PARTIALLY SUPERSEDED (2026-06-11).** The **roll-based dictation
+> discriminator** documented below (roll = atan2(gy,gz), threshold 85°) was a
+> **WRONG TURN** — it reads the palm twist, which is in the gravity blind spot
+> and contradicts the settled `decision_dictation_voice_gated_entry`
+> (dictation = bring-to-face geometry + voice, NOT the twist). It mislabeled a
+> steady near-vertical air-mouse pose as DICTATION. The corrected direction —
+> an observability-aware classifier (roll-validity cone) + bring-to-face
+> geometry + voice — is in
+> [`observability-aware-pose-and-cursor-design.md`](observability-aware-pose-and-cursor-design.md).
+> The orientation-foundation, gyro-integral-failure, and bias-measurement
+> sections below remain valid; only the roll-split *conclusion* is retracted.
+
 **Date:** 2026-06-10
-**Status:** Settled & hardware-validated (v0). Cursor pointing deferred.
+**Status:** Orientation foundation valid; **roll-split conclusion retracted**
+(see banner). Cursor pointing deferred.
 **Scope:** Everything from the gyro-based addition (when the cursor spec
 was handed over) through to the validated orientation foundation +
 roll-based dictation discriminator.
