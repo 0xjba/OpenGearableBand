@@ -271,17 +271,34 @@
  *  8. Air-mouse cursor (pointing v1)
  *  ---------------------------------------------------------------------------
  *  See docs/superpowers/specs/2026-06-11-air-mouse-cursor-design.md.
- *  Relative/rate: cursor moves by the per-tick CHANGE in the fused wrist
- *  angle.  All [USER]/empirical, tuned per-mount on hardware. */
+ *  Y is an absolute gravity-anchored servo (counts/deg); X is relative/rate
+ *  px/deg.  Constants are a mix of [USER] and [STRUCTURAL] — see inline tags. */
 
-/* Angle-delta -> pixels (SIGNED; flip on hardware if a direction is
- * inverted).  gain ~= reachable span: gain * usable-angle-range = total
- * travel.  ~80 deg usable twist * 8 = ~640 px (~1/3 of 1080p) -- EXPECT the
- * first tuning pass to ~triple this (and then a speed-dependent gain curve,
- * deferred, likely becomes necessary).  Start at 8 only to confirm direction
- * + stability. */
-#define CURSOR_GAIN_Y                   8.0f
-#define CURSOR_GAIN_X                   8.0f
+/* --- Absolute-Y cursor (gravity-anchored vertical) --------------------------
+ * Y is no longer a relative px/deg gain.  CURSOR_GAIN_Y is now COUNTS/DEG: the
+ * servo target is GAIN_Y * (vert - vert_top), tuned on '}' / '{' so a full
+ * comfortable down-sweep fills the screen (this folds in the unknown host
+ * count->pixel scale).  X stays relative px/deg.  See
+ * docs/superpowers/specs/2026-06-11-absolute-y-cursor-design.md. */
+#define CURSOR_GAIN_Y                   30.0f   /* counts/deg (servo); tune on HW [USER][HOUSING] */
+#define CURSOR_GAIN_X                   8.0f    /* px/deg (relative roll->X) [USER][HOUSING]      */
+
+/* Vertical map calibration (deg). vert = acos(|gx|/|g|), 0=vertical..90=flat. */
+#define CURSOR_VERT_SPAN_DEG            40.0f   /* nominal comfortable down-range [USER]           */
+#define CURSOR_VERT_TOP_DEFAULT         15.0f   /* seed/fallback top anchor [USER][HOUSING]        */
+#define CURSOR_VERT_TOP_MAX             25.0f   /* reject entry above this (lazy raise) -> fallback [USER] */
+#define CURSOR_VERT_BOTTOM_MAX          60.0f   /* comfort clamp on implied bottom [USER]          */
+
+/* Slam (manufactured edge clamp).  Over-travel is free (OS clamps); undershoot
+ * poisons registration -> a GAIN_Y-INDEPENDENT floor guarantees the edge even
+ * untuned. */
+#define CURSOR_SLAM_MARGIN              2.0f    /* 2× max_counts [STRUCTURAL]                      */
+#define CURSOR_SLAM_FLOOR_COUNTS        6000.0f /* absolute min over-travel, counts [USER][HOUSING] */
+#define CURSOR_SLAM_MAX_REPORTS         80      /* generous burst cap (mis-tune) [STRUCTURAL]      */
+
+/* Top re-pin hysteresis band (deg around vert_top). LEAVE >= ENTER. */
+#define CURSOR_PIN_ENTER_DEG            3.0f    /* [USER] */
+#define CURSOR_PIN_LEAVE_DEG            6.0f    /* [USER] */
 
 /* Cone gate (X axis) with HYSTERESIS, on the GRAVITY-LPF shadow
  * sqrt(gy^2+gz^2): roll is unobservable near a vertical forearm.  Below
