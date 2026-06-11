@@ -345,25 +345,15 @@ static void pose_fsm_update(float gx, float gy, float gz)
     pose_id_t best = pose_classify_best(gx, gy, gz,
                                           POSE_MATCH_THRESH, &score);
 
-    /* Roll-based AIR_MOUSE/DICTATION split (validated 2026-06-10).
-     * The raised hemisphere is one canonical (POSE_AIR_MOUSE); within
-     * it, SUPINATION distinguishes dictation (palm to face) from
-     * air-mouse (palm to screen).  Supination shows up as ROLL =
-     * atan2(gy, gz), which is gravity-derived and DRIFT-FREE.  Measured
-     * settled poses: air-mouse roll ~+30..+64 deg, dictation ~+105..+117
-     * deg.  Threshold 85 deg (signed -- dictation is POSITIVE high roll;
-     * a left lean is negative roll and stays air-mouse).
-     *
-     * Known edge case: a heavily-supinated / max-right air-mouse lean
-     * (roll > 85) reads as DICTATION.  Rare for screen-pointing; voice
-     * gating is the future backstop (decision_dictation_voice_gated_
-     * entry).  DICTATION is log-only until its feature exists. */
-    if (best == POSE_AIR_MOUSE) {
-        float roll_deg = atan2f(gy, gz) * (180.0f / 3.14159265f);
-        if (roll_deg >= DICTATION_ROLL_THRESH_DEG) {
-            best = POSE_DICTATION;
-        }
-    }
+    /* NOTE: do NOT re-add a roll/gz-based AIR_MOUSE<->DICTATION split here.
+     * A held max-right air-mouse is gravity-identical to dictation (measured
+     * 2026-06-11); pose-only discrimination is impossible.  The confirming
+     * GESTURE decides the mode (see 2026-06-11-pose-trigger-realignment spec
+     * + decision_dictation_voice_gated_entry).  The raised hemisphere arms
+     * as POSE_AIR_MOUSE; dictation entry is future (clench + voice).
+     * Pose logic operates on the gravity-LPF components (gx/gy/gz) only --
+     * NEVER orientation_get().roll_deg (the quaternion Euler roll lags ~10
+     * deg in motion; it is for the cursor/logging, not pose decisions). */
 
     if (pose_armed_state != POSE_NONE) {
         /* Already armed.  If the user is still in the SAME pose,
@@ -1277,12 +1267,6 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
          * 't'/'y' serial commands in main.cpp for the AIR_MOUSE entry
          * pattern.  Logged-only for now to verify pose+gesture path
          * empirically first. */
-        break;
-
-    case POSE_DICTATION:
-        LOG_INF("MODE ENTRY: DICTATION (pose + cadenced double-tap)");
-        /* Dictation mode does not exist yet (its own spec).  Log
-         * only; will wire when dictation feature lands. */
         break;
 
     case POSE_SURFACE:

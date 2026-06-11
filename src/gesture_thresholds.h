@@ -48,8 +48,8 @@
 
 /* AIR_MOUSE = the raised hemisphere (forearm axis).  Wide cone (tol 0.45 →
  * arms within ~43.5°) to catch inclined raises while rejecting NEUTRAL
- * (~48°+) and SURFACE (~80°).  Within this pose, ROLL splits air-mouse vs
- * dictation (see DICTATION_ROLL_THRESH_DEG). */
+ * (~48°+) and SURFACE (~80°).  The confirming gesture (double-tap) decides
+ * the mode; roll-based splitting was removed 2026-06-11. */
 #define POSE_AIRMOUSE_GX        1.0f
 #define POSE_AIRMOUSE_GY        0.0f
 #define POSE_AIRMOUSE_GZ        0.0f
@@ -73,7 +73,7 @@
 #define POSE_SURFACE_TOL        0.940f
 
 /* ---------------------------------------------------------------------------
- *  2. Pose FSM (arming + the AIR_MOUSE/DICTATION roll split)
+ *  2. Pose FSM (arming)
  *  --------------------------------------------------------------------------- */
 
 /* Pose-arm window: a matching gesture must arrive within this long of arming.
@@ -83,11 +83,10 @@
 /* Minimum pose-match score (0..1) to count as "in a pose".  [STRUCTURAL] */
 #define POSE_MATCH_THRESH               0.5f
 
-/* Roll (= atan2(gy,gz), deg) above which a raised pose is DICTATION (palm
- * supinated to face) vs AIR_MOUSE (palm to screen).  Signed: dictation is
- * positive high roll; a left lean is negative and stays air-mouse.  Settled
- * data: air-mouse ~30-64°, dictation ~105-117°.  [HOUSING][USER] */
-#define DICTATION_ROLL_THRESH_DEG       85.0f
+/* (removed 2026-06-11) Roll-based AIR_MOUSE/DICTATION split deleted: a held
+ * max-right air-mouse is gravity-identical to dictation, so pose-only
+ * discrimination is impossible.  The confirming gesture decides the mode.
+ * See 2026-06-11-pose-trigger-realignment spec. */
 
 /* Gravity low-pass alpha (per-sample IIR) for the orientation/gravity
  * estimate used by pose detection.  [STRUCTURAL] */
