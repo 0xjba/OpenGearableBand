@@ -423,92 +423,28 @@ static const char *_orientation_str(WristOrientation o)
     }
 }
 
-/*
- * Classify the current gravity vector into an orientation.  Returns
- * NEUTRAL if no axis is sufficiently dominant.
- *
- * Body-frame convention (verified against the existing IMU traces in
- * the HR logs): with the device worn palm-side-up on the wrist,
- * gravity registers approximately:
- *   - Palm-down on desk (DOWN_FLAT):    +X axis dominant
- *   - Forearm raised (UP_RAISED):       -Y axis dominant (varies by
- *                                       individual wrist twist)
- *
- * NOTE: these are first-cut classifications.  They will need
- * empirical adjustment once the band is on a wrist and the LOG_INF
- * lines below show what the actual filtered gravity vector looks
- * like in each pose.  See TODOs in the architecture doc.
- */
 static WristOrientation _classify_orientation(float gx, float gy, float gz)
 {
-    float ax = fabsf(gx);
-    float ay = fabsf(gy);
-    float az = fabsf(gz);
+    /* Unified gravity-component geometry (observability-aware-pose-and-
+     * cursor-design.md 3.5): gx = forearm elevation, gy = left-right SWEEP
+     * axis, gz = volar-normal.  RAISED ignores gy so a wide air-mouse sweep
+     * (gy large at the extremes) stays UP_RAISED instead of flapping to
+     * NEUTRAL.  Thresholds are empirical (regression test: the 2026-06-11
+     * left-right sweep must produce 0 UP_RAISED<->NEUTRAL transitions). */
 
-    /* Sort magnitudes to find the largest and second-largest.  We
-     * keep track of which axis is largest so we can check its sign
-     * below.  Compact pattern: at most 3 comparisons. */
-    float largest_mag, second_mag;
-    int largest_axis;   /* 0=X, 1=Y, 2=Z */
-    float largest_signed;
-
-    if (ax >= ay && ax >= az) {
-        largest_mag = ax; largest_axis = 0; largest_signed = gx;
-        second_mag = (ay >= az) ? ay : az;
-    } else if (ay >= az) {
-        largest_mag = ay; largest_axis = 1; largest_signed = gy;
-        second_mag = (ax >= az) ? ax : az;
-    } else {
-        largest_mag = az; largest_axis = 2; largest_signed = gz;
-        second_mag = (ax >= ay) ? ax : ay;
+    /* RAISED: forearm up and clearly above flat (gx dominates |gz|). */
+    if (gx > 0.0f && gx > RAISED_ELEVATION_RATIO * fabsf(gz)) {
+        return WRIST_UP_RAISED;
     }
 
-    /* NEUTRAL when no axis is clearly dominant over the others
-     * (DOMINANCE_RATIO gate -- prevents 3-way-balanced poses from
-     * being mis-classified to whichever is fractionally largest).
-     * No absolute magnitude threshold by design -- see DOMINANCE_RATIO
-     * comment for rationale. */
-    if (second_mag > 0.0f && largest_mag < DOMINANCE_RATIO * second_mag) {
-        return WRIST_NEUTRAL;
+    /* FLAT: volar-normal up and dominant over BOTH other axes. */
+    if (gz > 0.0f &&
+        gz > DOMINANCE_RATIO * fabsf(gx) &&
+        gz > DOMINANCE_RATIO * fabsf(gy)) {
+        return WRIST_DOWN_FLAT;
     }
 
-    /* Classify based on which axis dominates + its sign.
-     *
-     * Empirical mapping from field calibration (this user, this
-     * board mounting):
-     *   - X+ dominant ~ 6.2 m/s^2  ==> AIR_MOUSE raised pose
-     *     (captured during two test attempts at g=[6.18,-4.23,3.66]
-     *     and g=[6.23,-3.98,3.24])
-     *   - Z+ dominant ~ 8.3 m/s^2  ==> band flat / surface
-     *     (captured during snapshot windows when band was sitting
-     *     on desk: accel=(0.47,-5.04,8.27) etc.)
-     *   - Y axis dominance: no current empirical mapping; was a
-     *     placeholder guess for raised pose in earlier code, now
-     *     stripped.  Will need re-test if the user adopts a third
-     *     distinct gesture pose where Y dominates.
-     *
-     * If the user's board mounting changes (e.g. switching wrists
-     * or rotating the band on the strap), these mappings will need
-     * to be re-captured.  Procedure: hold the band in each intended
-     * pose, run 'g' over serial, read raw_g and update the
-     * conditions below to match. */
-    switch (largest_axis) {
-    case 0:  /* X-axis dominant */
-        /* Positive X dominant -> wrist raised in AIR_MOUSE pose. */
-        return (largest_signed > 0.0f) ? WRIST_UP_RAISED : WRIST_NEUTRAL;
-    case 1:  /* Y-axis dominant */
-        /* No mapping yet -- not enough field data.  Stay NEUTRAL so
-         * the FSM doesn't fire on poses we don't recognize. */
-        return WRIST_NEUTRAL;
-    case 2:  /* Z-axis dominant */
-        /* Positive Z dominant -> band flat (palm-down on surface
-         * or armrest level).  Used as the disengage zone for
-         * AIR_MOUSE exit and as the entry condition for SURFACE
-         * mode. */
-        return (largest_signed > 0.0f) ? WRIST_DOWN_FLAT : WRIST_NEUTRAL;
-    default:
-        return WRIST_NEUTRAL;
-    }
+    return WRIST_NEUTRAL;
 }
 
 /* Forward decl -- defined immediately after _transition_to.  Called

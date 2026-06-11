@@ -106,6 +106,16 @@
 /* Axis-dominance ratio for the coarse orientation classifier.  [STRUCTURAL] */
 #define DOMINANCE_RATIO                 1.3f
 
+/* Raised-zone elevation ratio: UP_RAISED when gx (forearm axis, positive)
+ * exceeds this * |gz| -- "arm up, not flat", IGNORING the gy SWEEP axis so a
+ * wide air-mouse reach (gy large at the extremes) stays raised instead of
+ * flapping to NEUTRAL (the 2026-06-11 sweep bug).  Part of the unified
+ * gravity-component geometry (observability doc 3.5).  EMPIRICAL: observed
+ * min gx/|gz| across the raised sweep ~1.31, so 1.1 leaves margin; refine
+ * against cross-session adversarial traces.  Regression test: 2026-06-11
+ * sweep log -> 0 UP_RAISED<->NEUTRAL transitions.  [USER] */
+#define RAISED_ELEVATION_RATIO          1.1f
+
 /* ---------------------------------------------------------------------------
  *  3. Gesture / tap timing (cadenced double-tap, ringing, activity)
  *  --------------------------------------------------------------------------- */
