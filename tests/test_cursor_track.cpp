@@ -147,6 +147,35 @@ int main(void)
     cursor_track_update(15.0f, 50.0f, false, V, &dx, &dy);   /* still at top, latch true */
     CHECK(!cursor_track_is_slamming());
 
+    /* --- X relative preserved; Y stillness via servo (Task 6) --- */
+
+    /* X1: roll still drives dx (relative px/deg) with the cone gate. */
+    cursor_track_set_gain(CURSOR_GAIN_X, CURSOR_GAIN_Y);
+    cursor_track_start(15.0f, 50.0f);
+    drain_slam(15.0f, 50.0f);
+    cursor_track_update(15.0f, 50.0f, false, V, &dx, &dy);        /* seed roll, valid */
+    cursor_track_update(15.0f, 53.0f, false, V, &dx, &dy);        /* droll=+3 */
+    CHECK(fabsf(dx - CURSOR_GAIN_X * 3.0f) < 1e-3f);
+
+    /* X2: cone gate still gates X (shadow below INVALIDATE -> dx 0). */
+    cursor_track_update(15.0f, 56.0f, false, CURSOR_ROLL_SHADOW_INVALIDATE - 1.0f, &dx, &dy);
+    CHECK(dx == 0.0f);
+
+    /* Y1: Y has NO at_rest freeze — when the wrist is still the servo already
+     * yields dy=0 (target static), and at_rest must not change Y behaviour.
+     * After converging to a target, dy is 0 with at_rest both false and true. */
+    cursor_track_start(15.0f, 50.0f);
+    drain_slam(15.0f, 50.0f);
+    for (int i = 0; i < 20; i++) cursor_track_update(25.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(dy) < 1e-3f);                     /* converged, still */
+    cursor_track_update(25.0f, 50.0f, true,  V, &dx, &dy);
+    CHECK(fabsf(dy) < 1e-3f);                     /* at_rest=true changes nothing on Y */
+
+    /* Y2: a fresh vert step still moves Y even with at_rest=true (servo, not
+     * freeze, owns Y -> at_rest never blocks a real target change). */
+    cursor_track_update(30.0f, 50.0f, true, V, &dx, &dy);
+    CHECK(dy > 0.0f);
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }
