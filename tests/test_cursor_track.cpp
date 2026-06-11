@@ -66,6 +66,32 @@ int main(void)
     cursor_track_update(40.0f, 80.0f, false, V, &dx, &dy);
     CHECK(dx == 0.0f && dy == 0.0f);
 
+    /* --- Slam sizing (Task 3) --- */
+
+    /* S1: entry arms a slam, and it lasts >= the floor's worth of reports
+     * regardless of a tiny GAIN_Y (undershoot would poison registration). */
+    cursor_track_set_gain(8.0f, 1.0f);          /* gain_y tiny -> max_counts small */
+    cursor_track_start(15.0f, 50.0f);
+    CHECK(cursor_track_is_slamming());
+    int floor_reports = (int)ceilf(CURSOR_SLAM_FLOOR_COUNTS / 127.0f);
+    int used = drain_slam(15.0f, 50.0f);
+    CHECK(used >= floor_reports);               /* not shorter than the floor */
+    CHECK(used <= CURSOR_SLAM_MAX_REPORTS);      /* and capped */
+
+    /* S2: a large tuned range scales the slam up (margin*max_counts > floor),
+     * still capped. */
+    cursor_track_set_gain(8.0f, 60.0f);          /* max=60*40=2400; *2=4800<6000 floor */
+    cursor_track_start(15.0f, 50.0f);
+    int used2 = drain_slam(15.0f, 50.0f);
+    CHECK(used2 >= floor_reports);
+    cursor_track_set_gain(8.0f, 200.0f);         /* max=8000; *2=16000 -> capped */
+    cursor_track_start(15.0f, 50.0f);
+    int used3 = drain_slam(15.0f, 50.0f);
+    CHECK(used3 == CURSOR_SLAM_MAX_REPORTS);
+
+    /* restore default gain for any later tests */
+    cursor_track_set_gain(CURSOR_GAIN_X, CURSOR_GAIN_Y);
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }
