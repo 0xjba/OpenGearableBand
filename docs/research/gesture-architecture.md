@@ -1178,6 +1178,24 @@ Documentation typically lists "Cortex-M4" without FPU detail.  Our
 chip is M4F.  Verify FPU is utilized by EI codegen -- should give
 meaningful inference speedup.
 
+### F. Host pointer acceleration must be OFF (Mac app onboarding)
+
+**HARD prerequisite for the air-mouse cursor — the companion (Mac)
+app MUST detect and prompt the user to disable it.**  The absolute-Y
+cursor is a band-side servo assuming `1 emitted HID count == constant
+pixels`.  macOS pointer **acceleration** (System Settings → Mouse →
+Advanced → Pointer acceleration) breaks that: mild at low speed (slow
+tracking feels fine) but steep at high speed, so the servo's
+max-velocity catch-up bursts after a slam-to-edge get amplified and the
+cursor **flies off-target**.  *Hardware-confirmed 2026-06-12: accel ON
+flung the cursor toward center from the top; OFF fixed it cleanly.*
+The firmware compile-asserts `CURSOR_SENSITIVITY == 1.0` (tracking
+*speed*) but the acceleration *curve* is a separate macOS toggle the
+firmware can't see/set — hence app responsibility.  It is a GLOBAL
+setting, so prefer a per-device (LinearMouse-style) profile that only
+affects the band; fall back to the global toggle with explanation.
+See `docs/superpowers/specs/2026-06-11-absolute-y-cursor-design.md` §2.
+
 ---
 
 ## 10.5 Trigger architecture (2026-06-10 redesign)

@@ -375,34 +375,6 @@ Tracked but not yet investigated:
 
 ---
 
-## Mac companion app — required host setup
-
-The air-mouse cursor (absolute-Y, see
-`docs/superpowers/specs/2026-06-11-absolute-y-cursor-design.md`) depends on host
-configuration the firmware cannot enforce. When the Mac companion app is built,
-it MUST handle these as part of onboarding:
-
-- **REQUIRED — pointer acceleration OFF.** The cursor is a band-side absolute
-  servo that assumes `1 emitted HID count == constant pixels`. macOS pointer
-  **acceleration** (System Settings → Mouse → Advanced → Pointer acceleration)
-  breaks that assumption: it is mild at low speed (so slow tracking feels fine)
-  but **steep at high speed**, so the servo's max-velocity catch-up bursts after
-  a slam-to-edge get amplified and the cursor **flies off-target** (confirmed on
-  hardware 2026-06-12 — with accel ON the cursor flung toward center from the
-  top; turning it OFF fixed it cleanly). The app must **detect and prompt the
-  user to disable pointer acceleration** (or set it per-device via a bundled
-  LinearMouse-style profile), and ideally re-check it on launch. This is a hard
-  prerequisite, not a nicety — the cursor is unusable with accel on.
-  - Firmware already compile-asserts `CURSOR_SENSITIVITY == 1.0` (the
-    tracking-*speed* scalar), but the acceleration *curve* is a separate macOS
-    toggle the firmware can't see or set — hence this host-app responsibility.
-- **Note — accel is a GLOBAL setting.** Turning it off changes the feel of the
-  user's everyday mouse too. Prefer the per-device (LinearMouse-style) approach
-  so only the band is affected; fall back to the global toggle with a clear
-  explanation if per-device isn't available.
-
----
-
 ## Sources
 
 Listed by which stage they primarily support.
