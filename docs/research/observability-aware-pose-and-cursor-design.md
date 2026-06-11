@@ -145,6 +145,45 @@ the *same* cone as the pose classifier.
 
 (Madgwick/Mahony, ZUPT/ZARU refs in `cursor-drift-mitigation.md`.)
 
+## 8b. UPDATE 2026-06-11 — adversarial campaign result + clench resolution
+
+Held-extreme traces (today's mount) settled the discriminator question:
+
+| Pose (held, at_rest=1) | gz | roll | verdict |
+|---|---|---|---|
+| Max-LEFT air-mouse | **+4.3** | 33 | clean air-mouse (wrist not flipped) |
+| Max-RIGHT air-mouse | **−2.5** | **113** | **collides with dictation** |
+| Dictation (bring-to-face) | −2.1 | 108 | — |
+
+**Key finding:** a held **max-right** air-mouse reach supinates the wrist
+enough to flip gz negative → roll 113, *past* dictation's 108. So the
+gz-sign / roll discriminator I proposed **does NOT survive max-right** —
+it's a full overlap, not a thin margin. Gravity provably cannot separate
+the full air-mouse envelope from dictation. (Max-LEFT, by contrast, stays
+gz>0 — confirming the *wrist flip*, not the *arm position*, is the signal.)
+
+**Resolution (two layers, both already in the design intent):**
+1. **The gesture decides the mode, never the pose** — air-mouse = taps,
+   dictation = **clench → mic → voice**. Max-right has *no clench*, so it
+   is never dictation regardless of its dictation-identical gravity. The
+   collision becomes irrelevant.
+2. **Max-right is in-session** (a cursor move *after* air-mouse entry), not
+   an entry pose — so the entry decision never confronts it anyway.
+
+**=> Design pivot:** do NOT use roll/gz as the air-mouse↔dictation
+discriminator (it can't be). Keep the **cone** only for roll-*reliability*
+(the cursor's roll→X axis, and blocking the near-vertical garbage zone).
+The MODE decision rides entirely on the confirming gesture.
+
+**Clench gate (refines decision_dictation_voice_gated_entry):** DICTATION =
+bring-to-face pose + **CLENCH** (the deliberate act) → powers the mic →
+listens for voice. The clench (a) separates dictation from gravity-identical
+poses like max-right, and (b) gates mic power so it isn't always-on (answers
+the battery + ambient-voice concerns). Clench detection is FUTURE work — lean
+IMU/bio-acoustic (tendon micro-motion / high-ODR), NOT PPG, so the gate stays
+cheap and available while IMU-only in IDLE. Dictation stays log-only until
+clench + voice exist.
+
 ## 9. Status / next
 
 Measure A/B/C → derive cone + dictation signature on today's mount → write
