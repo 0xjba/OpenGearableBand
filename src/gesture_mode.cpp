@@ -194,8 +194,11 @@ static bool cursor_has_reached_pose = false;
 static int entry_grace_remaining = 0;
 
 /* AIR_MOUSE desk-settle exit state (Amendment A.3). */
-static bool air_impact_seen      = false;  /* (a) volar-contact impact latched in the near-flat zone */
-static int  air_past_plane_dwell = 0;      /* (b) consecutive samples forearm is past horizontal */
+/* (a) DESK-contact exit: the chip tap engine fires on the volar landing.  Set
+ * by gesture_mode_on_chip_single_tap (power thread) when AIR_MOUSE + near-flat;
+ * read+cleared by gesture_mode_update_accel (acq thread) -> atomic. */
+static atomic_t air_desk_tap     = ATOMIC_INIT(0);
+static int      air_past_plane_dwell = 0;  /* (b) consecutive samples forearm is past horizontal */
 
 /* Reference gravity vector captured at the moment a cursor mode
  * first engages (cursor_has_reached_pose flips false -> true).
@@ -526,7 +529,7 @@ static void _transition_to(GestureMode new_mode)
     if (_mode_needs_continuous_imu(new_mode)) {
         /* Clear desk-settle state from any prior cursor session so a stale
          * impact latch can't false-exit right after a fast re-engage. */
-        air_impact_seen      = false;
+        atomic_set(&air_desk_tap, 0);
         air_past_plane_dwell = 0;
 
         WristOrientation expected =
@@ -560,7 +563,7 @@ static void _transition_to(GestureMode new_mode)
     } else {
         cursor_has_reached_pose = false;
         entry_grace_remaining = 0;
-        air_impact_seen = false;
+        atomic_set(&air_desk_tap, 0);
         air_past_plane_dwell = 0;
     }
 
@@ -648,7 +651,7 @@ void gesture_mode_init(void)
     cursor_cooldown_mode = MODE_IDLE;
     cursor_has_reached_pose = false;
     entry_grace_remaining = 0;
-    air_impact_seen = false;
+    atomic_set(&air_desk_tap, 0);
     air_past_plane_dwell = 0;
     surface_motion_burst_dwell = 0;
     surface_motion_peak = 0.0f;
@@ -895,10 +898,10 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     }
 
     /* --- Exit detection (per mode) ---
-     * AIR_MOUSE (Amendment A.3): stay engaged through the full raised->near-flat
-     * range; exit only on a desk-settle in the near-flat zone -- (a) volar
-     * contact impact + settle (desk present), or (b) forearm past the
-     * horizontal plane (no desk).  SURFACE keeps its orientation-drop exit. */
+     * AIR_MOUSE: stay engaged through the full raised->near-flat range; exit on
+     * (a) a chip tap in the near-flat zone (the band landing on a desk), or
+     * (b) the forearm crossing past horizontal (no desk).  SURFACE keeps its
+     * orientation-drop exit. */
     if (in_cursor_mode && cursor_has_reached_pose) {
         bool do_exit = false;
         const char *exit_reason = "";
@@ -906,23 +909,19 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         if (current_mode == MODE_AIR_MOUSE) {
             bool near_flat = (gx_filt < CURSOR_DESK_ZONE_GX);
 
-            /* (a) desk present: an impact while near-flat, then stillness. */
-            if (!near_flat) {
-                air_impact_seen = false;          /* left the zone -> reset the latch */
-            } else if (r_mag > CURSOR_IMPACT_THRESH) {
-                air_impact_seen = true;           /* volar contact transient */
-                /* TODO(clicks): once click/tap is implemented, a tap while near-flat
-                 * also spikes r_mag and would latch this -> false desk-exit. Then
-                 * gate the impact on N consecutive samples / a decay signature to
-                 * tell a desk landing from an on-wrist tap. */
-            }
-            /* desk_settled needs BOTH a prior impact latch AND subsequent quiet;
-             * quiet alone (a still near-flat hover to point at the bottom) must
-             * NOT exit. */
-            bool desk_settled = air_impact_seen &&
-                                (samples_since_activity >= CURSOR_SETTLE_DWELL);
+            /* (a) DESK PRESENT: the chip tap engine fired on the volar landing.
+             * Read-and-clear every tick so the flag never goes stale; only
+             * counts as an exit while near-flat. */
+            /* atomic_set returns the PREVIOUS value (Zephyr contract; like
+             * __atomic_exchange), so this writes 0 and tests the old value in a
+             * single atomic op -- a true read-and-clear, NOT atomic_get+atomic_set.
+             * Cleared every tick here (and in the else / transition / init sites),
+             * so a tap set before the pose is reached can never linger into a
+             * spurious exit. */
+            bool tapped   = (atomic_set(&air_desk_tap, 0) != 0);
+            bool desk_tap = near_flat && tapped;
 
-            /* (b) desk absent: signed gx crosses past horizontal (drooping). */
+            /* (b) DESK ABSENT: signed gx crosses past horizontal (drooping). */
             if (gx_filt < CURSOR_PAST_PLANE_GX) {
                 if (air_past_plane_dwell < CURSOR_PAST_PLANE_DWELL) air_past_plane_dwell++;
             } else {
@@ -930,16 +929,15 @@ void gesture_mode_update_accel(float ax, float ay, float az)
             }
             bool past_plane = (air_past_plane_dwell >= CURSOR_PAST_PLANE_DWELL);
 
-            if (desk_settled)    { do_exit = true; exit_reason = "desk contact + settle"; }
+            if (desk_tap)        { do_exit = true; exit_reason = "desk contact (chip tap)"; }
             else if (past_plane) { do_exit = true; exit_reason = "past horizontal plane (no desk)"; }
 
-            /* Near-flat telemetry to HW-tune CURSOR_IMPACT_THRESH (Amendment A.4). */
+            /* Near-flat telemetry. */
             if (near_flat) {
                 static int deskdbg = 0;
                 if (++deskdbg % 10 == 0) {
-                    LOG_INF("[DESK] gx=%d r_mag=%d still=%d impact=%d ppdwell=%d",
-                            (int)gx_filt, (int)r_mag, (int)samples_since_activity,
-                            (int)air_impact_seen, air_past_plane_dwell);
+                    LOG_INF("[DESK] gx=%d still=%d ppdwell=%d",
+                            (int)gx_filt, (int)samples_since_activity, air_past_plane_dwell);
                 }
             }
         } else {
@@ -963,13 +961,13 @@ void gesture_mode_update_accel(float ax, float ay, float az)
                     _mode_str(current_mode), exit_reason, CURSOR_COOLDOWN_SAMPLES * 10);
             cursor_cooldown_mode = current_mode;
             cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
-            air_impact_seen = false;
+            atomic_set(&air_desk_tap, 0);
             air_past_plane_dwell = 0;
             _transition_to(MODE_IDLE);
         }
     } else {
         cursor_exit_dwell = 0;
-        air_impact_seen = false;
+        atomic_set(&air_desk_tap, 0);
         air_past_plane_dwell = 0;
     }
 
@@ -1162,6 +1160,23 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
      * the pose-gated trigger redesign spec. */
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
+
+    /* Desk-contact exit (Part 2): a chip tap while in AIR_MOUSE and near-flat is
+     * the band landing on the desk -> raise the exit flag (read by
+     * gesture_mode_update_accel) and consume the tap (not an entry gesture). */
+    if (current_mode == MODE_AIR_MOUSE && gx_filt < CURSOR_DESK_ZONE_GX) {
+        atomic_set(&air_desk_tap, 1);
+        /* Keep the recent-activity guard + ringing refractory live: a desk
+         * landing is real motion, so record it like any tap, else a sig-motion
+         * a few ms later could slip past gesture_mode_recent_activity() into
+         * WORKOUT_VERIFY. (gx_filt: written by acq thread, read here on the power
+         * thread -- a single float is one word on Cortex-M, torn read is
+         * impossible, one-sample staleness is fine for a threshold gate.) */
+        prev_chip_tap_time_ms = last_chip_tap_time_ms;
+        last_chip_tap_time_ms = k_uptime_get();
+        return;
+    }
+
     int64_t now = k_uptime_get();
 
     /* Ringing-rejection refractory: at 833 Hz the chip's QUIET

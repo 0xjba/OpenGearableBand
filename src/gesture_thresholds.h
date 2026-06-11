@@ -297,8 +297,6 @@
 #define CURSOR_DESK_ZONE_GX             1.7f    /* near-flat zone: gx below this (vert>~80) [USER] */
 #define CURSOR_PAST_PLANE_GX            (-1.0f) /* (b) no-desk exit: forearm past horizontal [USER] */
 #define CURSOR_PAST_PLANE_DWELL         15      /* samples gx must stay past-plane [USER] */
-#define CURSOR_IMPACT_THRESH            6.0f    /* (a) accel-residual spike, m/s^2 -- HW-TUNED seed [HOUSING] */
-#define CURSOR_SETTLE_DWELL             40      /* post-impact stillness samples (~400ms) [USER] */
 
 /* Slam (manufactured edge clamp).  Over-travel is free (OS clamps); undershoot
  * poisons registration -> a GAIN_Y-INDEPENDENT floor guarantees the edge even
