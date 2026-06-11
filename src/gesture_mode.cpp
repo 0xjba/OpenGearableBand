@@ -39,6 +39,17 @@ static float gx_filt = 0.0f;
 static float gy_filt = 0.0f;
 static float gz_filt = -9.81f;   /* assume face-up at boot */
 
+/* Angle-from-vertical (deg) from the GRAVITY-LPF: the cursor Y driver.
+ * Roll-immune (a scalar projection of gravity onto the forearm axis), unlike
+ * Euler pitch which saturates at high roll -- see cursor_track.h. */
+static inline float current_vert_deg(void)
+{
+    float mag = sqrtf(gx_filt * gx_filt + gy_filt * gy_filt + gz_filt * gz_filt);
+    return (mag > 0.1f)
+        ? acosf(fminf(1.0f, fabsf(gx_filt) / mag)) * (180.0f / 3.14159265f)
+        : 0.0f;
+}
+
 /* Filter initialised flag (so first sample seeds the state instead
  * of being heavily attenuated by the LP filter). */
 static bool filter_initialised = false;
@@ -196,14 +207,7 @@ static int entry_grace_remaining = 0;
  *
  * For AIR_MOUSE the same idea applies but for the raised pose --
  * tracking is relative to the at-engagement orientation rather than
- * absolute angles.
- *
- * Captured here but NOT yet consumed in Item 0; cursor_pipeline.cpp
- * will read these once cursor tracking lands. */
-static float cursor_reference_gx = 0.0f;
-static float cursor_reference_gy = 0.0f;
-static float cursor_reference_gz = 0.0f;
-static bool  cursor_reference_valid = false;
+ * absolute angles. */
 
 /* Acquisition-request callback registered by main.cpp. */
 static gesture_acq_request_cb_t s_acq_request_cb = NULL;
@@ -477,7 +481,7 @@ static void _transition_to(GestureMode new_mode)
     if (new_mode == MODE_AIR_MOUSE) {
         orientation_state_t ori;
         orientation_get(&ori);
-        cursor_track_start(ori.pitch_deg, ori.roll_deg);
+        cursor_track_start(current_vert_deg(), ori.roll_deg);
     } else {
         cursor_track_stop();
     }
@@ -547,7 +551,6 @@ static void _transition_to(GestureMode new_mode)
     } else {
         cursor_has_reached_pose = false;
         entry_grace_remaining = 0;
-        cursor_reference_valid = false;
     }
 
     /* Clear the cooldown-reengage flag unconditionally so it never
@@ -634,10 +637,6 @@ void gesture_mode_init(void)
     cursor_cooldown_mode = MODE_IDLE;
     cursor_has_reached_pose = false;
     entry_grace_remaining = 0;
-    cursor_reference_valid = false;
-    cursor_reference_gx = 0.0f;
-    cursor_reference_gy = 0.0f;
-    cursor_reference_gz = 0.0f;
     surface_motion_burst_dwell = 0;
     surface_motion_peak = 0.0f;
     surface_motion_log_counter = 0;
@@ -867,23 +866,8 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         cursor_has_reached_pose = true;
         entry_grace_remaining = 0;  /* engaged -- stop the timeout */
 
-        /* Capture the engagement gravity vector as the reference plane.
-         * For SURFACE this records the desk-plane orientation at the
-         * instant of contact; for AIR_MOUSE it records the raised-pose
-         * baseline.  Item 2 (cursor pipeline) will use this to compute
-         * cursor motion relative to the engagement orientation rather
-         * than absolute angles. */
-        cursor_reference_gx = gx_filt;
-        cursor_reference_gy = gy_filt;
-        cursor_reference_gz = gz_filt;
-        cursor_reference_valid = true;
-
-        LOG_INF("%s: expected pose reached -- exit detection armed, "
-                "ref g=[%.3f, %.3f, %.3f]",
-                _mode_str(current_mode),
-                (double)cursor_reference_gx,
-                (double)cursor_reference_gy,
-                (double)cursor_reference_gz);
+        LOG_INF("%s: expected pose reached -- exit detection armed",
+                _mode_str(current_mode));
     }
 
     /* Entry-grace timeout: counts down while in a cursor mode and
@@ -1022,10 +1006,24 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
         orientation_state_t ori;
         orientation_get(&ori);
         float shadow = sqrtf(gy_filt * gy_filt + gz_filt * gz_filt);
+        float vert = current_vert_deg();      /* roll-immune Y driver */
         float dx = 0.0f, dy = 0.0f;
-        cursor_track_update(ori.pitch_deg, ori.roll_deg, ori.at_rest,
+        cursor_track_update(vert, ori.roll_deg, ori.at_rest,
                             shadow, &dx, &dy);
         cursor_pipeline_inject_motion(dx, dy);
+
+        /* Throttled cursor telemetry (~10 Hz).  Exposes absolute-Y internal
+         * state (vert_top anchor, cur_y position, slam flag) alongside the
+         * motion deltas for tuning and acceptance testing. */
+        static int cursor_tel_ctr = 0;
+        if ((dx != 0.0f || dy != 0.0f || cursor_track_is_slamming()) &&
+            (++cursor_tel_ctr % 10 == 0)) {
+            LOG_INF("[CURSOR] vert=%d vtop=%d cur_y=%d slam=%d roll=%d "
+                    "shadow=%d dx=%d dy=%d",
+                    (int)vert, (int)cursor_track_vert_top(),
+                    (int)cursor_track_cur_y(), (int)cursor_track_is_slamming(),
+                    (int)ori.roll_deg, (int)shadow, (int)dx, (int)dy);
+        }
     }
 
     /* Push into the rotation-signature ring buffer (dictation-flip
