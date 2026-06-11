@@ -9,13 +9,17 @@ static_assert(CURSOR_ROLL_SHADOW_REVALIDATE >= CURSOR_ROLL_SHADOW_INVALIDATE,
 static float s_prev_pitch = 0.0f;
 static float s_prev_roll  = 0.0f;
 static bool  s_roll_valid = false;
+static bool  s_started    = false;
 
 /* Wrap an angle delta into [-180,180] so the roll (atan2) discontinuity at
  * +/-180 doesn't produce a ~360 deg jump. */
 static float wrap180(float d)
 {
-    while (d >  180.0f) d -= 360.0f;
-    while (d < -180.0f) d += 360.0f;
+    /* if (not while): the raw delta of two bounded angles is in [-360,+360],
+     * so a single step lands in [-180,+180].  A while loop would hang on a
+     * non-finite input -- fatal on an MCU with no watchdog here. */
+    if (d >  180.0f) d -= 360.0f;
+    if (d < -180.0f) d += 360.0f;
     return d;
 }
 
@@ -24,11 +28,14 @@ void cursor_track_start(float pitch_deg, float roll_deg)
     s_prev_pitch = pitch_deg;
     s_prev_roll  = roll_deg;
     s_roll_valid = false;   /* gate X until the shadow clearly clears the cone */
+    s_started    = true;
 }
 
 void cursor_track_update(float pitch_deg, float roll_deg, bool at_rest,
                          float shadow, float *out_dx, float *out_dy)
 {
+    if (!s_started) { *out_dx = 0.0f; *out_dy = 0.0f; return; }
+
     float dpitch = wrap180(pitch_deg - s_prev_pitch);
     float droll  = wrap180(roll_deg  - s_prev_roll);
 
@@ -65,4 +72,5 @@ void cursor_track_update(float pitch_deg, float roll_deg, bool at_rest,
 void cursor_track_stop(void)
 {
     s_roll_valid = false;
+    s_started    = false;
 }

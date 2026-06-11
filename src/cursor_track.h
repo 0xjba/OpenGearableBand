@@ -11,6 +11,9 @@ extern "C" {
  * Air-mouse pointing: turn the drift-free orientation into a relative mouse
  * delta.  PURE -- no Zephyr / cursor_pipeline deps, so it is host-unit-
  * testable; the CALLER injects the returned delta into cursor_pipeline.
+ * (The spec draft showed cursor_track_update calling cursor_pipeline_inject_
+ * motion directly; the plan revised it to out-params so the module stays
+ * caller-injectable and testable without the pipeline.)
  * Relative/rate model.  Stateful singleton (one band / one cursor).
  * See docs/superpowers/specs/2026-06-11-air-mouse-cursor-design.md.
  */

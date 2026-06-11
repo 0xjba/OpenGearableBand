@@ -37,6 +37,20 @@ int main(void)
                         &dx, &dy);                                                    /* between -> holds */
     CHECK(dx != 0.0f);
 
+    /* 4b. Hysteresis (inverse): a previously-INVALID state is also held in
+     * the band -- catches an accidental ">= INVALIDATE" revalidation bug. */
+    cursor_track_start(-60.0f, 50.0f);
+    cursor_track_update(-60.0f, 50.0f, false, CURSOR_ROLL_SHADOW_INVALIDATE - 1.0f, &dx, &dy); /* valid=false */
+    cursor_track_update(-60.0f, 51.0f, false,
+                        (CURSOR_ROLL_SHADOW_INVALIDATE + CURSOR_ROLL_SHADOW_REVALIDATE) * 0.5f,
+                        &dx, &dy);                                                    /* between -> holds invalid */
+    CHECK(dx == 0.0f);
+
+    /* 4c. After stop(), update is a safe no-op until a fresh start. */
+    cursor_track_stop();
+    cursor_track_update(-60.0f, 80.0f, false, V, &dx, &dy);
+    CHECK(dx == 0.0f && dy == 0.0f);
+
     /* 5. Freeze: at_rest + tiny delta -> no motion. */
     cursor_track_start(-60.0f, 50.0f);
     cursor_track_update(-60.0f, 50.0f, true, V, &dx, &dy);
