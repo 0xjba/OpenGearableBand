@@ -2,6 +2,8 @@
 #include "gesture_poses.h"
 #include "orientation.h"
 #include "gesture_thresholds.h"
+#include "cursor_track.h"
+#include "cursor_pipeline.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -470,6 +472,15 @@ static void _transition_to(GestureMode new_mode)
         return;
     }
     atomic_set(&mode_atomic, (atomic_val_t)new_mode);
+    /* Air-mouse cursor: start tracking on entry (capture the reference
+     * angles so there's no jump), stop on any transition away. */
+    if (new_mode == MODE_AIR_MOUSE) {
+        orientation_state_t ori;
+        orientation_get(&ori);
+        cursor_track_start(ori.pitch_deg, ori.roll_deg);
+    } else {
+        cursor_track_stop();
+    }
     LOG_INF("Mode transition: %s -> %s",
             _mode_str(old), _mode_str(new_mode));
     /* Reset dwell counters on every transition so the next trigger
@@ -1004,6 +1015,19 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
     orientation_update(last_raw_ax, last_raw_ay, last_raw_az,
                        gx_rps, gy_rps, gz_rps);
 
+    /* Air-mouse cursor tracking: fused angles -> relative delta -> pipeline.
+     * Cone gate uses the GRAVITY-LPF shadow (gy_filt/gz_filt), NEVER the
+     * fused quaternion (inside the cone the fused roll drifts on gyro alone). */
+    if ((GestureMode)atomic_get(&mode_atomic) == MODE_AIR_MOUSE) {
+        orientation_state_t ori;
+        orientation_get(&ori);
+        float shadow = sqrtf(gy_filt * gy_filt + gz_filt * gz_filt);
+        float dx = 0.0f, dy = 0.0f;
+        cursor_track_update(ori.pitch_deg, ori.roll_deg, ori.at_rest,
+                            shadow, &dx, &dy);
+        cursor_pipeline_inject_motion(dx, dy);
+    }
+
     /* Push into the rotation-signature ring buffer (dictation-flip
      * prototype).  Stored in rad/s; gyro_signature() converts. */
     gyro_hist[gyro_hist_idx][0] = gx_rps;
@@ -1220,10 +1244,7 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
     switch (armed) {
     case POSE_AIR_MOUSE:
         LOG_INF("MODE ENTRY: AIR_MOUSE (pose + cadenced double-tap)");
-        /* TODO (future task F2): wire to power state machine -- see
-         * 't'/'y' serial commands in main.cpp for the AIR_MOUSE entry
-         * pattern.  Logged-only for now to verify pose+gesture path
-         * empirically first. */
+        _transition_to(MODE_AIR_MOUSE);
         break;
 
     case POSE_SURFACE:
