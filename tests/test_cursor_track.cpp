@@ -6,72 +6,66 @@
 static int failures = 0;
 #define CHECK(cond) do { if(!(cond)){ printf("FAIL line %d: %s\n", __LINE__, #cond); failures++; } } while(0)
 
+/* Drive past any entry slam: call update until the slam burst is exhausted,
+ * holding vert/roll fixed so only the slam contributes.  Returns ticks used. */
+static int drain_slam(float vert, float roll)
+{
+    float dx, dy;
+    int n = 0;
+    for (; n < CURSOR_SLAM_MAX_REPORTS + 2; n++) {
+        if (!cursor_track_is_slamming()) break;
+        cursor_track_update(vert, roll, false, 0.0f, &dx, &dy);
+    }
+    return n;
+}
+
 int main(void)
 {
     float dx, dy;
     const float V = CURSOR_ROLL_SHADOW_REVALIDATE + 1.0f; /* shadow: X valid */
 
-    /* 1. Unchanged angles -> no movement. */
-    cursor_track_start(-60.0f, 50.0f);
-    cursor_track_update(-60.0f, 50.0f, false, V, &dx, &dy);
-    CHECK(dx == 0.0f && dy == 0.0f);
+    /* --- Map + servo (Task 2) --- */
 
-    /* 2. Pitch->dy, roll->dx, scaled by gain (X valid). */
-    cursor_track_start(-60.0f, 50.0f);
-    cursor_track_update(-58.0f, 53.0f, false, V, &dx, &dy);  /* dpitch=+2 droll=+3 */
-    CHECK(fabsf(dy - CURSOR_GAIN_Y * 2.0f) < 1e-3f);
-    CHECK(fabsf(dx - CURSOR_GAIN_X * 3.0f) < 1e-3f);
+    /* M1: after the entry slam drains, the cursor estimate is pinned to top
+     * (cur_y == 0) and holding vert==vert_top yields no Y motion. */
+    cursor_track_start(15.0f, 50.0f);   /* vert_top = 15 */
+    drain_slam(15.0f, 50.0f);
+    CHECK(fabsf(cursor_track_cur_y() - 0.0f) < 1e-3f);
+    cursor_track_update(15.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(dy) < 1e-3f);                       /* target 0, cur_y 0 -> err 0 */
 
-    /* 3. Cone gate: shadow below INVALIDATE -> X gated, Y still moves. */
-    cursor_track_start(-60.0f, 50.0f);
-    cursor_track_update(-60.0f, 50.0f, false, V, &dx, &dy);                          /* valid=true */
-    cursor_track_update(-58.0f, 55.0f, false, CURSOR_ROLL_SHADOW_INVALIDATE - 1.0f, &dx, &dy);
-    CHECK(dx == 0.0f);
-    CHECK(fabsf(dy - CURSOR_GAIN_Y * 2.0f) < 1e-3f);
+    /* M2: servo drives toward target = GAIN_Y*(vert-vert_top), int8-clamped. */
+    cursor_track_start(15.0f, 50.0f);
+    CHECK(cursor_track_is_slamming());
+    drain_slam(15.0f, 50.0f);
+    /* vert 25 -> target = 30*(25-15)=300 counts; first tick clamps to +127. */
+    cursor_track_update(25.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(dy - 127.0f) < 1e-3f);
+    /* keep holding vert=25: converges (300 = 127+127+46). */
+    cursor_track_update(25.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(dy - 127.0f) < 1e-3f);
+    cursor_track_update(25.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(dy - 46.0f) < 1e-3f);
+    cursor_track_update(25.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(dy) < 1e-3f);                       /* converged */
+    CHECK(fabsf(cursor_track_cur_y() - 300.0f) < 1e-3f);
 
-    /* 4. Hysteresis: shadow between thresholds holds the prior state. */
-    cursor_track_start(-60.0f, 50.0f);
-    cursor_track_update(-60.0f, 50.0f, false, V, &dx, &dy);                          /* valid=true */
-    cursor_track_update(-60.0f, 51.0f, false,
-                        (CURSOR_ROLL_SHADOW_INVALIDATE + CURSOR_ROLL_SHADOW_REVALIDATE) * 0.5f,
-                        &dx, &dy);                                                    /* between -> holds */
-    CHECK(dx != 0.0f);
+    /* M3: target clamps to max_counts at the comfort bottom.
+     * vert_top=15, span=40 -> vert_bottom=min(55,60)=55; max=30*40=1200. */
+    cursor_track_start(15.0f, 50.0f);
+    CHECK(cursor_track_is_slamming());
+    drain_slam(15.0f, 50.0f);
+    for (int i = 0; i < 20; i++) cursor_track_update(90.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(cursor_track_cur_y() - 1200.0f) < 1e-3f); /* clamped, not 30*(90-15) */
 
-    /* 4b. Hysteresis (inverse): a previously-INVALID state is also held in
-     * the band -- catches an accidental ">= INVALIDATE" revalidation bug. */
-    cursor_track_start(-60.0f, 50.0f);
-    cursor_track_update(-60.0f, 50.0f, false, CURSOR_ROLL_SHADOW_INVALIDATE - 1.0f, &dx, &dy); /* valid=false */
-    cursor_track_update(-60.0f, 51.0f, false,
-                        (CURSOR_ROLL_SHADOW_INVALIDATE + CURSOR_ROLL_SHADOW_REVALIDATE) * 0.5f,
-                        &dx, &dy);                                                    /* between -> holds invalid */
-    CHECK(dx == 0.0f);
-
-    /* 4c. After stop(), update is a safe no-op until a fresh start. */
+    /* M4: post-stop update is a no-op. */
+    cursor_track_start(15.0f, 50.0f);
+    drain_slam(15.0f, 50.0f);
     cursor_track_stop();
-    cursor_track_update(-60.0f, 80.0f, false, V, &dx, &dy);
+    dx = 1.0f; dy = 1.0f;
+    cursor_track_update(40.0f, 80.0f, false, V, &dx, &dy);
     CHECK(dx == 0.0f && dy == 0.0f);
 
-    /* 5. Freeze: at_rest + tiny delta -> no motion. */
-    cursor_track_start(-60.0f, 50.0f);
-    cursor_track_update(-60.0f, 50.0f, true, V, &dx, &dy);
-    CHECK(dx == 0.0f && dy == 0.0f);
-
-    /* 6. Freeze releases on a move above the release delta even if at_rest. */
-    cursor_track_start(-60.0f, 50.0f);
-    cursor_track_update(-59.0f, 50.0f, true, V, &dx, &dy);  /* dpitch=+1 > release */
-    CHECK(fabsf(dy - CURSOR_GAIN_Y * 1.0f) < 1e-3f);
-
-    /* 7a. Roll wrap at +/-180 is handled (not a teleport). */
-    cursor_track_start(-60.0f, 179.0f);
-    cursor_track_update(-60.0f, -179.0f, false, V, &dx, &dy);  /* raw -358 -> wrap +2 */
-    CHECK(fabsf(dx - CURSOR_GAIN_X * 2.0f) < 1e-3f);
-
-    /* 7b. A true glitch beyond MAX_DELTA is discarded. */
-    cursor_track_start(0.0f, 0.0f);
-    cursor_track_update(0.0f, CURSOR_MAX_DELTA_DEG + 10.0f, false, V, &dx, &dy);
-    CHECK(dx == 0.0f);
-
-    if (failures == 0) { printf("ALL PASS\n"); return 0; }
-    printf("%d FAILURES\n", failures);
-    return 1;
+    printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
+    return failures ? 1 : 0;
 }
