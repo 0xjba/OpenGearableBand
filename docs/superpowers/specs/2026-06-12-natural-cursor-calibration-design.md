@@ -55,7 +55,7 @@ calibration.
 
 ```
 gesture_mode (acq thread)                cursor_calib (PURE)            cursor_track (PURE)
-─ vert_hist[150] ring buffer  ── arrays ─▶ extract bottom plateau   ─ anchors ─▶ set_anchors(top,bottom)
+─ vert_hist[300] ring buffer  ── arrays ─▶ extract bottom plateau   ─ anchors ─▶ set_anchors(top,bottom)
 ─ at AIR_MOUSE entry:                      score ritual completeness            map uses top + bottom
     call cursor_calib_decide()             adoption matrix → verdict            (span = bottom − top)
     apply verdict, set_anchors             (+ new anchors)
@@ -69,12 +69,17 @@ Three units, each independently understandable and (for two of them) host-testab
   threads, no Zephyr. This is where every non-trivial rule lives (plateau
   extraction, ritual scoring, the adoption matrix, the blend), so all of it is
   testable like `cursor_track`. Interface in §6.
-- **`gesture_mode.cpp` — plumbing only.** Owns a new `vert_hist[150]` ring
-  buffer of absolute `vert` (deg) at 100 Hz (parallel to the existing
-  `gyro_hist`, ~600 B). At AIR_MOUSE entry (`gesture_mode.cpp:512`, where
-  `cursor_track_start` is already called) it snapshots the buffers, calls
-  `cursor_calib_decide()`, applies the returned anchors via
-  `cursor_track_set_anchors()`, and emits the `[CAL]` telemetry line.
+- **`gesture_mode.cpp` — plumbing only.** Owns a new `vert_hist[300]` ring
+  buffer of absolute `vert` (deg) at 100 Hz (separate from `gyro_hist`, ~1.2 KB).
+  At AIR_MOUSE entry (`gesture_mode.cpp:512`, where `cursor_track_start` is
+  already called) it runs a **strict three-step order**:
+  **(1) `cursor_calib_decide()` → (2) `cursor_track_set_anchors()` →
+  (3) `cursor_track_start()`**, then emits the `[CAL]` line.
+  **The ordering is load-bearing:** the entry slam and the `map(vert)` placement
+  in `cursor_track_start` are *sized from the anchors*, so the anchors MUST be
+  updated *before* `start` — otherwise the very entry that recalibrates the map
+  executes its slam-then-place against the *previous* mount's anchors, and the
+  first placement of every recalibrated session lands wrong.
 - **`cursor_track.{h,cpp}` — consumer.** `s_vert_top` changes from `const` to a
   variable; a new `s_vert_bottom` variable replaces the derived
   `vert_top + SPAN` (span becomes `bottom − top`, still clamped to
@@ -84,14 +89,20 @@ Three units, each independently understandable and (for two of them) host-testab
 
 ## 3. Data: the `vert_hist` ring buffer
 
-- `static float vert_hist[VERT_HIST_SAMPLES]`, `VERT_HIST_SAMPLES = 150` (1.5 s
-  at 100 Hz), written every sample in the acq
-  pipeline alongside `gyro_hist`, storing `current_vert_deg()` (the FAST
-  cursor-filter inclination — the same signal that drives the cursor Y).
-- ~600 B static. The 1.5 s depth matches `gyro_hist`; it must be long enough to
-  contain the resting plateau **plus** the raise. If HW traces show a slow
-  raise overruns 1.5 s, lengthen it (a `[USER]` structural constant), do not
-  silently accept a truncated plateau.
+- `static float vert_hist[VERT_HIST_SAMPLES]`, `VERT_HIST_SAMPLES = 300` (**3 s**
+  at 100 Hz), written every sample in the acq pipeline alongside `gyro_hist`,
+  storing `current_vert_deg()` (the FAST cursor-filter inclination — the same
+  signal that drives the cursor Y). This is a **separate, deeper** buffer than
+  `gyro_hist` (which stays 1.5 s for its own dictation-flip purpose).
+- **~1.2 KB static — and deliberately generous (3 s, not 1.5 s).** The buffer
+  must contain the resting plateau **plus** the entire raise. The failure mode
+  of an undersized buffer is insidious: a slow raise pushes the plateau out of
+  the window, which surfaces as `no-plateau`, which is indistinguishable in the
+  telemetry from a genuine lazy mid-air entry — so recalibration would silently
+  starve with **nothing in the log pointing at the buffer**. The trigger
+  condition is invisible by construction, so we size up front (1.2 KB on 256 KB
+  RAM is trivial) rather than wait for a symptom we cannot see. Trim only if
+  someone later has a concrete reason to.
 
 ## 4. Bottom extraction — plateau, not last-sample
 
@@ -152,7 +163,7 @@ as the top — it is not trusted even if everything else passes).
 | **Cold-start** (`!have_calib`, every boot) + ritual complete | **Seed** both immediately (blend α = 1): `new_top = top_now`, `new_bottom = bottom_candidate`. |
 | **Cold-start** + ritual incomplete | **No adopt.** Run absolute mode on the compile-time defaults (`CURSOR_VERT_TOP_DEG` / `+SPAN`); log `cold-start-default`. Self-heals on first complete ritual. |
 | Both trusted + ritual complete + `|Δtop| > CAL_MIN_DELTA` (or `|Δbottom| > CAL_MIN_DELTA`) | **Adopt (blend).** `new_top = blend(prior_top, top_now)`, `new_bottom = blend(prior_bottom, bottom_candidate)`. Span = `new_bottom − new_top`. |
-| **Top trusted, no bottom plateau** (entered from mid-air) | **Coupled adoption `[VALIDATE]`:** adopt top (blend), and *translate* bottom to preserve the last span: `new_bottom = new_top + (prior_bottom − prior_top)`. **Never** pair a fresh top with a stale-epoch bottom as independent absolutes. |
+| **Top plausible, no bottom plateau** (entered from mid-air) | **No-op + SHADOW log.** Adopt nothing (the ritual is *incomplete* — signal 1 failed — so per §5 it must not move the map). But emit the *would-have-been* coupled translation `shadow_bottom = top_now + (prior_bottom − prior_top)` in the `[CAL]` line as `decision=SHADOW-TRANSLATE`, applying nothing. |
 | Ritual incomplete / neither trusted / `|Δ| < CAL_MIN_DELTA` | **No-op.** Keep current anchors; log the reason. |
 
 **Cold-start path is a first-class path, not an edge case** (RAM-only means
@@ -169,22 +180,40 @@ entry corrects it. *(Alternative considered: require two consecutive
 agreeing entries — strictly rejects a single odd entry but costs one
 miscalibrated engagement after a genuine re-wear. Chose blend; revisit if HW
 shows blend converges too slowly after a re-wear.)*
+*(Future option, noted so it is not re-derived: an **adaptive α** — a larger
+blend factor for a large but fully-vouched delta (clear re-wear) and a small one
+for minor drift — would speed re-wear convergence without losing jitter damping.
+Dropped from v1 for simplicity; revisit alongside the two-consecutive trigger.)*
+
+**Why the mid-air case is shadow-only (not a live translate).** A translation
+moves *both* anchors at once, yet the only evidence behind it is a top that
+passed the plausibility clamp — the weakest signal in the system, on an entry
+whose ritual is by definition incomplete (no plateau). Letting that move the
+whole map contradicts §5's gate. So we **log the prediction without applying
+it**: after a few weeks, compare each `SHADOW-TRANSLATE` prediction against the
+*next* full-ritual bottom; promote the translation to a live decision only if
+the rigid-shift assumption survives that data. This keeps §5's principle absolute
+— **incomplete ritual → no adoption, ever** — while still gathering the evidence
+to justify the feature later.
 
 **Epoch rule (explicit):** `top` and `bottom` must always come from the *same*
-epoch — both fresh from one ritual, or bottom translated from the new top. The
-matrix never stores a top from entry N beside a bottom from entry M as two
-independent absolutes.
+epoch — both fresh from one complete ritual. The matrix never stores a top from
+entry N beside a bottom from entry M as two independent absolutes (the mid-air
+case adopts neither; it only shadow-logs).
 
 ## 7. Telemetry — `[CAL]` on every entry
 
 ```
 [CAL] top old=<a> new=<b>  bottom old=<c> new=<d>  span=<d-b> |
       plateau=<Y/N>(var=<v>,n=<k>)  sweep=<deg>  topdwell=<n> |
-      decision=<ADOPT|SEED|TRANSLATE|REJECT>  reason=<...>
+      decision=<ADOPT|SEED|SHADOW-TRANSLATE|REJECT>  reason=<...>
+      [shadow_bottom=<s>]   # only on SHADOW-TRANSLATE: the would-be, NOT applied
 ```
 
 `reason ∈ { ok, cold-start-default, no-plateau, insufficient-sweep,
-implausible-top, below-min-delta }`.
+implausible-top, below-min-delta, mid-air-shadow }`. The `SHADOW-TRANSLATE`
+stream is the dataset that, after a few weeks, decides whether the mid-air
+coupled translation is ever promoted to live (§6).
 
 Calibration that silently shifts the map is the subsystem we least want opaque —
 this project debugs on trace evidence. As a side effect, the per-entry `[CAL]`
@@ -196,7 +225,7 @@ prerequisite fulfils itself as a logging by-product.
 
 | Constant | Seed | Meaning |
 |---|---|---|
-| `VERT_HIST_SAMPLES` | `150` | 1.5 s of `vert` history at 100 Hz (`[STRUCTURAL]`; lengthen if a slow raise overruns) |
+| `VERT_HIST_SAMPLES` | `300` | 3 s of `vert` history at 100 Hz, ~1.2 KB (`[STRUCTURAL]`; deep on purpose — an undersized buffer fails *invisibly* as `no-plateau`, see §3) |
 | `CAL_PLATEAU_VAR` | `4.0` | max `vert` variance (deg², ~2° std) for "resting still" |
 | `CAL_PLATEAU_DWELL` | `30` (~300 ms) | min plateau length (samples) |
 | `CAL_SWEEP_MIN_DEG` | `25.0` | min `top − bottom` to count as a real raise |
@@ -217,7 +246,10 @@ bottom in `cursor_track`.
   otherwise (span = `vert_bottom() − s_vert_top`, now both variable).
 - `void cursor_track_set_anchors(float vert_top, float vert_bottom)` — sets both;
   used by `gesture_mode` after a calibration verdict. (Does **not** itself
-  re-slam; the entry slam in `cursor_track_start` still runs as today.)
+  re-slam.) **Must be called BEFORE `cursor_track_start()` at entry** (the §2
+  decide→set→start order), so the entry slam in `cursor_track_start` — which is
+  sized from the anchors — uses the *just-calibrated* values, not the previous
+  mount's.
 - `float cursor_track_vert_bottom(void)` — getter for telemetry.
 - `cursor_track_vert_top()` now returns the variable.
 
@@ -225,9 +257,12 @@ bottom in `cursor_track`.
 
 **Host unit tests (both modules are pure):**
 - `cursor_calib`: plateau extraction (median, variance gate, dwell floor, no-
-  plateau case); sweep gate; plausibility clamp; the full adoption matrix —
-  cold-start seed, both-trusted blend, coupled/translate, all reject reasons,
-  below-min-delta no-op; blend arithmetic; epoch rule (no cross-epoch pairing).
+  plateau case, **and a slow-raise case where the plateau sits near the OLD edge
+  of the buffer** — guards the §3 invisible-starvation failure); sweep gate;
+  plausibility clamp; the full adoption matrix — cold-start seed, both-trusted
+  blend, **mid-air → SHADOW-TRANSLATE (asserts nothing is applied, shadow_bottom
+  is computed)**, all reject reasons, below-min-delta no-op; blend arithmetic;
+  epoch rule (no cross-epoch pairing — the mid-air case adopts neither anchor).
 - `cursor_track`: `set_anchors` changes the map; span derived correctly; bottom
   clamp at `CURSOR_VERT_BOTTOM_MAX`; `max_counts`/`target`/slam behave with
   non-default anchors.
@@ -239,8 +274,10 @@ bottom in `cursor_track`.
 - Enter from a desk/lap rest with a full raise → `[CAL] decision=ADOPT/SEED`;
   anchors match the observed top and resting `vert`; cursor then reaches **both**
   screen edges across the wrist range.
-- Lazy mid-air entry → `decision=REJECT reason=no-plateau` (or
-  `insufficient-sweep`); map unchanged; entry still works.
+- Lazy mid-air entry → `decision=SHADOW-TRANSLATE` (top plausible, no plateau)
+  or `decision=REJECT reason=no-plateau/insufficient-sweep`; **map unchanged
+  either way**; entry still works. Confirm the `shadow_bottom` prediction is
+  logged but not applied.
 - Simulated re-wear (shift the band) → first complete ritual adopts the new
   mount's anchors; mapping is correct again without a manual step.
 - `[CAL]` lines across several sessions show `vert_top` clustering (the §4.1
@@ -253,8 +290,9 @@ bottom in `cursor_track`.
   mount-dependent contact angle), but that wiring is not in this spec.
 - **NVS persistence** — deferred (RAM-only here); the per-entry recapture makes
   reboot self-healing, so NVS is marginal until a later productionization pass.
-- **Coupled adoption** (epoch translation, §6) is tagged `[VALIDATE]` — it
-  assumes a mount shift is ~a rigid translation of both anchors; confirm on HW
-  before trusting it beyond a fallback.
+- **Coupled adoption** (mid-air epoch translation, §6) ships in **shadow mode
+  only** — logged as `SHADOW-TRANSLATE`, never applied. Promoting it to a live
+  decision is explicitly out of scope here; it happens only if the shadow
+  dataset later shows the rigid-shift assumption holds.
 - **Absolute-X**, clicks, the cursor smoothing/`o`-`p` knob, and the live-gain
   keys are untouched.
