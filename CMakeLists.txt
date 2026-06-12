@@ -14,4 +14,5 @@ target_sources(app PRIVATE
     src/ble_hid.cpp
     src/cursor_pipeline.cpp
     src/cursor_track.cpp
+    src/cursor_calib.cpp
 )

@@ -3,6 +3,7 @@
 #include "orientation.h"
 #include "gesture_thresholds.h"
 #include "cursor_track.h"
+#include "cursor_calib.h"
 #include "cursor_pipeline.h"
 
 #include <zephyr/kernel.h>
@@ -290,6 +291,22 @@ static float flick_burst_sign = 0.0f;
 static float gyro_hist[GYRO_HIST_SAMPLES][3];
 static int   gyro_hist_idx = 0;
 
+/* Absolute-vert history for natural cursor calibration (entry-time auto-anchor).
+ * SEPARATE from gyro_hist (which is gyro rates, 1.5 s) -- this is absolute vert
+ * (deg) and DEEPER (3 s) so a slow raise's resting plateau cannot fall out of the
+ * window unseen (an undersized buffer fails invisibly as no-plateau).  Written on
+ * the acq thread alongside gyro_hist; read on the acq thread at AIR_MOUSE entry
+ * (same thread -- no cross-thread race).  See
+ * docs/superpowers/specs/2026-06-12-natural-cursor-calibration-design.md. */
+static float vert_hist[VERT_HIST_SAMPLES];
+static int   vert_hist_idx = 0;
+static bool  vert_hist_primed = false;     /* false until the buffer has filled once */
+
+/* RAM-only calibration state (no NVS): false until the first complete entry ritual
+ * seeds the anchors.  cursor_track holds the anchor values; this just tracks "have
+ * we calibrated since boot" for the cold-start branch. */
+static bool cursor_have_calib = false;
+
 /* Latest raw accel (m/s^2), stashed by gesture_mode_update_accel so the
  * orientation filter can fuse it with the gyro sample that arrives in
  * the immediately-following gesture_mode_update_gyro() call. */
@@ -497,6 +514,77 @@ static void _update_acq_request(void);
  * entry.  Cleared inside _transition_to after the check. */
 static bool s_transition_via_cooldown_reengage = false;
 
+/* Copy the vert_hist ring into chronological order (oldest -> newest) for the
+ * pure decider.  Returns the count (== VERT_HIST_SAMPLES once primed, else the
+ * number written so far). */
+static int vert_hist_chronological(float *out)
+{
+    if (vert_hist_primed) {
+        int k = 0;
+        for (int i = 0; i < VERT_HIST_SAMPLES; i++) {
+            out[k++] = vert_hist[(vert_hist_idx + i) % VERT_HIST_SAMPLES];
+        }
+        return VERT_HIST_SAMPLES;
+    }
+    for (int i = 0; i < vert_hist_idx; i++) out[i] = vert_hist[i];
+    return vert_hist_idx;
+}
+
+static const char *cal_decision_str(cursor_calib_decision_t d)
+{
+    switch (d) {
+        case CAL_SEED:             return "SEED";
+        case CAL_ADOPT:            return "ADOPT";
+        case CAL_SHADOW_TRANSLATE: return "SHADOW-TRANSLATE";
+        default:                   return "REJECT";
+    }
+}
+static const char *cal_reason_str(cursor_calib_reason_t r)
+{
+    switch (r) {
+        case CAL_REASON_OK:                return "ok";
+        case CAL_REASON_COLD_START_DEFAULT:return "cold-start-default";
+        case CAL_REASON_NO_PLATEAU:        return "no-plateau";
+        case CAL_REASON_INSUFFICIENT_SWEEP:return "insufficient-sweep";
+        case CAL_REASON_IMPLAUSIBLE_TOP:   return "implausible-top";
+        case CAL_REASON_BELOW_MIN_DELTA:   return "below-min-delta";
+        case CAL_REASON_MID_AIR_SHADOW:    return "mid-air-shadow";
+        default:                           return "?";
+    }
+}
+
+/* Run natural calibration for an AIR_MOUSE entry.  MUST be called BEFORE
+ * cursor_track_start (the entry slam is sized from the anchors).  top_now is the
+ * snap-moment inclination. */
+static void cursor_calib_run_on_entry(float top_now)
+{
+    static float chrono[VERT_HIST_SAMPLES];
+    int n = vert_hist_chronological(chrono);
+
+    float prior_top    = cursor_track_vert_top();
+    float prior_bottom = cursor_track_vert_bottom();
+
+    cursor_calib_result_t res =
+        cursor_calib_decide(cursor_have_calib, prior_top, prior_bottom,
+                            top_now, chrono, n);
+
+    if (res.apply) {
+        cursor_track_set_anchors(res.new_top, res.new_bottom);
+        cursor_have_calib = true;
+    }
+
+    LOG_INF("[CAL] top %d->%d bottom %d->%d span=%d | "
+            "plateau=%s(var=%d,n=%d) sweep=%d | decision=%s reason=%s shadow_bottom=%d",
+            (int)prior_top, (int)(res.apply ? res.new_top : prior_top),
+            (int)prior_bottom, (int)(res.apply ? res.new_bottom : prior_bottom),
+            (int)((res.apply ? res.new_bottom : prior_bottom) -
+                  (res.apply ? res.new_top : prior_top)),
+            res.plateau_found ? "Y" : "N",
+            (int)res.plateau_var, res.plateau_n, (int)res.sweep_deg,
+            cal_decision_str(res.decision), cal_reason_str(res.reason),
+            (int)res.shadow_bottom);
+}
+
 static void _transition_to(GestureMode new_mode)
 {
     GestureMode old = (GestureMode)atomic_get(&mode_atomic);
@@ -509,7 +597,13 @@ static void _transition_to(GestureMode new_mode)
     if (new_mode == MODE_AIR_MOUSE) {
         orientation_state_t ori;
         orientation_get(&ori);
-        cursor_track_start(current_vert_deg(), ori.roll_deg);
+        float top_now = current_vert_deg();
+        /* Natural calibration FIRST: it may set_anchors() based on the entry
+         * ritual.  cursor_track_start (below) sizes the entry slam from those
+         * anchors, so the order MUST be decide -> set_anchors -> start, or the
+         * recalibrating entry would slam against the previous mount. */
+        cursor_calib_run_on_entry(top_now);
+        cursor_track_start(top_now, ori.roll_deg);
     } else {
         cursor_track_stop();
     }
@@ -1116,6 +1210,11 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
     gyro_hist[gyro_hist_idx][1] = gy_rps;
     gyro_hist[gyro_hist_idx][2] = gz_rps;
     gyro_hist_idx = (gyro_hist_idx + 1) % GYRO_HIST_SAMPLES;
+
+    /* Mirror push into the absolute-vert calibration history. */
+    vert_hist[vert_hist_idx] = current_vert_deg();
+    vert_hist_idx = (vert_hist_idx + 1) % VERT_HIST_SAMPLES;
+    if (vert_hist_idx == 0) vert_hist_primed = true;
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
 
