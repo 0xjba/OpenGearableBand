@@ -91,8 +91,17 @@
  * See 2026-06-11-pose-trigger-realignment spec. */
 
 /* Gravity low-pass alpha (per-sample IIR) for the orientation/gravity
- * estimate used by pose detection.  [STRUCTURAL] */
+ * estimate used by pose detection, the cone gate, and `shadow`.  SLOW on
+ * purpose -- stability is the feature there.  [STRUCTURAL] */
 #define GRAVITY_LP_ALPHA                0.01f
+
+/* SEPARATE faster gravity LPF for the CURSOR Y driver only (gx/gy/gz_cursor in
+ * gesture_mode.cpp).  ~0.15 -> tau ~67 ms @100 Hz, so the cursor lags the wrist
+ * ~1-2 deg instead of the ~18 deg the slow filter caused.  INTERIM (a): an
+ * accel-only filter still can't reject linear-accel transients on a fast flick;
+ * the destination is a gyro-fused inclination from the Mahony quaternion.
+ * Do NOT merge with GRAVITY_LP_ALPHA -- different consumers, different needs. [USER] */
+#define CURSOR_GRAVITY_ALPHA            0.15f
 
 /* Orientation classifier dwell, asymmetric (hysteresis, samples @100 Hz).
  * Entering a DEFINITE pose (UP_RAISED/DOWN_FLAT) is responsive (ENTER); a

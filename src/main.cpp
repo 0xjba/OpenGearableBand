@@ -657,6 +657,14 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
         } else if (c == '{') {
             // Vertical (Y) cursor gain DOWN.
             pending_cmd = '{';
+        } else if (c == 'o') {
+            // Cursor SMOOTHER (lower the fast-filter alpha -> more smoothing,
+            // slightly more lag).  Live knob for responsiveness vs jitter.
+            pending_cmd = 'o';
+        } else if (c == 'p') {
+            // Cursor SHARPER (raise the fast-filter alpha -> snappier, more
+            // accel noise).
+            pending_cmd = 'p';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -839,6 +847,17 @@ void reset_thread_entry(void *, void *, void *) {
             LOG_INF("Cursor gain %s %s -> X=%.1f Y=%.1f px/deg",
                     is_x ? "X" : "Y", is_up ? "UP" : "DOWN",
                     (double)gx, (double)gy);
+        } else if (cmd == 'o' || cmd == 'p') {
+            pending_cmd = 0;
+            /* Live-tune the FAST cursor gravity-filter alpha.  'o' = smoother
+             * (lower alpha, more lag), 'p' = sharper (higher alpha, snappier
+             * but more accel noise).  Multiplicative step, clamped in
+             * gesture_mode_adjust_cursor_alpha.  tau ~= 10ms / alpha. */
+            float factor = (cmd == 'p') ? 1.25f : 0.8f;
+            float a = gesture_mode_adjust_cursor_alpha(factor);
+            LOG_INF("Cursor smoothing %s -> alpha=%.3f (~%d ms tau)",
+                    (cmd == 'p') ? "SHARPER" : "SMOOTHER",
+                    (double)a, (int)(10.0f / a));
         } else if (cmd == 'y') {
             pending_cmd = 0;
             LOG_INF("Simulating chip triple-tap event");
