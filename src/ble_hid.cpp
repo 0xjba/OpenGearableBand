@@ -17,19 +17,24 @@ LOG_MODULE_REGISTER(ble_hid, LOG_LEVEL_INF);
  *   https://www.usb.org/sites/default/files/hut1_4.pdf  (HID Usage Tables)
  * and the Zephyr peripheral_hids sample for the same layout.
  *
- * Report layout (1 report ID byte + 4 payload bytes = 5 bytes total):
- *   byte 0:  Report ID = 1
- *   byte 1:  Buttons (bit0=left, bit1=right, bit2=middle, bits3-7 pad)
- *   byte 2:  X delta  (int8, -127..127)
- *   byte 3:  Y delta  (int8, -127..127)
- *   byte 4:  Wheel    (int8, -127..127)
+ * The descriptor declares Report ID 1, but in HID-over-GATT the ID is NOT
+ * carried in the notification payload -- it is conveyed by the Report
+ * Reference descriptor.  So the on-air payload is the 4 fields only:
+ *   byte 0:  Buttons (bit0=left, bit1=right, bit2=middle, bits3-7 pad)
+ *   byte 1:  X delta  (int8, -127..127)
+ *   byte 2:  Y delta  (int8, -127..127)
+ *   byte 3:  Wheel    (int8, -127..127)
  *
  * Hosts parse this descriptor on connect to know how to interpret the
  * notifications.  Standardised so Windows / Mac / Linux / Android all
  * see "a mouse" without any vendor-specific driver.
  */
 #define HID_REPORT_ID_MOUSE     1
-#define HID_INPUT_REPORT_LEN    5
+/* Notification payload length.  HID-over-GATT does NOT carry the Report ID in
+ * the report characteristic value -- the ID is conveyed out-of-band by the
+ * Report Reference descriptor (input_report_reference[]).  So the payload is
+ * exactly the 4 report fields: buttons, X, Y, wheel. */
+#define HID_INPUT_REPORT_LEN    4
 
 static const uint8_t hid_report_map[] = {
     0x05, 0x01,        /* Usage Page (Generic Desktop)              */
@@ -262,9 +267,29 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     }
 }
 
+/* HID chars are PERM_READ_ENCRYPT: the host must establish an encrypted
+ * (bonded) link before it can read the report map / subscribe.  Log the
+ * outcome so a pairing/bond mismatch is visible instead of showing up only
+ * as an opaque "disconnected reason 0x13".  A non-zero err here (typically
+ * after a flash that left a stale bond on one side) is the signature of the
+ * mismatch -- clear bonds on BOTH sides ('u' serial cmd + Forget on host). */
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+                             enum bt_security_err err)
+{
+    ARG_UNUSED(conn);
+    if (err) {
+        LOG_WRN("HID: security FAILED (level %d, err %d) -- likely stale bond; "
+                "clear bonds both sides ('u' + Forget on host)",
+                (int)level, (int)err);
+    } else {
+        LOG_INF("HID: link encrypted (security level %d)", (int)level);
+    }
+}
+
 BT_CONN_CB_DEFINE(ble_hid_conn_cb) = {
     .connected = connected,
     .disconnected = disconnected,
+    .security_changed = security_changed,
 };
 
 /*
@@ -293,14 +318,15 @@ int ble_hid_send_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t scroll)
         return -EAGAIN;
     }
 
-    /* Compose the 5-byte report: report-ID prefix is handled by the
-     * notification (we send the payload starting from byte 1). */
+    /* Compose the 4-byte report.  NO Report-ID prefix here: HOGP carries the
+     * ID via the Report Reference descriptor, so prepending it shifts every
+     * field by one byte on the host (buttons->X, X->Y, Y->wheel == "scroll
+     * instead of cursor"). Layout matches the report map: buttons, X, Y, wheel. */
     uint8_t report[HID_INPUT_REPORT_LEN];
-    report[0] = HID_REPORT_ID_MOUSE;
-    report[1] = buttons & 0x07;  /* mask to 3 valid button bits */
-    report[2] = (uint8_t)dx;
-    report[3] = (uint8_t)dy;
-    report[4] = (uint8_t)scroll;
+    report[0] = buttons & 0x07;  /* mask to 3 valid button bits */
+    report[1] = (uint8_t)dx;
+    report[2] = (uint8_t)dy;
+    report[3] = (uint8_t)scroll;
 
     /* Find the input-report value attribute.  It's the second entry
      * in our service (after the primary service declaration).  We use
