@@ -53,6 +53,14 @@ bool  cursor_track_is_slamming(void);
 float cursor_track_cur_y(void);           /* Y position estimate, counts from top  */
 float cursor_track_target_counts(void);   /* servo target, counts from top         */
 float cursor_track_vert_top(void);        /* captured top anchor (deg)             */
+float cursor_track_vert_bottom(void);     /* current bottom anchor (deg), clamped  */
+
+/* Set both absolute-Y anchors at runtime (natural calibration, RAM-only).  MUST
+ * be called BEFORE cursor_track_start() at entry: the entry slam is sized from
+ * the anchors, so a stale anchor would slam the recalibrating entry against the
+ * previous mount.  Does NOT itself re-slam.  See
+ * docs/superpowers/specs/2026-06-12-natural-cursor-calibration-design.md. */
+void cursor_track_set_anchors(float vert_top, float vert_bottom);
 
 #ifdef __cplusplus
 }

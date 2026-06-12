@@ -136,6 +136,26 @@ int main(void)
     cursor_track_update(TOP + 15.0f, 50.0f, true, V, &dx, &dy);
     CHECK(dy > 0.0f);
 
+    /* --- Runtime anchors: set_anchors changes top + bottom; span derives. --- */
+    cursor_track_set_gain(CURSOR_GAIN_X, CURSOR_GAIN_Y);
+    cursor_track_set_anchors(20.0f, 80.0f);
+    CHECK(fabsf(cursor_track_vert_top() - 20.0f) < 1e-3f);
+    CHECK(fabsf(cursor_track_vert_bottom() - 80.0f) < 1e-3f);
+    /* New top=20: holding vert=20 after slam yields dy 0; vert=30 servos to GAIN_Y*10. */
+    cursor_track_start(20.0f, 50.0f);
+    drain_slam(20.0f, 50.0f);
+    cursor_track_update(20.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(dy) < 1e-3f);
+    for (int i = 0; i < 20; i++) cursor_track_update(30.0f, 50.0f, false, V, &dx, &dy);
+    CHECK(fabsf(cursor_track_cur_y() - CURSOR_GAIN_Y * 10.0f) < 1e-3f);
+
+    /* --- Bottom still clamps to CURSOR_VERT_BOTTOM_MAX when set beyond it. --- */
+    cursor_track_set_anchors(20.0f, 200.0f);
+    CHECK(fabsf(cursor_track_vert_bottom() - CURSOR_VERT_BOTTOM_MAX) < 1e-3f);
+
+    /* Restore defaults for hygiene (nothing runs after, but be explicit). */
+    cursor_track_set_anchors(CURSOR_VERT_TOP_DEG, CURSOR_VERT_TOP_DEG + CURSOR_VERT_SPAN_DEG);
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }

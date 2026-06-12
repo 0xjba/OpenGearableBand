@@ -25,8 +25,11 @@ static bool  s_roll_valid     = false;
 static bool  s_started        = false;
 
 /* Absolute-Y state. */
-/* Fixed top anchor (Amendment A.1): no longer captured at entry. */
-static const float s_vert_top = CURSOR_VERT_TOP_DEG;
+/* Absolute-Y anchors -- now RUNTIME-VARIABLE (natural calibration sets them via
+ * cursor_track_set_anchors).  Seeded from the compile-time defaults, which also
+ * serve as the cold-start values until the first complete entry ritual. */
+static float s_vert_top    = CURSOR_VERT_TOP_DEG;
+static float s_vert_bottom = CURSOR_VERT_TOP_DEG + CURSOR_VERT_SPAN_DEG;
 static float s_cur_y          = 0.0f;                    /* counts from top         */
 static float s_target_counts  = 0.0f;                    /* last servo target, counts from top */
 static int   s_slam_remaining = 0;                       /* >0 => slamming          */
@@ -63,10 +66,10 @@ static float wrap180(float d)
     return d;
 }
 
-/* vert_bottom = top + comfort span, clamped to the comfort maximum. */
+/* vert_bottom = runtime anchor, clamped to the comfort maximum. */
 static float vert_bottom(void)
 {
-    float vb = s_vert_top + CURSOR_VERT_SPAN_DEG;
+    float vb = s_vert_bottom;                       /* runtime anchor (was top + SPAN) */
     if (vb > CURSOR_VERT_BOTTOM_MAX) vb = CURSOR_VERT_BOTTOM_MAX;
     return vb;
 }
@@ -185,6 +188,13 @@ bool  cursor_track_is_slamming(void)     { return s_slam_remaining > 0; }
 float cursor_track_cur_y(void)           { return s_cur_y; }
 float cursor_track_target_counts(void)   { return s_target_counts; }
 float cursor_track_vert_top(void)        { return s_vert_top; }
+float cursor_track_vert_bottom(void)     { return vert_bottom(); }
+
+void cursor_track_set_anchors(float vert_top, float vert_bottom_in)
+{
+    s_vert_top    = vert_top;
+    s_vert_bottom = vert_bottom_in;
+}
 
 void cursor_track_stop(void)
 {
