@@ -112,6 +112,48 @@ int main(void)
     CHECK(r.reason == CAL_REASON_COLD_START_DEFAULT);
     CHECK(r.apply == false);
 
+    /* A1 (both trusted, large shift): re-wear moved mount; rest now @60, top now @20.
+     *     Adopt via blend toward (20,60) from prior (12,82). */
+    fill(v, VERT_HIST_SAMPLES, 60.0f);
+    for (int i = VERT_HIST_SAMPLES - 40; i < VERT_HIST_SAMPLES; i++) v[i] = 20.0f;
+    r = cursor_calib_decide(true, 12.0f, 82.0f, 20.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_ADOPT);
+    CHECK(r.apply == true);
+    CHECK(fabsf(r.new_top    - (12.0f + CAL_BLEND_ALPHA * (20.0f - 12.0f))) < 1e-2f);
+    CHECK(fabsf(r.new_bottom - (82.0f + CAL_BLEND_ALPHA * (60.0f - 82.0f))) < 0.6f);
+
+    /* A2 (both trusted, tiny shift below CAL_MIN_DELTA): no-op. prior (12,82),
+     *     capture ~ (13, 81) -> both deltas < 5 -> REJECT below-min-delta. */
+    fill(v, VERT_HIST_SAMPLES, 81.0f);
+    for (int i = VERT_HIST_SAMPLES - 40; i < VERT_HIST_SAMPLES; i++) v[i] = 13.0f;
+    r = cursor_calib_decide(true, 12.0f, 82.0f, 13.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_REJECT);
+    CHECK(r.reason == CAL_REASON_BELOW_MIN_DELTA);
+    CHECK(r.apply == false);
+
+    /* A3 (mid-air: top plausible, no plateau): SHADOW-TRANSLATE; apply NOTHING. */
+    for (int i = 0; i < VERT_HIST_SAMPLES; i++) v[i] = 10.0f + 0.5f * i; /* no rest */
+    r = cursor_calib_decide(true, 12.0f, 82.0f, 14.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_SHADOW_TRANSLATE);
+    CHECK(r.reason == CAL_REASON_MID_AIR_SHADOW);
+    CHECK(r.apply == false);                                   /* nothing applied */
+    CHECK(fabsf(r.shadow_bottom - (14.0f + (82.0f - 12.0f))) < 1e-3f); /* top_now + prior span */
+
+    /* A4 (implausible top: snapped at 45 > CAL_TOP_MAX): REJECT implausible-top, no-op. */
+    fill(v, VERT_HIST_SAMPLES, 80.0f);
+    r = cursor_calib_decide(true, 12.0f, 82.0f, 45.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_REJECT);
+    CHECK(r.reason == CAL_REASON_IMPLAUSIBLE_TOP);
+    CHECK(r.apply == false);
+
+    /* A5 (insufficient sweep: rest exists but only @25, top 12 -> sweep 13 < 25):
+     *     REJECT insufficient-sweep, no-op. */
+    fill(v, VERT_HIST_SAMPLES, 25.0f);
+    r = cursor_calib_decide(true, 12.0f, 82.0f, 12.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_REJECT);
+    CHECK(r.reason == CAL_REASON_INSUFFICIENT_SWEEP);
+    CHECK(r.apply == false);
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }

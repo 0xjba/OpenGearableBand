@@ -128,10 +128,40 @@ cursor_calib_result_t cursor_calib_decide(bool have_calib,
         return r;
     }
 
-    /* ---- have_calib branch: filled in Task 4. ---- */
-    (void)prior_bottom; (void)cal_blend;
+    /* ---- Have prior calibration. ---- */
+    if (ritual_complete) {
+        bool top_moved = fabsf(top_now  - prior_top)    >= CAL_MIN_DELTA;
+        bool bot_moved = fabsf(p.median - prior_bottom) >= CAL_MIN_DELTA;
+        if (!top_moved && !bot_moved) {
+            r.decision = CAL_REJECT;
+            r.reason   = CAL_REASON_BELOW_MIN_DELTA;  /* stable within this wear */
+            r.apply    = false;
+        } else {
+            r.decision   = CAL_ADOPT;
+            r.reason     = CAL_REASON_OK;
+            r.new_top    = cal_blend(prior_top,    top_now);
+            r.new_bottom = cal_blend(prior_bottom, p.median);
+            r.apply      = true;
+        }
+        return r;
+    }
+
+    /* Ritual incomplete. Mid-air (top plausible, no rest at all) -> shadow only:
+     * log the would-be coupled translation, APPLY NOTHING (spec section 6 -- the
+     * weakest signal must never move the map; we gather data to justify it later). */
+    if (top_plausible && !p.found && !p.any_lowvar) {
+        r.decision     = CAL_SHADOW_TRANSLATE;
+        r.reason       = CAL_REASON_MID_AIR_SHADOW;
+        r.shadow_bottom = top_now + (prior_bottom - prior_top); /* preserve prior span */
+        r.apply        = false;
+        return r;
+    }
+
+    /* Otherwise a hard reject; pick the most specific reason for telemetry. */
     r.decision = CAL_REJECT;
-    r.reason   = CAL_REASON_NO_PLATEAU;
     r.apply    = false;
+    if (!top_plausible)        r.reason = CAL_REASON_IMPLAUSIBLE_TOP;
+    else if (p.any_lowvar)     r.reason = CAL_REASON_INSUFFICIENT_SWEEP; /* rest existed, too shallow */
+    else                       r.reason = CAL_REASON_NO_PLATEAU;
     return r;
 }
