@@ -611,8 +611,20 @@ static void _transition_to(GestureMode new_mode)
         /* Natural calibration FIRST: it may set_anchors() based on the entry
          * ritual.  cursor_track_start (below) sizes the entry slam from those
          * anchors, so the order MUST be decide -> set_anchors -> start, or the
-         * recalibrating entry would slam against the previous mount. */
-        cursor_calib_run_on_entry(top_now);
+         * recalibrating entry would slam against the previous mount.
+         *
+         * BUT skip calibration on a cooldown RE-ENGAGE: a re-engage fires
+         * automatically when the user raises back to the pose within the exit
+         * cooldown -- it is NOT a deliberate rest->raise->snap ritual, so the
+         * vert_hist at that moment is incidental (e.g. a mid-air hover the user
+         * paused at), and capturing it can SEED a garbage bottom (HW-observed
+         * 2026-06-12: a 45deg hover became the bottom -> span 25, hyper-sensitive).
+         * A re-engage should RESUME with the current anchors; only a fresh
+         * deliberate entry recalibrates.  s_transition_via_cooldown_reengage is
+         * still set here (cleared later in this function). */
+        if (!s_transition_via_cooldown_reengage) {
+            cursor_calib_run_on_entry(top_now);
+        }
         cursor_track_start(top_now, ori.roll_deg);
     } else {
         cursor_track_stop();
