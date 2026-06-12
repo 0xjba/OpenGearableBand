@@ -154,6 +154,27 @@ int main(void)
     CHECK(r.reason == CAL_REASON_INSUFFICIENT_SWEEP);
     CHECK(r.apply == false);
 
+    /* A6 (asymmetric delta: only the BOTTOM moved past CAL_MIN_DELTA): the OR in the
+     *    adopt condition still triggers a FULL adopt, blending BOTH anchors (the
+     *    small-delta top blends by a little too). prior (12,82); capture top~13
+     *    (delta 1 < 5), bottom~70 (delta 12 >= 5). */
+    fill(v, VERT_HIST_SAMPLES, 70.0f);
+    for (int i = VERT_HIST_SAMPLES - 40; i < VERT_HIST_SAMPLES; i++) v[i] = 13.0f;
+    r = cursor_calib_decide(true, 12.0f, 82.0f, 13.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_ADOPT);
+    CHECK(r.apply == true);
+    CHECK(fabsf(r.new_top    - (12.0f + CAL_BLEND_ALPHA * (13.0f - 12.0f))) < 1e-2f); /* ~12.4 */
+    CHECK(fabsf(r.new_bottom - (82.0f + CAL_BLEND_ALPHA * (70.0f - 82.0f))) < 0.6f);  /* ~77.2 */
+
+    /* A7 (cold-start with a good plateau but IMPLAUSIBLE top): top 45 > CAL_TOP_MAX
+     *    makes the ritual incomplete; cold-start reports COLD_START_DEFAULT (the
+     *    implausible-top reason is intentionally masked on the cold-start path). */
+    fill(v, VERT_HIST_SAMPLES, 80.0f);
+    r = cursor_calib_decide(false, 12.0f, 82.0f, 45.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_REJECT);
+    CHECK(r.reason == CAL_REASON_COLD_START_DEFAULT);
+    CHECK(r.apply == false);
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }
