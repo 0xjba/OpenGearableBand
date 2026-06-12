@@ -155,7 +155,7 @@ as the top — it is not trusted even if everything else passes).
 
 ## 6. Adoption decision matrix
 
-`cursor_calib_decide(prior_top, prior_bottom, have_calib, top_now, vert_hist[])
+`cursor_calib_decide(have_calib, prior_top, prior_bottom, top_now, vert_chrono[], n)
  → { decision, reason, new_top, new_bottom }`
 
 | Situation | Decision |

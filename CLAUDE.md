@@ -40,6 +40,11 @@ known gotchas). Keep it current when these stable facts change.
 - `src/cursor_track.{h,cpp}` — **PURE** absolute-Y cursor: fixed top anchor →
   servo toward `GAIN_Y*(vert-vert_top)` → slam-to-edge + latched top re-pin.
   Host-unit-tested. No Zephyr deps.
+- `src/cursor_calib.{h,cpp}` — **PURE** entry-time cursor calibration: extracts
+  the resting-pose bottom anchor from a `vert` history + scores the air-mouse
+  entry ritual → adoption verdict (`cursor_calib_decide`). Host-unit-tested
+  (`tests/test_cursor_calib.cpp`). `gesture_mode` runs it at AIR_MOUSE entry
+  (decide→set_anchors→start) and logs `[CAL]`. No Zephyr deps.
 - `src/cursor_pipeline.{h,cpp}` — 125 Hz publish thread; sensitivity (MUST stay
   1.0) + 1px dead-zone + int8; `cursor_pipeline_inject_motion`; calls
   `ble_hid_send_report`.
