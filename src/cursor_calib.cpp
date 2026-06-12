@@ -9,6 +9,8 @@ typedef struct { bool found; float median; float var; int len; bool any_lowvar; 
 /* Median of a[0..n) via insertion sort on a local copy (n <= VERT_HIST_SAMPLES). */
 static float median_of(const float *a, int n)
 {
+    if (n > VERT_HIST_SAMPLES) n = VERT_HIST_SAMPLES;
+    if (n <= 0) return 0.0f;
     float tmp[VERT_HIST_SAMPLES];
     for (int i = 0; i < n; i++) tmp[i] = a[i];
     for (int i = 1; i < n; i++) {
@@ -44,6 +46,10 @@ static plateau_t find_plateau(const float *v, int n, float top_now)
             double newmean = mean + d / newcnt;
             double newM2   = M2 + d * ((double)v[i] - newmean);
             double var     = (newcnt > 1) ? newM2 / newcnt : 0.0;
+            /* The variance gate is the ONLY thing that breaks a run: a drift slow
+             * enough to stay under CAL_PLATEAU_VAR is absorbed into the run. That's
+             * fine -- median (not mean) keeps the anchor honest; reported `var` shows
+             * the inflated spread to telemetry. */
             if (cnt > 0 && var >= CAL_PLATEAU_VAR) {
                 close_run = true;            /* exclude v[i]; restart the run at i */
             } else {

@@ -73,6 +73,29 @@ int main(void)
         CHECK(fabsf(p.median - 70.0f) < 1.5f);         /* the lowered rest, NOT the 14 dwell */
     }
 
+    /* P6 (partial buffer, n < VERT_HIST_SAMPLES): a qualifying rest in a 120-sample
+     *    window is still found (caller passes the real count before the ring fills). */
+    fill(v, VERT_HIST_SAMPLES, 0.0f);
+    for (int i = 0; i < 120; i++) v[i] = 65.0f;        /* 120 samples rest @65 */
+    {
+        plateau_t p = cursor_calib_find_plateau_TEST(v, 120, 12.0f);
+        CHECK(p.found);
+        CHECK(fabsf(p.median - 65.0f) < 1.5f);
+        CHECK(p.len == 120);
+    }
+
+    /* P7 (run ends EXACTLY at the buffer end -> recorded via the i==n flush):
+     *    a brief raise, then a rest @75 occupying the most-recent CAL_PLATEAU_DWELL+
+     *    samples right up to the final index. */
+    fill(v, VERT_HIST_SAMPLES, 20.0f);                 /* early region: raised */
+    for (int i = VERT_HIST_SAMPLES - 50; i < VERT_HIST_SAMPLES; i++) v[i] = 75.0f;
+    {
+        plateau_t p = cursor_calib_find_plateau_TEST(v, VERT_HIST_SAMPLES, 12.0f);
+        CHECK(p.found);
+        CHECK(fabsf(p.median - 75.0f) < 1.5f);
+        CHECK(p.len >= CAL_PLATEAU_DWELL);
+    }
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }
