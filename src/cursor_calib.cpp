@@ -83,23 +83,55 @@ extern "C" plateau_t cursor_calib_find_plateau_TEST(const float *v, int n, float
     return find_plateau(v, n, top_now);
 }
 
+static float cal_blend(float old_v, float new_v)
+{
+    return old_v + CAL_BLEND_ALPHA * (new_v - old_v);
+}
+
 cursor_calib_result_t cursor_calib_decide(bool have_calib,
                                           float prior_top, float prior_bottom,
                                           float top_now,
                                           const float *vert_chrono, int n)
 {
-    (void)have_calib; (void)top_now; (void)vert_chrono; (void)n;
     cursor_calib_result_t r;
     r.decision = CAL_REJECT;
     r.reason   = CAL_REASON_NO_PLATEAU;
     r.apply    = false;
     r.new_top  = prior_top;
     r.new_bottom = prior_bottom;
-    r.plateau_found = false;
-    r.plateau_var = 0.0f;
-    r.plateau_n = 0;
-    r.bottom_candidate = 0.0f;
-    r.sweep_deg = 0.0f;
     r.shadow_bottom = 0.0f;
+
+    bool top_plausible = (top_now <= CAL_TOP_MAX);
+    plateau_t p = find_plateau(vert_chrono, n, top_now);
+
+    r.plateau_found    = p.found;
+    r.plateau_var      = p.var;
+    r.plateau_n        = p.len;
+    r.bottom_candidate = p.found ? p.median : 0.0f;
+    r.sweep_deg        = p.found ? (p.median - top_now) : 0.0f;
+
+    bool ritual_complete = top_plausible && p.found;  /* sweep enforced inside find_plateau */
+
+    /* ---- Cold-start: every boot starts here (RAM-only, no prior calibration). ---- */
+    if (!have_calib) {
+        if (ritual_complete) {
+            r.decision    = CAL_SEED;
+            r.reason      = CAL_REASON_OK;
+            r.new_top     = top_now;
+            r.new_bottom  = p.median;
+            r.apply       = true;
+        } else {
+            r.decision = CAL_REJECT;
+            r.reason   = CAL_REASON_COLD_START_DEFAULT;  /* run on compile-time defaults */
+            r.apply    = false;
+        }
+        return r;
+    }
+
+    /* ---- have_calib branch: filled in Task 4. ---- */
+    (void)prior_bottom; (void)cal_blend;
+    r.decision = CAL_REJECT;
+    r.reason   = CAL_REASON_NO_PLATEAU;
+    r.apply    = false;
     return r;
 }

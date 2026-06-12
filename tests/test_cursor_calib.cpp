@@ -96,6 +96,22 @@ int main(void)
         CHECK(p.len >= CAL_PLATEAU_DWELL);
     }
 
+    /* C1 (cold-start + complete ritual): rest @80 then raised; seed BOTH anchors. */
+    fill(v, VERT_HIST_SAMPLES, 80.0f);
+    for (int i = VERT_HIST_SAMPLES - 40; i < VERT_HIST_SAMPLES; i++) v[i] = 12.0f;
+    r = cursor_calib_decide(false /*have_calib*/, 12.0f, 82.0f, 12.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_SEED);
+    CHECK(r.apply == true);
+    CHECK(fabsf(r.new_top - 12.0f) < 1e-3f);
+    CHECK(fabsf(r.new_bottom - 80.0f) < 1.5f);
+
+    /* C2 (cold-start + incomplete ritual): no rest -> run on defaults, apply nothing. */
+    for (int i = 0; i < VERT_HIST_SAMPLES; i++) v[i] = 10.0f + 0.5f * i;
+    r = cursor_calib_decide(false, 12.0f, 82.0f, 12.0f, v, VERT_HIST_SAMPLES);
+    CHECK(r.decision == CAL_REJECT);
+    CHECK(r.reason == CAL_REASON_COLD_START_DEFAULT);
+    CHECK(r.apply == false);
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }
