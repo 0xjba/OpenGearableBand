@@ -338,4 +338,17 @@
  * move is far smaller per 10 ms).  Belt-and-suspenders with wrap180(). */
 #define CURSOR_MAX_DELTA_DEG            30.0f
 
+/* ---- Natural entry-time cursor calibration (auto top+bottom anchors) ----
+ * See docs/superpowers/specs/2026-06-12-natural-cursor-calibration-design.md.
+ * All seeds; tune from the per-entry [CAL] traces. */
+#define VERT_HIST_SAMPLES     300     /* 3 s of vert history @100Hz, ~1.2KB. Deep on
+                                       * purpose: an undersized buffer fails INVISIBLY
+                                       * as no-plateau (masquerades as a lazy entry). [STRUCTURAL] */
+#define CAL_PLATEAU_VAR       4.0f    /* max vert variance (deg^2, ~2 deg std) for "resting still" [USER] */
+#define CAL_PLATEAU_DWELL     30      /* min plateau length (samples, ~300 ms) [USER] */
+#define CAL_SWEEP_MIN_DEG     25.0f   /* min (bottom - top) to count as a real raise [USER] */
+#define CAL_TOP_MAX           30.0f   /* plausibility clamp: reject a top above this (lazy raise) [USER] */
+#define CAL_MIN_DELTA         5.0f    /* ignore anchor shifts smaller than this (stable within a wear) [USER] */
+#define CAL_BLEND_ALPHA       0.4f    /* adoption blend factor (1.0 effective on cold-start seed) [USER] */
+
 #endif /* GESTURE_THRESHOLDS_H */
