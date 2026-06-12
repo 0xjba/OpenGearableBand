@@ -50,7 +50,7 @@ static plateau_t find_plateau(const float *v, int n, float top_now)
              * enough to stay under CAL_PLATEAU_VAR is absorbed into the run. That's
              * fine -- median (not mean) keeps the anchor honest; reported `var` shows
              * the inflated spread to telemetry. */
-            if (cnt > 0 && var >= CAL_PLATEAU_VAR) {
+            if (cnt > 0 && var >= (double)CAL_PLATEAU_VAR) {
                 close_run = true;            /* exclude v[i]; restart the run at i */
             } else {
                 mean = newmean; M2 = newM2; cnt = newcnt;

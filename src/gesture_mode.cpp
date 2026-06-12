@@ -301,6 +301,9 @@ static int   gyro_hist_idx = 0;
 static float vert_hist[VERT_HIST_SAMPLES];
 static int   vert_hist_idx = 0;
 static bool  vert_hist_primed = false;     /* false until the buffer has filled once */
+/* NOTE: never reset -- a first AIR_MOUSE entry within ~3 s of boot runs the
+ * decider on a partial buffer (n < VERT_HIST_SAMPLES); that is fine, the
+ * cold-start branch (have_calib=false) tolerates a short/no-plateau capture. */
 
 /* RAM-only calibration state (no NVS): false until the first complete entry ritual
  * seeds the anchors.  cursor_track holds the anchor values; this just tracks "have
