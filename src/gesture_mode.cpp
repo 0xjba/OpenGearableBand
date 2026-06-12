@@ -294,9 +294,16 @@ static int   gyro_hist_idx = 0;
 /* Absolute-vert history for natural cursor calibration (entry-time auto-anchor).
  * SEPARATE from gyro_hist (which is gyro rates, 1.5 s) -- this is absolute vert
  * (deg) and DEEPER (3 s) so a slow raise's resting plateau cannot fall out of the
- * window unseen (an undersized buffer fails invisibly as no-plateau).  Written on
- * the acq thread alongside gyro_hist; read on the acq thread at AIR_MOUSE entry
- * (same thread -- no cross-thread race).  See
+ * window unseen (an undersized buffer fails invisibly as no-plateau).  WRITTEN on
+ * the acq thread (every gyro sample); READ at AIR_MOUSE entry from a DIFFERENT
+ * thread -- _transition_to(MODE_AIR_MOUSE) runs on the power thread (chip
+ * double-tap via service_chip_int1) or the system workqueue (multi_tap_commit_
+ * handler), never the acq thread.  This is a DOCUMENTED BENIGN RACE (same class
+ * as the gx_filt threshold reads): each cell + idx + primed is a word-sized
+ * scalar (atomic load/store on Cortex-M4F), there is no multi-word invariant a
+ * torn read could break, and the entry snapshot scans 300 samples for a
+ * statistical plateau -- a worst-case one-sample skew at the ring wrap is noise.
+ * So NO lock is needed; do not add one (it would block the acq ISR path).  See
  * docs/superpowers/specs/2026-06-12-natural-cursor-calibration-design.md. */
 static float vert_hist[VERT_HIST_SAMPLES];
 static int   vert_hist_idx = 0;
