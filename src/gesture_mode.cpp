@@ -291,26 +291,16 @@ static float flick_burst_sign = 0.0f;
 static float gyro_hist[GYRO_HIST_SAMPLES][3];
 static int   gyro_hist_idx = 0;
 
-/* Absolute-vert history for natural cursor calibration (entry-time auto-anchor).
- * SEPARATE from gyro_hist (which is gyro rates, 1.5 s) -- this is absolute vert
- * (deg) and DEEPER (3 s) so a slow raise's resting plateau cannot fall out of the
- * window unseen (an undersized buffer fails invisibly as no-plateau).  WRITTEN on
- * the acq thread (every gyro sample); READ at AIR_MOUSE entry from a DIFFERENT
- * thread -- _transition_to(MODE_AIR_MOUSE) runs on the power thread (chip
- * double-tap via service_chip_int1) or the system workqueue (multi_tap_commit_
- * handler), never the acq thread.  This is a DOCUMENTED BENIGN RACE (same class
- * as the gx_filt threshold reads): each cell + idx + primed is a word-sized
- * scalar (atomic load/store on Cortex-M4F), there is no multi-word invariant a
- * torn read could break, and the entry snapshot scans 300 samples for a
- * statistical plateau -- a worst-case one-sample skew at the ring wrap is noise.
- * So NO lock is needed; do not add one (it would block the acq ISR path).  See
- * docs/superpowers/specs/2026-06-12-natural-cursor-calibration-design.md. */
-static float vert_hist[VERT_HIST_SAMPLES];
-static int   vert_hist_idx = 0;
-static bool  vert_hist_primed = false;     /* false until the buffer has filled once */
-/* NOTE: never reset -- a first AIR_MOUSE entry within ~3 s of boot runs the
- * decider on a partial buffer (n < VERT_HIST_SAMPLES); that is fine, the
- * cold-start branch (have_calib=false) tolerates a short/no-plateau capture. */
+/* Bottom-anchor capture (replaces the old 3-second ring buffer, which aged the rest
+ * out before the >3 s raise->snap ritual completed -- see the 2026-06-13 [CALDBG]
+ * finding).  `last_rest_vert` is a PERSISTENT scalar (never ages): the most-recent
+ * settled desk-rest angle, captured at placement (the motion of setting the wrist
+ * down keeps sampling awake long enough to register the settle).  Fed to
+ * cursor_calib at AIR_MOUSE entry.  `rest_dwell` counts consecutive settled-low
+ * samples and drives the stillness-held disengage. */
+static float last_rest_vert  = 0.0f;
+static bool  bottom_valid     = false;
+static int   rest_dwell       = 0;
 
 /* RAM-only calibration state (no NVS): false until the first complete entry ritual
  * seeds the anchors.  cursor_track holds the anchor values; this just tracks "have
@@ -524,21 +514,6 @@ static void _update_acq_request(void);
  * entry.  Cleared inside _transition_to after the check. */
 static bool s_transition_via_cooldown_reengage = false;
 
-/* Copy the vert_hist ring into chronological order (oldest -> newest) for the
- * pure decider.  Returns the count (== VERT_HIST_SAMPLES once primed, else the
- * number written so far). */
-static int vert_hist_chronological(float *out)
-{
-    if (vert_hist_primed) {
-        int k = 0;
-        for (int i = 0; i < VERT_HIST_SAMPLES; i++) {
-            out[k++] = vert_hist[(vert_hist_idx + i) % VERT_HIST_SAMPLES];
-        }
-        return VERT_HIST_SAMPLES;
-    }
-    for (int i = 0; i < vert_hist_idx; i++) out[i] = vert_hist[i];
-    return vert_hist_idx;
-}
 
 static const char *cal_decision_str(cursor_calib_decision_t d)
 {
@@ -565,18 +540,15 @@ static const char *cal_reason_str(cursor_calib_reason_t r)
 
 /* Run natural calibration for an AIR_MOUSE entry.  MUST be called BEFORE
  * cursor_track_start (the entry slam is sized from the anchors).  top_now is the
- * snap-moment inclination. */
+ * snap-moment inclination; the bottom comes from the persistent last_rest_vert. */
 static void cursor_calib_run_on_entry(float top_now)
 {
-    static float chrono[VERT_HIST_SAMPLES];
-    int n = vert_hist_chronological(chrono);
-
     float prior_top    = cursor_track_vert_top();
     float prior_bottom = cursor_track_vert_bottom();
 
     cursor_calib_result_t res =
         cursor_calib_decide(cursor_have_calib, prior_top, prior_bottom,
-                            top_now, chrono, n);
+                            top_now, last_rest_vert, bottom_valid);
 
     if (res.apply) {
         cursor_track_set_anchors(res.new_top, res.new_bottom);
@@ -584,13 +556,12 @@ static void cursor_calib_run_on_entry(float top_now)
     }
 
     LOG_INF("[CAL] top %d->%d bottom %d->%d span=%d | "
-            "plateau=%s(var=%d,n=%d) sweep=%d | decision=%s reason=%s shadow_bottom=%d",
+            "bottom_valid=%d cand=%d sweep=%d | decision=%s reason=%s shadow_bottom=%d",
             (int)prior_top, (int)(res.apply ? res.new_top : prior_top),
             (int)prior_bottom, (int)(res.apply ? res.new_bottom : prior_bottom),
             (int)((res.apply ? res.new_bottom : prior_bottom) -
                   (res.apply ? res.new_top : prior_top)),
-            res.plateau_found ? "Y" : "N",
-            (int)res.plateau_var, res.plateau_n, (int)res.sweep_deg,
+            (int)bottom_valid, (int)res.bottom_candidate, (int)res.sweep_deg,
             cal_decision_str(res.decision), cal_reason_str(res.reason),
             (int)res.shadow_bottom);
 }
@@ -616,8 +587,8 @@ static void _transition_to(GestureMode new_mode)
          * BUT skip calibration on a cooldown RE-ENGAGE: a re-engage fires
          * automatically when the user raises back to the pose within the exit
          * cooldown -- it is NOT a deliberate rest->raise->snap ritual, so the
-         * vert_hist at that moment is incidental (e.g. a mid-air hover the user
-         * paused at), and capturing it can SEED a garbage bottom (HW-observed
+         * last_rest_vert at that moment may be a mid-air hover the user
+         * paused at, and capturing it can SEED a garbage bottom (HW-observed
          * 2026-06-12: a 45deg hover became the bottom -> span 25, hyper-sensitive).
          * A re-engage should RESUME with the current anchors; only a fresh
          * deliberate entry recalibrates.  s_transition_via_cooldown_reengage is
@@ -960,6 +931,29 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         samples_since_activity++;
     }
 
+    /* ---- Rest tracker: capture the bottom anchor + drive the stillness-exit dwell.
+     * "Settled" = in the low zone AND still (activity gate saturated -> low variance).
+     * current_vert_deg() is stable when still, so it's a clean rest reading.  Runs in
+     * ALL states; captured at placement (motion -> sampling awake -> settle).  The
+     * scalar never ages, so it bridges the >3 s gap to the entry snap. ---- */
+    {
+        bool low_zone = (gx_filt < CURSOR_LOW_ZONE_GX);
+        bool still    = (samples_since_activity >= ACTIVITY_GATE_DWELL);
+        if (low_zone && still) {
+            last_rest_vert = current_vert_deg();   /* auto-tracks the latest rest */
+            bottom_valid   = true;
+            if (rest_dwell < STILL_EXIT_DWELL) rest_dwell++;
+            static int restdbg = 0;
+            if (++restdbg % 10 == 0) {
+                LOG_INF("[REST] vert=%d still=%d dwell=%d last_rest=%d",
+                        (int)current_vert_deg(), (int)samples_since_activity,
+                        rest_dwell, (int)last_rest_vert);
+            }
+        } else {
+            rest_dwell = 0;
+        }
+    }
+
     /* Update pose state machine.  Arms on canonical pose match alone. */
     pose_fsm_update(gx_filt, gy_filt, gz_filt);
 
@@ -1232,11 +1226,6 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
     gyro_hist[gyro_hist_idx][1] = gy_rps;
     gyro_hist[gyro_hist_idx][2] = gz_rps;
     gyro_hist_idx = (gyro_hist_idx + 1) % GYRO_HIST_SAMPLES;
-
-    /* Mirror push into the absolute-vert calibration history. */
-    vert_hist[vert_hist_idx] = current_vert_deg();
-    vert_hist_idx = (vert_hist_idx + 1) % VERT_HIST_SAMPLES;
-    if (vert_hist_idx == 0) vert_hist_primed = true;
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
 
