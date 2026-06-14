@@ -94,23 +94,6 @@ static int reengage_dwell = 0;
  * starts cooldown. */
 static int cursor_exit_dwell = 0;
 
-/* Motion-burst exit detector (SURFACE only).  Counts consecutive
- * samples with motion-residual magnitude above
- * SURFACE_MOTION_BURST_THRESH.  Reaches SURFACE_MOTION_BURST_DWELL
- * -> SURFACE exit + cooldown.  Used to catch wrist-transport
- * gestures (e.g., desk -> lap) that don't change palm orientation. */
-static int surface_motion_burst_dwell = 0;
-
-/* Peak motion-residual seen since the last periodic stats log
- * (reset every SURFACE_MOTION_LOG_PERIOD samples).  Used both for
- * the periodic calibration stream and as the value reported in the
- * exit log.  Lets the user read off actual peaks during gliding
- * (should be small) vs transport (should be large) to tune the
- * threshold empirically without further code changes. */
-static float surface_motion_peak = 0.0f;
-static int   surface_motion_log_counter = 0;
-#define      SURFACE_MOTION_LOG_PERIOD   200    /* 2 s at 100 Hz */
-
 /* Pose FSM state.  Updated each accel sample from update_accel. */
 static pose_id_t pose_armed_state = POSE_NONE;
 static int64_t   pose_armed_time_ms = 0;
@@ -606,9 +589,6 @@ static void _transition_to(GestureMode new_mode)
      * starts cleanly. */
     reengage_dwell = 0;
     cursor_exit_dwell = 0;
-    surface_motion_burst_dwell = 0;
-    surface_motion_peak = 0.0f;
-    surface_motion_log_counter = 0;
     /* Multi-tap counter and activity gate persist across transitions
      * by design: a tap arriving DURING the disambiguation window
      * that triggers a mode change (e.g., AIR_MOUSE entry on tap 2)
@@ -764,9 +744,6 @@ void gesture_mode_init(void)
     entry_grace_remaining = 0;
     atomic_set(&air_desk_tap, 0);
     air_past_plane_dwell = 0;
-    surface_motion_burst_dwell = 0;
-    surface_motion_peak = 0.0f;
-    surface_motion_log_counter = 0;
     pose_armed_state = POSE_NONE;
     pose_armed_time_ms = 0;
     multi_tap_count = 0;
@@ -1002,8 +979,7 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     /* The remaining per-sample logic only matters while we're in a
      * cursor mode.  Compute "what pose does the current mode expect"
      * once and use it below. */
-    bool in_cursor_mode = (current_mode == MODE_AIR_MOUSE ||
-                           current_mode == MODE_SURFACE);
+    bool in_cursor_mode = (current_mode == MODE_AIR_MOUSE);
     WristOrientation expected = in_cursor_mode
         ? expected_pose_for(current_mode)
         : WRIST_NEUTRAL;
@@ -1079,20 +1055,6 @@ void gesture_mode_update_accel(float ax, float ay, float az)
                             (int)gx_filt, (int)samples_since_activity, air_past_plane_dwell);
                 }
             }
-        } else {
-            /* SURFACE (and any non-AIR_MOUSE cursor mode): orientation-drop exit. */
-            int exit_dwell_target = _exit_dwell_for(current_mode);
-            if (orientation_current != expected) {
-                if (cursor_exit_dwell <= exit_dwell_target) {
-                    cursor_exit_dwell++;
-                    if (cursor_exit_dwell > exit_dwell_target) {
-                        do_exit = true;
-                        exit_reason = "wrist left desk plane (lift or drop)";
-                    }
-                }
-            } else {
-                cursor_exit_dwell = 0;
-            }
         }
 
         if (do_exit) {
@@ -1110,59 +1072,6 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         air_past_plane_dwell = 0;
     }
 
-    /* SURFACE motion-burst exit detector.  See
-     * SURFACE_MOTION_BURST_THRESH comment block for rationale.  Only
-     * runs in SURFACE (AIR_MOUSE has no equivalent "transport without
-     * orientation change" failure mode -- raising the arm always
-     * rotates the wrist).  Runs after cursor_has_reached_pose is
-     * latched -- pre-engagement motion is just the user placing the
-     * wrist down. */
-    if (current_mode == MODE_SURFACE && cursor_has_reached_pose) {
-        float rx_s = ax - gx_filt;
-        float ry_s = ay - gy_filt;
-        float rz_s = az - gz_filt;
-        float r_mag_s = sqrtf(rx_s * rx_s + ry_s * ry_s + rz_s * rz_s);
-
-        /* Track windowed peak (resets each periodic log). */
-        if (r_mag_s > surface_motion_peak) {
-            surface_motion_peak = r_mag_s;
-        }
-
-        /* Periodic stats log -- a calibration stream the user can
-         * read off while gliding (low values expected, ~0.2-0.8) vs
-         * transporting (high values expected, 2-5+).  Helps tune
-         * SURFACE_MOTION_BURST_THRESH from real data. */
-        surface_motion_log_counter++;
-        if (surface_motion_log_counter >= SURFACE_MOTION_LOG_PERIOD) {
-            LOG_INF("SURFACE motion stats: peak |a-g|=%.2f m/s^2 "
-                    "in last %d ms (burst thresh=%.2f)",
-                    (double)surface_motion_peak,
-                    SURFACE_MOTION_LOG_PERIOD * 10,
-                    (double)SURFACE_MOTION_BURST_THRESH);
-            surface_motion_peak = 0.0f;
-            surface_motion_log_counter = 0;
-        }
-
-        if (r_mag_s > SURFACE_MOTION_BURST_THRESH) {
-            if (surface_motion_burst_dwell < SURFACE_MOTION_BURST_DWELL) {
-                surface_motion_burst_dwell++;
-                if (surface_motion_burst_dwell == SURFACE_MOTION_BURST_DWELL) {
-                    LOG_INF("SURFACE exit: motion burst |a-g|=%.2f m/s^2 "
-                            "(thresh=%.2f, window peak=%.2f) -- "
-                            "starting %d ms re-engage cooldown",
-                            (double)r_mag_s,
-                            (double)SURFACE_MOTION_BURST_THRESH,
-                            (double)surface_motion_peak,
-                            CURSOR_COOLDOWN_SAMPLES * 10);
-                    cursor_cooldown_mode = MODE_SURFACE;
-                    cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
-                    _transition_to(MODE_IDLE);
-                }
-            }
-        } else {
-            surface_motion_burst_dwell = 0;
-        }
-    }
 }
 
 void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
@@ -1487,19 +1396,10 @@ disarm:
 void gesture_mode_on_chip_triple_tap(void)
 {
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
-    /* Triple-tap is the SURFACE ENTRY trigger ONLY.  Symmetric to
-     * double-tap: explicit, entry-only, exit by orientation.  Triple-
-     * tap while in any non-IDLE mode is a no-op (logged). */
-    if (current_mode == MODE_IDLE) {
-        LOG_INF("Chip triple-tap from IDLE -- entering SURFACE");
-        cursor_cooldown_remaining = 0;  /* explicit entry skips cooldown */
-        cursor_cooldown_mode = MODE_IDLE;
-        _transition_to(MODE_SURFACE);
-    } else {
-        LOG_INF("Chip triple-tap from %s -- ignored (triple-tap is "
-                "entry-only; exit by lifting the wrist off the surface)",
-                _mode_str(current_mode));
-    }
+    /* SURFACE mode was dropped (roadmap 2026-06-13).  Triple-tap is KEPT as a free,
+     * unbound trigger to repurpose later -- log-only for now, enters no mode. */
+    LOG_INF("Chip triple-tap (unbound) from %s -- no mode entry (SURFACE removed)",
+            _mode_str(current_mode));
 }
 
 GestureMode gesture_mode_get(void)
