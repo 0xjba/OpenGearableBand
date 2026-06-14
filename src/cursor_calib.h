@@ -42,26 +42,25 @@ typedef struct {
     float new_top;           /* anchor to apply (valid when apply==true)         */
     float new_bottom;        /* anchor to apply (valid when apply==true)         */
     /* Diagnostics for the [CAL] log line: */
-    bool  plateau_found;
-    float plateau_var;       /* variance of the chosen plateau (deg^2)           */
-    int   plateau_n;         /* length of the chosen plateau (samples)           */
-    float bottom_candidate;  /* median vert of the plateau (deg); 0 if none      */
-    float sweep_deg;         /* bottom_candidate - top_now (deg); 0 if no plateau */
+    float bottom_candidate;  /* the captured rest vert handed in (deg); 0 if !bottom_valid */
+    float sweep_deg;         /* bottom_candidate - top_now (deg); 0 if !bottom_valid       */
     float shadow_bottom;     /* would-be translate (CAL_SHADOW_TRANSLATE only)   */
 } cursor_calib_result_t;
 
 /*
  * Decide whether/how to recalibrate the cursor anchors for this entry.
- *   have_calib    : false on the first entry since boot (RAM-only, no prior).
+ *   have_calib       : false on the first entry since boot (RAM-only, no prior).
  *   prior_top/bottom : current anchors (defaults on cold start).
- *   top_now       : the snap-moment inclination (deg) = current_vert_deg().
- *   vert_chrono   : n samples of vert (deg) in CHRONOLOGICAL order (oldest first).
+ *   top_now          : the snap-moment inclination (deg) = current_vert_deg().
+ *   bottom_candidate : the most-recent settled desk-rest vert (deg), captured at
+ *                      placement by the caller's rest tracker (does NOT age).
+ *   bottom_valid     : false if no rest has been captured since boot.
  * Pure; returns a verdict. Never mutates global state.
  */
 cursor_calib_result_t cursor_calib_decide(bool have_calib,
                                           float prior_top, float prior_bottom,
                                           float top_now,
-                                          const float *vert_chrono, int n);
+                                          float bottom_candidate, bool bottom_valid);
 
 #ifdef __cplusplus
 }
