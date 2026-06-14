@@ -303,7 +303,19 @@
 
 /* Desk-settle exit (Amendment A.3).  gx_filt is the forearm-axis gravity
  * component in m/s^2 (~9.81 = 1g vertical, 0 = flat). */
-#define CURSOR_DESK_ZONE_GX             1.7f    /* near-flat zone: gx below this (vert>~80) [USER] */
+/* Low/near-flat zone: gx_filt below this = "low zone" for rest-capture + the
+ * stillness/tap disengage.  Seed 2.5 ~= vert > 75 deg, ~5-9 deg margin below the
+ * measured ~80-84 deg desk rest (cf. old DESK_ZONE 1.7 ~= vert>80).  M2-tuned. [USER] */
+#define CURSOR_LOW_ZONE_GX              2.5f
+/* Deprecated alias so existing call sites keep building until repointed (removed in
+ * the cleanup task once no references remain). */
+#define CURSOR_DESK_ZONE_GX             CURSOR_LOW_ZONE_GX
+
+/* Stillness-held disengage: consecutive settled-in-low-zone samples (still =
+ * samples_since_activity >= ACTIVITY_GATE_DWELL) required to exit AIR_MOUSE.  Seed
+ * 120 (~1.2 s) -- long enough a floating-to-point hand can't hold it, short enough
+ * a real desk rest fires.  M1-tuned. [USER] */
+#define STILL_EXIT_DWELL                120
 #define CURSOR_PAST_PLANE_GX            (-1.0f) /* (b) no-desk exit: forearm past horizontal [USER] */
 #define CURSOR_PAST_PLANE_DWELL         15      /* samples gx must stay past-plane [USER] */
 
