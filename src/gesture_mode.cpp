@@ -88,12 +88,6 @@ static int orientation_candidate_dwell = 0;
  * matches the cooldown's mode's expected pose. */
 static int reengage_dwell = 0;
 
-/* Counts non-expected-pose samples while in a cursor mode.  When it
- * exceeds the per-mode exit dwell (AIR_MOUSE_EXIT_DWELL or
- * SURFACE_EXIT_DWELL via _exit_dwell_for()), the FSM exits to IDLE +
- * starts cooldown. */
-static int cursor_exit_dwell = 0;
-
 /* Pose FSM state.  Updated each accel sample from update_accel. */
 static pose_id_t pose_armed_state = POSE_NONE;
 static int64_t   pose_armed_time_ms = 0;
@@ -200,7 +194,7 @@ static int entry_grace_remaining = 0;
 
 /* AIR_MOUSE desk-settle exit state (Amendment A.3). */
 /* (a) DESK-contact exit: the chip tap engine fires on the volar landing.  Set
- * by gesture_mode_on_chip_single_tap (power thread) when AIR_MOUSE + near-flat;
+ * by gesture_mode_on_chip_single_tap (power thread) when AIR_MOUSE + low zone;
  * read+cleared by gesture_mode_update_accel (acq thread) -> atomic. */
 static atomic_t air_desk_tap     = ATOMIC_INIT(0);
 static int      air_past_plane_dwell = 0;  /* (b) consecutive samples forearm is past horizontal */
@@ -242,20 +236,14 @@ static bool s_prev_needs_acq = false;
 
 static inline bool _mode_needs_continuous_imu(GestureMode m)
 {
-    return (m == MODE_AIR_MOUSE) || (m == MODE_SURFACE);
+    return (m == MODE_AIR_MOUSE);
 }
 
 /* Per-mode timing accessors -- centralise the mode-vs-constant
  * lookups so the FSM body doesn't sprinkle conditionals throughout. */
 static inline int _entry_grace_for(GestureMode m)
 {
-    return (m == MODE_AIR_MOUSE) ? AIR_MOUSE_ENTRY_GRACE
-                                 : SURFACE_ENTRY_GRACE;
-}
-static inline int _exit_dwell_for(GestureMode m)
-{
-    return (m == MODE_AIR_MOUSE) ? AIR_MOUSE_EXIT_DWELL
-                                 : SURFACE_EXIT_DWELL;
+    return (m == MODE_AIR_MOUSE) ? AIR_MOUSE_ENTRY_GRACE : 0;
 }
 
 /* Wrist-flick state. */
@@ -588,7 +576,6 @@ static void _transition_to(GestureMode new_mode)
     /* Reset dwell counters on every transition so the next trigger
      * starts cleanly. */
     reengage_dwell = 0;
-    cursor_exit_dwell = 0;
     /* Multi-tap counter and activity gate persist across transitions
      * by design: a tap arriving DURING the disambiguation window
      * that triggers a mode change (e.g., AIR_MOUSE entry on tap 2)
@@ -737,7 +724,6 @@ void gesture_mode_init(void)
     orientation_candidate = WRIST_NEUTRAL;
     orientation_candidate_dwell = 0;
     reengage_dwell = 0;
-    cursor_exit_dwell = 0;
     cursor_cooldown_remaining = 0;
     cursor_cooldown_mode = MODE_IDLE;
     cursor_has_reached_pose = false;
@@ -1013,10 +999,11 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     }
 
     /* --- Exit detection (per mode) ---
-     * AIR_MOUSE: stay engaged through the full raised->near-flat range; exit on
-     * (a) a chip tap in the near-flat zone (the band landing on a desk), or
-     * (b) the forearm crossing past horizontal (no desk).  SURFACE keeps its
-     * orientation-drop exit. */
+     * AIR_MOUSE: stay engaged through the full raised->low range; exit on the
+     * three-way disengage ladder:
+     *   (a) a chip tap in the low zone (the band landing on a desk),
+     *   (b) stillness held in the low zone (resting-on-desk settle), or
+     *   (c) the forearm drooping past the horizontal plane (no desk). */
     if (in_cursor_mode && cursor_has_reached_pose) {
         bool do_exit = false;
         const char *exit_reason = "";
@@ -1025,7 +1012,11 @@ void gesture_mode_update_accel(float ax, float ay, float az)
             bool low_zone = (gx_filt < CURSOR_LOW_ZONE_GX);
 
             /* (a) chip tap in the low zone (desk landing). Read-and-clear the latch
-             * every tick (atomic_set returns the prior value) so it can't go stale. */
+             * every tick (atomic_set returns the prior value) so it can't go stale.
+             * The AUTHORITATIVE low-zone gate is the setter: gesture_mode_on_chip_single_tap
+             * only sets air_desk_tap when already in the low zone, so this
+             * `low_zone && tapped` guard is defense-in-depth -- a future editor must NOT
+             * loosen the setter's gate on the assumption this check covers it. */
             bool tapped   = (atomic_set(&air_desk_tap, 0) != 0);
             bool desk_tap = low_zone && tapped;
 
@@ -1057,7 +1048,6 @@ void gesture_mode_update_accel(float ax, float ay, float az)
             _transition_to(MODE_IDLE);
         }
     } else {
-        cursor_exit_dwell = 0;
         atomic_set(&air_desk_tap, 0);
         air_past_plane_dwell = 0;
     }
@@ -1143,8 +1133,7 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
         /* Look for a reversal of the original burst direction. */
         if (largest_mag >= FLICK_BURST_THRESH_RPS &&
             ((largest_val > 0.0f) != (flick_burst_sign > 0.0f))) {
-            if (current_mode == MODE_AIR_MOUSE ||
-                current_mode == MODE_SURFACE) {
+            if (current_mode == MODE_AIR_MOUSE) {
                 LOG_INF("Wrist flick detected -- cancelling mode");
                 _transition_to(MODE_IDLE);
             }
@@ -1209,8 +1198,8 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
 
-    /* Desk-contact exit (Part 2): a chip tap while in AIR_MOUSE and near-flat is
-     * the band landing on the desk -> raise the exit flag (read by
+    /* Desk-contact exit (Part 2): a chip tap while in AIR_MOUSE and in the low
+     * zone is the band landing on the desk -> raise the exit flag (read by
      * gesture_mode_update_accel) and consume the tap (not an entry gesture). */
     if (current_mode == MODE_AIR_MOUSE && gx_filt < CURSOR_LOW_ZONE_GX) {
         atomic_set(&air_desk_tap, 1);

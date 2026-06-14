@@ -191,13 +191,8 @@
 #define FFT_BIN_MID_START               122
 #define FFT_BIN_MID_END                 246    /* ~400 Hz, exclusive */
 
-/* SURFACE motion-burst exit: residual above THRESH (m/s^2) for DWELL samples
- * exits SURFACE (wrist transported off the desk).  [USER] */
-#define SURFACE_MOTION_BURST_THRESH     2.0f
-#define SURFACE_MOTION_BURST_DWELL      15     /* 150 ms @100 Hz */
-
 /* ---------------------------------------------------------------------------
- *  5. Cursor-mode cooldown / exit dwell (AIR_MOUSE / SURFACE)
+ *  5. Cursor-mode cooldown / exit dwell (AIR_MOUSE)
  *  --------------------------------------------------------------------------- */
 
 /* Cooldown after a cursor mode exits, during which re-entry is orientation-
@@ -207,13 +202,8 @@
 /* Orientation dwell to re-engage during cooldown.  Samples @100 Hz.  [USER] */
 #define COOLDOWN_REENGAGE_DWELL         50
 
-/* Dwell out-of-pose before a cursor mode exits.  Samples @100 Hz.  [USER] */
-#define AIR_MOUSE_EXIT_DWELL            50
-#define SURFACE_EXIT_DWELL              0      /* immediate (volar-on-desk) */
-
 /* Entry grace (ms) after mode entry before exit logic arms.  [USER] */
 #define AIR_MOUSE_ENTRY_GRACE           500
-#define SURFACE_ENTRY_GRACE             300
 
 /* ---------------------------------------------------------------------------
  *  6. Wrist-flick (gyro) — flick-to-cancel a cursor mode
@@ -307,9 +297,6 @@
  * stillness/tap disengage.  Seed 2.5 ~= vert > 75 deg, ~5-9 deg margin below the
  * measured ~80-84 deg desk rest (cf. old DESK_ZONE 1.7 ~= vert>80).  M2-tuned. [USER] */
 #define CURSOR_LOW_ZONE_GX              2.5f
-/* Deprecated alias so existing call sites keep building until repointed (removed in
- * the cleanup task once no references remain). */
-#define CURSOR_DESK_ZONE_GX             CURSOR_LOW_ZONE_GX
 
 /* Stillness-held disengage: consecutive settled-in-low-zone samples (still =
  * samples_since_activity >= ACTIVITY_GATE_DWELL) required to exit AIR_MOUSE.  Seed
@@ -353,11 +340,6 @@
 /* ---- Natural entry-time cursor calibration (auto top+bottom anchors) ----
  * See docs/superpowers/specs/2026-06-12-natural-cursor-calibration-design.md.
  * All seeds; tune from the per-entry [CAL] traces. */
-#define VERT_HIST_SAMPLES     300     /* 3 s of vert history @100Hz, ~1.2KB. Deep on
-                                       * purpose: an undersized buffer fails INVISIBLY
-                                       * as no-plateau (masquerades as a lazy entry). [STRUCTURAL] */
-#define CAL_PLATEAU_VAR       4.0f    /* max vert variance (deg^2, ~2 deg std) for "resting still" [USER] */
-#define CAL_PLATEAU_DWELL     30      /* min plateau length (samples, ~300 ms) [USER] */
 #define CAL_SWEEP_MIN_DEG     25.0f   /* min (bottom - top) to count as a real raise [USER] */
 #define CAL_TOP_MAX           30.0f   /* plausibility clamp: reject a top above this (lazy raise) [USER] */
 #define CAL_MIN_DELTA         5.0f    /* ignore anchor shifts smaller than this (stable within a wear) [USER] */

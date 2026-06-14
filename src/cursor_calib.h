@@ -10,9 +10,9 @@ extern "C" {
 /*
  * Natural (entry-time) cursor calibration -- PURE decision engine.
  * No Zephyr / no I/O / no threads, so it is host-unit-testable like
- * cursor_track.  The CALLER (gesture_mode) owns the vert history buffer,
- * linearises it into chronological order (oldest -> newest), and applies
- * the verdict via cursor_track_set_anchors().
+ * cursor_track.  The CALLER captures the resting bottom angle at placement
+ * (a persistent scalar) and the top at the snap, and applies the verdict via
+ * cursor_track_set_anchors().
  * Geometry: vert = acos(|gx|/|g|); SMALL when raised (screen top),
  * LARGE when flat (screen bottom).  So bottom > top in degrees.
  * See docs/superpowers/specs/2026-06-12-natural-cursor-calibration-design.md.
