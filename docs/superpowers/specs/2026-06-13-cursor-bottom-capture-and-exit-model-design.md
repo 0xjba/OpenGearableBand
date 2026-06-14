@@ -176,7 +176,7 @@ data; only wider if M2 confirms a lower rest). Audit existing uses of
 ADD (all `[USER]`, seeds tuned from M1/M2):
 | Constant | Seed | Meaning |
 |---|---|---|
-| `CURSOR_LOW_ZONE_GX` | tune (M2) | `gx_filt` below this = "low zone" for rest-capture + stillness/tap exit; set to cover the M2-MEASURED rest range (today's data ~80–84° ⇒ narrow gate; widen only if a lower rest is confirmed) |
+| `CURSOR_LOW_ZONE_GX` | `2.5` (≈ vert > 75°) | `gx_filt` below this = "low zone" for rest-capture + stillness/tap exit. Seed gives ~5–9° margin below the measured ~80–84° rest (cf. old `CURSOR_DESK_ZONE_GX`=1.7 ≈ vert>80°). M2 finalizes: set ~5° under the measured *lowest* rest; widen only if a notably lower rest is confirmed |
 | `CAL_REST_STILL_DWELL` | ~40 (~400 ms) | min still-samples to call a low-zone pose a settled rest (capture `last_rest_vert`) |
 | `CAL_REST_VAR` | `4.0` | max `vert` variance (deg²) over the dwell for "settled" |
 | `STILL_EXIT_DWELL` | tune (M1) | consecutive settled low-zone samples to DISENGAGE (long enough a floating hand can't hold it) |
