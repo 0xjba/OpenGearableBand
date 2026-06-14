@@ -68,15 +68,15 @@ during build-out.
 
 ## TL;DR
 
-Three product use cases (surface touchpad, air mouse, advanced
-gestures) plus a cross-cutting voice-context capability share the
-same underlying engine.  Build one **unified gesture + voice pipeline**
+Two product use cases (air mouse, advanced gestures) plus a
+cross-cutting voice-context capability share the same underlying engine.
+(Surface touchpad was a third use case, DROPPED 2026-06-13 — see §1.)  Build one **unified gesture + voice pipeline**
 with mode-aware and context-aware output routing rather than separate
 implementations.
 
 **Implementation order:** foundation (mode detector + HID profile +
 cursor scaffolding) → chip-embedded gestures → air mouse v1 (IMU-only
-pinch via Edge Impulse) → surface mode → custom macro gestures →
+pinch via Edge Impulse) → custom macro gestures →
 **voice-activated context state machine (KWS)** → PPG-fused pinch
 (Apple-tier) → broader gesture vocabulary.  **Total to ship all three
 use cases + voice context at usable quality: 11-15 weeks** with
@@ -88,14 +88,25 @@ gesture or keyword for usable models).  Not code, not infrastructure.
 
 ---
 
-## 1. The three product use cases
+## 1. The product use cases
 
-### Use Case 1: Surface touchpad
+> **DECISION 2026-06-13 — Surface touchpad (Use Case 1 / roadmap Item 3) is
+> DROPPED.** Removed as a product direction (was previously "parked" pending an
+> optical/proximity sensor for true desk-plane lock). The air mouse covers the
+> on-desk case well enough via its near-flat bottom range, and Surface added a
+> hardware dependency + a second cursor-tuning surface for marginal benefit. The
+> §4 detail below and scattered Surface references are kept as design history
+> only — do NOT plan or build Surface. Cleanup later removes the SURFACE *mode*
+> (`MODE_SURFACE` + entry routing + its cursor-exit branch) but **KEEPS the
+> triple-tap gesture** (`gesture_mode_on_chip_triple_tap` + `y` sim) — triple-tap
+> is retained as a free trigger to repurpose for something else (binding TBD).
 
-Wrist resting on a desk surface.  Trigger gesture enters mode.
+### ~~Use Case 1: Surface touchpad~~ — DROPPED (2026-06-13)
+
+~~Wrist resting on a desk surface.  Trigger gesture enters mode.
 Wrist motion glides cursor on the surface.  Single tap on surface
 acts as right click, double tap as left click.  Wrist roll / tilt
-performs scroll.
+performs scroll.~~
 
 ### Use Case 2: Air mouse
 
@@ -846,7 +857,7 @@ mobile recorder.
 | **0** | **Foundation:** mode detector, BLE HID profile (HOGP), cursor pipeline scaffolding | LOW | **3-5 days** | Zephyr `peripheral_hids_mouse` sample + custom mode FSM | n/a -- infrastructure |
 | **1** | **Chip-embedded gestures** (tap-on-band, double-tap, wake, free-fall, sig-motion routing) | LOW | **+2-3 days** | LSM6DS3TR-C INT1 + register config | 95 %+ -- chip native |
 | **2** | **Air mouse cursor + IMU-only pinch click** (Doublepoint-class) | MEDIUM | **+2-3 weeks** | Gyro integration + Edge Impulse pinch model | Cursor smooth <30 s; pinch 82-88 % |
-| **3** | **Surface touchpad mode** (wrist on desk + LSM6 retuned tap + cursor reuse) | LOW-MEDIUM | **+3-5 days** | Reuses #0 cursor + retuned tap thresholds | Cursor jittery; clicks reliable |
+| ~~3~~ | ~~**Surface touchpad mode**~~ — **DROPPED 2026-06-13** (see §1). Item number retired, not reused. | — | — | — | — |
 | **4** | **Custom macro gestures** (wrist flick, twist, shake) | LOW-MEDIUM | **+3-5 days** | MCU-side threshold + duration classifier | ~90 % with tuning |
 | **5** | **Gesture-triggered live dictation** ("keyboard replacement" — snap + wrist-at-face pose → live STT → text injected at Mac cursor) | MEDIUM | **+2-3 weeks** | Omi-borrowed PDM + Opus + BLE audio GATT (firmware) + Voquill-forked Mac app + streaming STT (Deepgram Nova-3 BYOK in v0) | Transcription = vendor quality (~95 % clean audio); compound trigger false-positive target <1 % |
 | **6** | **Voice-activated context state machine** (push-to-talk KWS + context binding) | MEDIUM-HIGH | **+2-3 weeks** | nRF52840 PDM peripheral + Edge Impulse KWS model + custom GATT char | KWS 88-95 % closed vocabulary; mode router gates voice power |
@@ -1101,7 +1112,7 @@ additive, not replacing.
       |
       +-> [2] Air mouse + IMU pinch ---> [7] PPG-fused pinch
       |                                        |
-      +-> [3] Surface mode (reuses [0] cursor + [1] tap)
+      +-- [3] Surface mode -- DROPPED 2026-06-13 (see §1)
       |
       +-> [4] Macro gestures (reuses [0] mode FSM)
       |
@@ -1119,7 +1130,7 @@ additive, not replacing.
 Dependencies:
 
 - **Item 0 unblocks everything else.**  Build it first.
-- **Items 1, 2, 3, 4 are parallelizable** after item 0.
+- **Items 1, 2, 4 are parallelizable** after item 0. (Item 3 dropped.)
 - **Item 5 (dictation) needs items 0 + 1** -- the mode FSM and the
   chip-tap pattern (snap is a retuning of the tap engine).  The
   PDM + Opus + BLE audio GATT plumbing is borrowed wholesale from
@@ -1131,7 +1142,7 @@ Dependencies:
 - **Item 8 needs items 2 + 7** (extends the same gesture model
   further).
 
-Items 1, 3, 4 are each days of work and can be batched with item 0.
+Items 1, 4 are each days of work and can be batched with item 0.
 Item 5 (dictation) is sequenced ahead of items 6-8 because it
 completes the "band as input device" story (cursor + clicks +
 keyboard typing replacement) before the heavier Edge Impulse training
