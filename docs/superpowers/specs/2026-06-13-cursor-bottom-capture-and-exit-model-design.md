@@ -24,9 +24,11 @@ calibration code and share one "settled flat on the desk" signal.
   earlier "sensor sleeps during the rest" theory was overturned by this data. Fix =
   capture the bottom at placement into a non-aging scalar.
 - `finding_desk_exit_tap_misses_volar_up_2026_06_12` — the desk-tap exit works when
-  contact is genuinely near-flat (HW-confirmed 2026-06-13), but the user's
-  elbow-on-armrest rest lands at ~54° (not near-flat), which the old near-flat gate
-  excluded. The stillness-held exit + a widened low-zone gate are the angle-robust fix.
+  contact is genuinely near-flat (HW-confirmed 2026-06-13, rest ~80–84°). A *single,
+  unconfirmed, pre-re-wear* observation once put an elbow-on-armrest contact at ~54°
+  (flagged "to be confirmed", never reproduced, NOT seen in today's data) — it is a
+  case to CHECK in M2, NOT a design premise. The stillness-held exit is the
+  angle-robust fix regardless of the exact rest angle.
 - `project_air_mouse_exit_model_2026_06_12` — the agreed exit model this realizes.
 - Roadmap decision 2026-06-13: SURFACE touchpad (Use Case 1 / Item 3) is DROPPED.
 
@@ -39,8 +41,9 @@ but cannot capture the BOTTOM: by snap time the desk rest is >3 s old and has
 scrolled out of the 3 s `vert_hist` window (HW-proven, see `[CALDBG]` above). The
 bottom must be grabbed **at placement** — when the wrist settles on the desk — and
 held in a value that does not age. Separately, the AIR_MOUSE exit is unreliable
-(desk-tap gate only fires when contact is near-flat; the user's armrest rest at
-~54° is excluded). And SURFACE mode is dropped from the roadmap, so its code is
+(the desk-tap gate only fires when contact is near-flat; a non-near-flat rest, if
+the user ever has one, would be excluded — see M2). And SURFACE mode is dropped
+from the roadmap, so its code is
 removed here since it sits in the same exit branch.
 
 ## 2. The rest tracker (new) — `gesture_mode.cpp`
@@ -121,15 +124,18 @@ still at a raised / mid angle = "holding to point" → STAY ENGAGED. Pointing at
 *bottom of the screen* (low + still briefly) is distinguished from "parked on the
 desk" by the `STILL_EXIT_DWELL` dwell (M1).
 
-**Known tension (validate in M1/M2):** the low zone must be wide enough to include
-the ~54° armrest rest (so `CURSOR_LOW_ZONE_GX` ≈ the `gx` at 54°, much wider than
-the old near-flat 1.7). That means a chunk of the *lower pointing range* also falls
-in the low zone, so the `STILL_EXIT_DWELL` dwell is the SOLE thing separating
-"pointing low and pausing" from "parked on the desk" across that band. M1 must show
-a floating hand can't sustain the dwell anywhere in that band. **Fallback if it
-can't be cleanly separated:** keep stillness-exit only in the *deepest* (near-flat)
-sub-band and require the chip-tap for the shallower part of the low zone — tap is
-unambiguous. Decide from M1 data, not a priori.
+**Potential tension — CONDITIONAL on M2, do NOT assume it.** The low zone must
+cover the user's *actual measured* rest angle(s) (M2). Current HW data (2026-06-13)
+shows the rest at **~80–84° (near-flat)**, in which case the low zone is NARROW
+(`gx_filt` small, vert > ~75°), it barely overlaps the pointing range, and there is
+little tension — the dwell + tap are plenty. The wide-zone problem only arises *if*
+M2 finds the user routinely resting much lower (the historical, **unconfirmed,
+pre-re-wear** ~54° armrest observation — one trace, flagged "to be confirmed", never
+reproduced, and NOT seen in today's data). **If** M2 confirms a low rest, then the
+wider zone makes part of the lower pointing range disengage-eligible-when-still, and
+`STILL_EXIT_DWELL` becomes the sole separator — with the fallback: stillness-exit
+only in the deepest near-flat sub-band, chip-tap for the shallower part. Decide from
+M2 data; default expectation (per today's data) is the narrow, low-tension case.
 
 ## 5. SURFACE-mode removal
 
@@ -149,23 +155,28 @@ unambiguous. Decide from M1 data, not a priori.
   to hold the cursor at the bottom, read the same. Set `STILL_EXIT_DWELL`,
   `CAL_REST_STILL_DWELL`, `CAL_REST_VAR` from the gap (floating must NOT reach the
   dwell). Seeds below are first guesses pending this.
-- **M2 — low-zone reaches the real rests.** Confirm the low zone covers BOTH the
-  ~80° desk rest AND the ~54° elbow-on-armrest rest. If the strict `DOWN_FLAT`
-  classifier misses 54°, the low zone is gated on `gx_filt` / `vert` directly
-  (`CURSOR_LOW_ZONE_GX`) rather than the `DOWN_FLAT` orientation state, so it spans
-  both. Pick `CURSOR_LOW_ZONE_GX` from the measured `gx` at 54° and 80°.
+- **M2 — measure the user's ACTUAL rest angle(s); set the zone to cover them.** Do
+  NOT assume a number. Rest the wrist the way you actually work and read `vert`/`gx`
+  (the `[REST]` log). Today's data says ~80–84° (near-flat) — if that holds, set
+  `CURSOR_LOW_ZONE_GX` to a narrow near-flat gate. **Also check whether you ever rest
+  notably lower** (e.g. elbow on an armrest below desk height — a historical,
+  unconfirmed ~54° observation that did NOT appear in today's traces). If a lower
+  rest is real and reproducible, widen `CURSOR_LOW_ZONE_GX` to cover it (gated on
+  `gx_filt`/`vert` directly, not the strict `DOWN_FLAT` classifier) and apply the §4
+  fallback. The point is to fit *measured* behavior, not a remembered number.
 
 ## 7. Constants (`gesture_thresholds.h`)
 
 RETIRE: `VERT_HIST_SAMPLES`, `CAL_PLATEAU_VAR`, `CAL_PLATEAU_DWELL`.
-REPLACE: `CURSOR_DESK_ZONE_GX` (1.7, the old near-flat-only gate that excluded the
-54° rest) → subsumed by the wider, M2-tuned `CURSOR_LOW_ZONE_GX`. Audit existing
-uses of `CURSOR_DESK_ZONE_GX` in the exit branch and repoint them to the new gate.
+REPLACE: `CURSOR_DESK_ZONE_GX` (1.7, the old near-flat gate) → renamed/retuned to
+the M2-tuned `CURSOR_LOW_ZONE_GX` (likely similar if rests are near-flat per today's
+data; only wider if M2 confirms a lower rest). Audit existing uses of
+`CURSOR_DESK_ZONE_GX` in the exit branch and repoint them to the new gate.
 
 ADD (all `[USER]`, seeds tuned from M1/M2):
 | Constant | Seed | Meaning |
 |---|---|---|
-| `CURSOR_LOW_ZONE_GX` | tune (M2) | `gx_filt` below this = "low zone" for rest-capture + stillness/tap exit; must span ~54°..~90° |
+| `CURSOR_LOW_ZONE_GX` | tune (M2) | `gx_filt` below this = "low zone" for rest-capture + stillness/tap exit; set to cover the M2-MEASURED rest range (today's data ~80–84° ⇒ narrow gate; widen only if a lower rest is confirmed) |
 | `CAL_REST_STILL_DWELL` | ~40 (~400 ms) | min still-samples to call a low-zone pose a settled rest (capture `last_rest_vert`) |
 | `CAL_REST_VAR` | `4.0` | max `vert` variance (deg²) over the dwell for "settled" |
 | `STILL_EXIT_DWELL` | tune (M1) | consecutive settled low-zone samples to DISENGAGE (long enough a floating hand can't hold it) |
