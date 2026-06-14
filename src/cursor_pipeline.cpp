@@ -71,7 +71,7 @@ static int8_t consume_axis(float *pending, float sensitivity)
 static bool mode_allows_cursor(void)
 {
     GestureMode m = gesture_mode_get();
-    return (m == MODE_AIR_MOUSE) || (m == MODE_SURFACE);
+    return (m == MODE_AIR_MOUSE);
 }
 
 /*
