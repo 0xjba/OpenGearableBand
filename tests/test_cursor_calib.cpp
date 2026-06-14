@@ -16,12 +16,16 @@ int main(void)
     CHECK(r.apply == true);
     CHECK(fabsf(r.new_top - 12.0f) < 1e-3f);
     CHECK(fabsf(r.new_bottom - 80.0f) < 1e-3f);
+    CHECK(fabsf(r.bottom_candidate - 80.0f) < 1e-3f);
+    CHECK(fabsf(r.sweep_deg - (80.0f - 12.0f)) < 1e-3f);   /* sweep = bottom - top */
 
     /* C2: cold-start, no bottom captured -> run on defaults, apply nothing. */
     r = cursor_calib_decide(false, 12.0f, 82.0f, 12.0f, 0.0f, false);
     CHECK(r.decision == CAL_REJECT);
     CHECK(r.reason == CAL_REASON_COLD_START_DEFAULT);
     CHECK(r.apply == false);
+    CHECK(r.bottom_candidate == 0.0f);
+    CHECK(r.sweep_deg == 0.0f);
 
     /* A1: have-calib, large shift -> ADOPT, blend both toward (20,60). */
     r = cursor_calib_decide(true, 12.0f, 82.0f, 20.0f, 60.0f, true);
@@ -42,6 +46,8 @@ int main(void)
     CHECK(r.reason == CAL_REASON_MID_AIR_SHADOW);
     CHECK(r.apply == false);
     CHECK(fabsf(r.shadow_bottom - (14.0f + (82.0f - 12.0f))) < 1e-3f);  /* top + prior span */
+    CHECK(r.bottom_candidate == 0.0f);
+    CHECK(r.sweep_deg == 0.0f);
 
     /* A4: implausible top (45 > CAL_TOP_MAX) even with a valid bottom -> REJECT implausible-top. */
     r = cursor_calib_decide(true, 12.0f, 82.0f, 45.0f, 80.0f, true);
@@ -53,6 +59,21 @@ int main(void)
     r = cursor_calib_decide(true, 12.0f, 82.0f, 12.0f, 25.0f, true);
     CHECK(r.decision == CAL_REJECT);
     CHECK(r.reason == CAL_REASON_INSUFFICIENT_SWEEP);
+    CHECK(r.apply == false);
+
+    /* A6: only the BOTTOM moved past CAL_MIN_DELTA (top 12->13 = 1 < 5, bottom 82->70
+     *     = 12 >= 5); the OR still triggers a full ADOPT, blending BOTH anchors. */
+    r = cursor_calib_decide(true, 12.0f, 82.0f, 13.0f, 70.0f, true);
+    CHECK(r.decision == CAL_ADOPT);
+    CHECK(r.apply == true);
+    CHECK(fabsf(r.new_top    - (12.0f + CAL_BLEND_ALPHA * (13.0f - 12.0f))) < 1e-2f);  /* ~12.4 */
+    CHECK(fabsf(r.new_bottom - (82.0f + CAL_BLEND_ALPHA * (70.0f - 82.0f))) < 1e-2f);  /* ~77.2 */
+
+    /* A7: cold-start with a good bottom but implausible top (45>CAL_TOP_MAX) -> the
+     *     cold-start path reports COLD_START_DEFAULT (implausible-top is masked there). */
+    r = cursor_calib_decide(false, 12.0f, 82.0f, 45.0f, 80.0f, true);
+    CHECK(r.decision == CAL_REJECT);
+    CHECK(r.reason == CAL_REASON_COLD_START_DEFAULT);
     CHECK(r.apply == false);
 
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
