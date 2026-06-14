@@ -610,8 +610,9 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // chip event into the GPIO callback.
             pending_cmd = 't';
         } else if (c == 'y' || c == 'Y') {
-            // Stage 1 stand-in for triple-tap -- the SURFACE entry
-            // trigger.  Same Stage 2 deferral story as 't'.
+            // Stage 1 stand-in for triple-tap -- now an unbound trigger
+            // (SURFACE removed; triple-tap is log-only until rebound).
+            // Same Stage 2 deferral story as 't'.
             pending_cmd = 'y';
         } else if (c == 'c' || c == 'C') {
             // Tap calibration mode toggle.  When on, chip-tap events
@@ -691,7 +692,7 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'r'=reboot   'b'=UF2 bootloader");
     LOG_INF("  'g'=dump current gravity vector (pose calibration)");
     LOG_INF("  't'=simulate chip double-tap (AIR_MOUSE entry)");
-    LOG_INF("  'y'=simulate chip triple-tap (SURFACE entry)");
+    LOG_INF("  'y'=simulate chip triple-tap (unbound; SURFACE removed)");
     LOG_INF("  'm'=force mouse test mode (wasd=move, 1/2=click, ,/.=scroll, m again exits)");
     LOG_INF("  'c'=toggle chip-tap calibration logging");
     LOG_INF("  '+'=lower TAP_THS (more sensitive)   '-'=raise TAP_THS (less sensitive)");

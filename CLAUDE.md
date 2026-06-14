@@ -67,7 +67,7 @@ thread (125 Hz BLE HID) · BIO worker (FFT on tap). Cross-thread state uses
 
 ## Serial console (single letters)
 `r` reboot · `b` UF2 bootloader · `g` dump gravity · `t` sim double-tap
-(AIR_MOUSE entry) · `y` sim triple-tap (SURFACE) · `m` mouse test mode · `c`
+(AIR_MOUSE entry) · `y` sim triple-tap (unbound; SURFACE removed) · `m` mouse test mode · `c`
 tap-cal logging · `+`/`-` TAP_THS · `q` PPG probe · `z` gyro-bias trace · `v`
 pose trace · `u` clear BLE bonds · `]`/`[` horizontal-X gain · `}`/`{`
 vertical-Y gain.
