@@ -277,16 +277,6 @@ void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb);
 void gesture_mode_bio_acoustic_init(void);
 void gesture_mode_bio_acoustic_on_tap(void);
 
-/*
- * Live-tune the FAST cursor gravity-filter smoothing coefficient.
- * `factor` multiplies the current alpha (e.g. 0.8 = smoother/laggier,
- * 1.25 = sharper/snappier), clamped to [0.03, 0.50].  Returns the new
- * alpha so the caller can log it.  Wired to the serial console 'o'/'p'
- * keys -- lets the user dial cursor responsiveness vs jitter to taste
- * without a rebuild.  INTERIM: superseded by the gyro-fused inclination.
- */
-float gesture_mode_adjust_cursor_alpha(float factor);
-
 #ifdef __cplusplus
 }
 #endif

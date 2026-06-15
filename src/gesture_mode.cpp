@@ -39,36 +39,27 @@ static atomic_t mode_atomic = ATOMIC_INIT(MODE_IDLE);
  *  - gx/gy/gz_filt: SLOW ~1 s LPF (GRAVITY_LP_ALPHA).  Stability IS the feature
  *    here -- used by pose classification, the orientation classifier, the cone
  *    gate, and `shadow`.  Keep it slow.
- *  - gx/gy/gz_cursor: FAST LPF (CURSOR_GRAVITY_ALPHA) for the cursor Y driver
- *    ONLY -- responsiveness is the feature (the slow LPF lagged the cursor ~18°
- *    = rate*tau).  INTERIM fix (a); the destination fix (b) is a gyro-fused
- *    inclination from the existing Mahony quaternion (rejects linear-accel
- *    transients on fast flicks, which this accel-only filter cannot). */
+ *  (The cursor's vertical driver no longer has its own accel LPF -- it now reads
+ *  the Mahony filter's fused gravity via current_vert_deg(); see orientation.cpp.) */
 static float gx_filt = 0.0f;
 static float gy_filt = 0.0f;
 static float gz_filt = -9.81f;   /* assume face-up at boot */
-static float gx_cursor = 0.0f;
-static float gy_cursor = 0.0f;
-static float gz_cursor = -9.81f;
 
-/* Runtime-tunable smoothing coefficient for the FAST cursor filter, seeded
- * from the compile-time default.  Live-dialled via the serial console ('o'
- * smoother / 'p' sharper) so the user can trade responsiveness vs jitter to
- * taste this session without a rebuild.  Lower alpha = more smoothing + more
- * lag; higher = snappier + more accel noise.  Still INTERIM (a) -- the
- * destination fix (b) is the gyro-fused inclination, which is responsive AND
- * smooth without this knob. */
-static float s_cursor_alpha = CURSOR_GRAVITY_ALPHA;
-
-/* Angle-from-vertical (deg) for the cursor Y driver, from the FAST cursor
- * gravity filter.  Roll-immune (scalar projection of gravity onto the forearm
- * axis), unlike Euler pitch which saturates at high roll -- see cursor_track.h. */
+/* Angle-from-vertical (deg) for the cursor Y driver, from the Mahony filter's
+ * FUSED gravity vector (gyro-driven, accel-corrected -- responsive AND immune to
+ * linear-accel transients, unlike the old accel-only LPF).  Roll-immune: scalar
+ * projection of gravity onto the forearm axis (X), NOT Euler pitch (which is
+ * roll-contaminated near high roll -- see cursor_track.h).  Single source of
+ * truth for `vert`: cursor servo, entry-snap top, rest-bottom capture, and the
+ * anchor-relative low zone all read this. */
 static inline float current_vert_deg(void)
 {
-    float mag = sqrtf(gx_cursor * gx_cursor + gy_cursor * gy_cursor +
-                      gz_cursor * gz_cursor);
+    orientation_state_t ori;
+    orientation_get(&ori);
+    float gx = ori.gravity[0], gy = ori.gravity[1], gz = ori.gravity[2];
+    float mag = sqrtf(gx * gx + gy * gy + gz * gz);
     return (mag > 0.1f)
-        ? acosf(fminf(1.0f, fabsf(gx_cursor) / mag)) * (180.0f / 3.14159265f)
+        ? acosf(fminf(1.0f, fabsf(gx) / mag)) * (180.0f / 3.14159265f)
         : 0.0f;
 }
 
@@ -741,9 +732,6 @@ void gesture_mode_init(void)
     gx_filt = 0.0f;
     gy_filt = 0.0f;
     gz_filt = -9.81f;
-    gx_cursor = 0.0f;
-    gy_cursor = 0.0f;
-    gz_cursor = -9.81f;
     filter_initialised = false;
     orientation_current = WRIST_NEUTRAL;
     orientation_candidate = WRIST_NEUTRAL;
@@ -830,7 +818,6 @@ void gesture_mode_update_accel(float ax, float ay, float az)
      * wait ~5 time constants for the filter to converge. */
     if (!filter_initialised) {
         gx_filt = ax;    gy_filt = ay;    gz_filt = az;
-        gx_cursor = ax;  gy_cursor = ay;  gz_cursor = az;
         filter_initialised = true;
         return;
     }
@@ -839,12 +826,6 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     gx_filt += GRAVITY_LP_ALPHA * (ax - gx_filt);
     gy_filt += GRAVITY_LP_ALPHA * (ay - gy_filt);
     gz_filt += GRAVITY_LP_ALPHA * (az - gz_filt);
-
-    /* FAST 1-pole IIR (cursor Y driver ONLY) -- low lag.  INTERIM (a); the
-     * destination is a gyro-fused inclination from the Mahony quaternion. */
-    gx_cursor += s_cursor_alpha * (ax - gx_cursor);
-    gy_cursor += s_cursor_alpha * (ay - gy_cursor);
-    gz_cursor += s_cursor_alpha * (az - gz_cursor);
 
     /* Observability-cone measurement trace (no-op unless armed via 'v'). */
     pose_trace_tick();
@@ -1439,18 +1420,6 @@ void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz)
 int gesture_mode_get_cursor_cooldown_remaining(void)
 {
     return cursor_cooldown_remaining;
-}
-
-float gesture_mode_adjust_cursor_alpha(float factor)
-{
-    /* Multiplicative step (so the perceived smoothness scales smoothly), then
-     * clamp to a sane band.  Floor 0.03 (~0.3 s tau, very smooth but laggy);
-     * ceil 0.50 (very snappy, lets through a lot of accel noise -- past this
-     * there's no point, the raw signal dominates). */
-    s_cursor_alpha *= factor;
-    if (s_cursor_alpha < 0.03f) s_cursor_alpha = 0.03f;
-    if (s_cursor_alpha > 0.50f) s_cursor_alpha = 0.50f;
-    return s_cursor_alpha;
 }
 
 void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb)
