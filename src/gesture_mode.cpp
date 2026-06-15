@@ -79,6 +79,15 @@ static int orientation_candidate_dwell = 0;
  * matches the cooldown's mode's expected pose. */
 static int reengage_dwell = 0;
 
+/* True from the moment a passive exit opens the cooldown until the wrist is
+ * first seen OUT of the expected pose.  The orientation classifier rides the
+ * slow gravity LPF (~1 s lag), so right after a lower-to-rest exit it still
+ * reads UP_RAISED while the wrist is already low -- without this gate the
+ * re-engage fires mid-lowering and the cursor re-pins to the top then sweeps
+ * to the bottom (the observed exit glitch).  Re-engage may only arm after a
+ * genuine release, so it fires on a real raise-back where the top-pin matches. */
+static bool reengage_needs_release = false;
+
 /* Pose FSM state.  Updated each accel sample from update_accel. */
 static pose_id_t pose_armed_state = POSE_NONE;
 static int64_t   pose_armed_time_ms = 0;
@@ -189,6 +198,15 @@ static int entry_grace_remaining = 0;
  * read+cleared by gesture_mode_update_accel (acq thread) -> atomic. */
 static atomic_t air_desk_tap     = ATOMIC_INIT(0);
 static int      air_past_plane_dwell = 0;  /* (b) consecutive samples forearm is past horizontal */
+
+/* Deliberate-exit double-tap counter (acq-thread-only).  A SINGLE tap near rest
+ * is a passive desk landing (keeps the raise-to-resume cooldown); TWO taps
+ * within MULTI_TAP_WINDOW_MS while the wrist is POINTING (not in the rest zone)
+ * is the deliberate "switch the mouse off" gesture -> exit with NO cooldown.
+ * The rest-zone test separates the two: a desk landing is one tap down-low; a
+ * deliberate exit is two taps while up. */
+static int      air_exit_tap_count  = 0;
+static int      air_exit_tap_window = 0;  /* samples remaining in the double-tap window */
 
 /* Reference gravity vector captured at the moment a cursor mode
  * first engages (cursor_has_reached_pose flips false -> true).
@@ -737,12 +755,15 @@ void gesture_mode_init(void)
     orientation_candidate = WRIST_NEUTRAL;
     orientation_candidate_dwell = 0;
     reengage_dwell = 0;
+    reengage_needs_release = false;
     cursor_cooldown_remaining = 0;
     cursor_cooldown_mode = MODE_IDLE;
     cursor_has_reached_pose = false;
     entry_grace_remaining = 0;
     atomic_set(&air_desk_tap, 0);
     air_past_plane_dwell = 0;
+    air_exit_tap_count = 0;
+    air_exit_tap_window = 0;
     pose_armed_state = POSE_NONE;
     pose_armed_time_ms = 0;
     multi_tap_count = 0;
@@ -942,27 +963,42 @@ void gesture_mode_update_accel(float ax, float ay, float az)
      * holding the previously-active mode's expected pose for
      * COOLDOWN_REENGAGE_DWELL re-enters that mode without a fresh
      * trigger.  This covers "I was using AIR_MOUSE, briefly lowered
-     * to rest, raising again" and the analogous SURFACE case. */
+     * to rest, raising again" and the analogous SURFACE case.
+     *
+     * Gated on reengage_needs_release: the wrist must first be seen OUT
+     * of the expected pose since the exit before a raise-back can arm.
+     * Without it the slow-LPF orientation still reads UP_RAISED for ~1 s
+     * after a lower-to-rest exit and re-engages mid-lowering (cursor
+     * re-pins to top then sweeps to bottom -- the exit glitch). */
     if (current_mode == MODE_IDLE &&
         cursor_cooldown_remaining > 0 &&
-        cursor_cooldown_mode != MODE_IDLE &&
-        orientation_current == expected_pose_for(cursor_cooldown_mode)) {
-        if (reengage_dwell < COOLDOWN_REENGAGE_DWELL) {
-            reengage_dwell++;
-            if (reengage_dwell == COOLDOWN_REENGAGE_DWELL) {
-                LOG_INF("Cooldown re-engage (%s): %d ms remaining when fired",
-                        _mode_str(cursor_cooldown_mode),
-                        cursor_cooldown_remaining * 10);
-                GestureMode target = cursor_cooldown_mode;
-                cursor_cooldown_remaining = 0;
-                /* Flag the upcoming transition so _transition_to
-                 * suppresses the "entered while already in pose"
-                 * log -- the line above already explains we're
-                 * coming back from cooldown. */
-                s_transition_via_cooldown_reengage = true;
-                _transition_to(target);
+        cursor_cooldown_mode != MODE_IDLE) {
+        bool in_expected =
+            (orientation_current == expected_pose_for(cursor_cooldown_mode));
+        if (!in_expected) {
+            /* Wrist has left the raised pose -> a genuine raise-back can now
+             * re-engage. */
+            reengage_needs_release = false;
+            reengage_dwell = 0;
+        } else if (!reengage_needs_release) {
+            if (reengage_dwell < COOLDOWN_REENGAGE_DWELL) {
+                reengage_dwell++;
+                if (reengage_dwell == COOLDOWN_REENGAGE_DWELL) {
+                    LOG_INF("Cooldown re-engage (%s): %d ms remaining when fired",
+                            _mode_str(cursor_cooldown_mode),
+                            cursor_cooldown_remaining * 10);
+                    GestureMode target = cursor_cooldown_mode;
+                    cursor_cooldown_remaining = 0;
+                    /* Flag the upcoming transition so _transition_to
+                     * suppresses the "entered while already in pose"
+                     * log -- the line above already explains we're
+                     * coming back from cooldown. */
+                    s_transition_via_cooldown_reengage = true;
+                    _transition_to(target);
+                }
             }
         }
+        /* else: in expected pose but not yet released -> wait (no dwell). */
     } else {
         reengage_dwell = 0;
     }
@@ -1004,26 +1040,53 @@ void gesture_mode_update_accel(float ax, float ay, float az)
     }
 
     /* --- Exit detection (per mode) ---
-     * AIR_MOUSE: stay engaged through the full raised->low range; exit on the
-     * three-way disengage ladder:
-     *   (a) a chip tap in the low zone (the band landing on a desk),
-     *   (b) stillness held in the low zone (resting-on-desk settle), or
-     *   (c) the forearm drooping past the horizontal plane (no desk). */
+     * AIR_MOUSE disengage ladder.  Three exits are PASSIVE (resting the hand like
+     * lifting off a mouse -- they keep the raise-to-resume cooldown open):
+     *   (a) a single chip tap in the low zone (the band landing on a desk),
+     *   (b) stillness held in the low zone (resting-on-desk settle),
+     *   (c) the forearm drooping past the horizontal plane (no desk).
+     * One exit is DELIBERATE ("switch the mouse off" -- no cooldown, re-entry needs
+     * the full raise + double-tap ritual):
+     *   (d) a double-tap while POINTING (two taps, not in the rest zone). */
     if (in_cursor_mode && cursor_has_reached_pose) {
         bool do_exit = false;
+        bool deliberate_exit = false;
         const char *exit_reason = "";
 
         if (current_mode == MODE_AIR_MOUSE) {
-            /* (a) chip tap near the rest (desk landing). Read-and-clear the latch
-             * every tick (atomic_set returns the prior value) so it can't go stale.
-             * The setter (gesture_mode_on_chip_single_tap) now consumes EVERY tap in
-             * AIR_MOUSE (a tap has no other meaning here -- SURFACE entry is retired),
-             * so the AUTHORITATIVE zone gate is HERE: air_in_rest_zone() is anchor-
-             * relative, so a tap only disengages when we're actually near the
-             * calibrated rest -- a tap while pointing high sets the latch but is
-             * cleared here without exiting. */
-            bool tapped   = (atomic_set(&air_desk_tap, 0) != 0);
-            bool desk_tap = air_in_rest_zone() && tapped;
+            /* Read-and-clear the tap latch every tick (atomic_set returns the prior
+             * value) so it can't go stale.  The setter raises it on EVERY tap in
+             * AIR_MOUSE; the rest-zone test here (air_in_rest_zone(), anchor-relative)
+             * decides what the tap means. */
+            bool tapped  = (atomic_set(&air_desk_tap, 0) != 0);
+            bool in_rest = air_in_rest_zone();
+
+            /* Tick down the deliberate-exit double-tap window; reset the count when
+             * it lapses so two unrelated taps far apart never combine. */
+            if (air_exit_tap_window > 0) {
+                air_exit_tap_window--;
+                if (air_exit_tap_window == 0) air_exit_tap_count = 0;
+            }
+
+            /* (a) single tap near rest = desk landing = PASSIVE. */
+            bool desk_tap = in_rest && tapped;
+
+            /* (d) deliberate double-tap = two taps while POINTING (not near rest).
+             * A desk landing is one tap down-low; a deliberate "mouse off" is two
+             * taps while up.  Count taps that arrive outside the rest zone within the
+             * window; the 2nd one fires the deliberate exit. (Caveat from prior HW
+             * testing: a 2nd tap can be missed if the hand is moving while tapping --
+             * pause briefly to double-tap.) */
+            bool deliberate_dbltap = false;
+            if (tapped && !in_rest) {
+                air_exit_tap_count++;
+                air_exit_tap_window = (MULTI_TAP_WINDOW_MS / 10);  /* ms -> 100 Hz samples */
+                if (air_exit_tap_count >= 2) {
+                    deliberate_dbltap = true;
+                    air_exit_tap_count = 0;
+                    air_exit_tap_window = 0;
+                }
+            }
 
             /* (b) stillness-held: settled in the low zone for STILL_EXIT_DWELL (the
              * rest tracker maintains rest_dwell). Long enough a floating hand can't
@@ -1038,23 +1101,44 @@ void gesture_mode_update_accel(float ax, float ay, float az)
             }
             bool past_plane = (air_past_plane_dwell >= CURSOR_PAST_PLANE_DWELL);
 
-            if      (desk_tap)   { do_exit = true; exit_reason = "desk contact (chip tap)"; }
-            else if (still_held) { do_exit = true; exit_reason = "rest-settle (stillness)"; }
-            else if (past_plane) { do_exit = true; exit_reason = "past horizontal plane (no desk)"; }
+            if      (deliberate_dbltap) { do_exit = true; deliberate_exit = true; exit_reason = "deliberate double-tap"; }
+            else if (desk_tap)          { do_exit = true; exit_reason = "desk contact (chip tap)"; }
+            else if (still_held)        { do_exit = true; exit_reason = "rest-settle (stillness)"; }
+            else if (past_plane)        { do_exit = true; exit_reason = "past horizontal plane (no desk)"; }
         }
 
         if (do_exit) {
-            LOG_INF("%s exit: %s -- starting %d ms re-engage cooldown",
-                    _mode_str(current_mode), exit_reason, CURSOR_COOLDOWN_SAMPLES * 10);
-            cursor_cooldown_mode = current_mode;
-            cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
+            if (deliberate_exit) {
+                /* Deliberate double-tap = "switch the mouse off." NO cooldown: re-entry
+                 * requires the full raise + double-tap ritual.  Passive exits (a/b/c)
+                 * keep the convenience raise-to-resume cooldown -- they are just the
+                 * hand coming to rest, not a decision to quit. */
+                cursor_cooldown_mode = MODE_IDLE;
+                cursor_cooldown_remaining = 0;
+                reengage_dwell = 0;
+                LOG_INF("%s exit: %s -- deliberate, explicit re-tap required",
+                        _mode_str(current_mode), exit_reason);
+            } else {
+                cursor_cooldown_mode = current_mode;
+                cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
+                /* Require a genuine release before raise-to-resume can re-engage,
+                 * so the laggy orientation classifier can't re-engage mid-lowering. */
+                reengage_needs_release = true;
+                reengage_dwell = 0;
+                LOG_INF("%s exit: %s -- starting %d ms re-engage cooldown",
+                        _mode_str(current_mode), exit_reason, CURSOR_COOLDOWN_SAMPLES * 10);
+            }
             atomic_set(&air_desk_tap, 0);
             air_past_plane_dwell = 0;
+            air_exit_tap_count = 0;
+            air_exit_tap_window = 0;
             _transition_to(MODE_IDLE);
         }
     } else {
         atomic_set(&air_desk_tap, 0);
         air_past_plane_dwell = 0;
+        air_exit_tap_count = 0;
+        air_exit_tap_window = 0;
     }
 
 }
