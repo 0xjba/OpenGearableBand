@@ -117,7 +117,7 @@ int main(void)
     cursor_track_update(TOP, 50.0f, false, V, &dx, &dy);
     CHECK(!cursor_track_is_slamming());
 
-    /* --- X relative preserved; Y stillness via servo. --- */
+    /* --- X = linear yaw delta (was roll); Y stillness via servo. --- */
     cursor_track_set_gain(CURSOR_GAIN_X, CURSOR_GAIN_Y);
     cursor_track_start(TOP, 50.0f);
     drain_slam(TOP, 50.0f);
@@ -155,6 +155,82 @@ int main(void)
 
     /* Restore defaults for hygiene (nothing runs after, but be explicit). */
     cursor_track_set_anchors(CURSOR_VERT_TOP_DEG, CURSOR_VERT_TOP_DEG + CURSOR_VERT_SPAN_DEG);
+
+    /* ===== X-axis (yaw) contract ===== */
+    cursor_track_set_gain(CURSOR_GAIN_X, CURSOR_GAIN_Y);
+
+    /* A: arc-linearity + speed-independence -- a 20deg sweep moves GAIN_X*20 px
+     * whether fed as one big step or many small ones. */
+    cursor_track_start(TOP, 0.0f);
+    drain_slam(TOP, 0.0f);
+    cursor_track_update(TOP, 0.0f, false, V, &dx, &dy);   /* sync prev at yaw 0 */
+    float x_big = 0.0f;
+    cursor_track_update(TOP, 20.0f, false, V, &dx, &dy);
+    x_big += dx;
+    cursor_track_start(TOP, 0.0f);
+    drain_slam(TOP, 0.0f);
+    cursor_track_update(TOP, 0.0f, false, V, &dx, &dy);
+    float x_small = 0.0f;
+    for (int i = 1; i <= 40; i++) {
+        cursor_track_update(TOP, i * 0.5f, false, V, &dx, &dy);
+        x_small += dx;
+    }
+    CHECK(fabsf(x_big   - CURSOR_GAIN_X * 20.0f) < 1e-3f);
+    CHECK(fabsf(x_small - CURSOR_GAIN_X * 20.0f) < 1e-3f);
+    CHECK(fabsf(x_big - x_small) < 1e-3f);
+
+    /* B: at-rest yaw re-zero (a big discontinuity) is absorbed -> dx 0, and the
+     * next real move is uncontaminated (prev resynced across the re-zero). */
+    cursor_track_start(TOP, 100.0f);
+    drain_slam(TOP, 100.0f);
+    cursor_track_update(TOP, 100.0f, false, V, &dx, &dy);  /* sync prev at 100 */
+    cursor_track_update(TOP, 0.0f, true, V, &dx, &dy);      /* re-zero: -100 jump */
+    CHECK(dx == 0.0f);
+    cursor_track_update(TOP, 2.0f, false, V, &dx, &dy);     /* 0->2, not 100->2 */
+    CHECK(fabsf(dx - CURSOR_GAIN_X * 2.0f) < 1e-3f);
+
+    /* C: freeze at rest for sub-release motion; releases for a real move. */
+    cursor_track_start(TOP, 0.0f);
+    drain_slam(TOP, 0.0f);
+    cursor_track_update(TOP, 0.0f, false, V, &dx, &dy);
+    cursor_track_update(TOP, 0.02f, true, V, &dx, &dy);     /* 0.02 < FREEZE_RELEASE */
+    CHECK(dx == 0.0f);
+    cursor_track_update(TOP, 1.02f, true, V, &dx, &dy);      /* +1.0 > FREEZE_RELEASE */
+    CHECK(fabsf(dx - CURSOR_GAIN_X * 1.0f) < 1e-3f);
+
+    /* D: yaw wrap across +/-180 -> small real delta, no ~360 spike. */
+    cursor_track_start(TOP, 179.0f);
+    drain_slam(TOP, 179.0f);
+    cursor_track_update(TOP, 179.0f, false, V, &dx, &dy);
+    cursor_track_update(TOP, -179.0f, false, V, &dx, &dy);  /* wraps to +2 deg */
+    CHECK(fabsf(dx - CURSOR_GAIN_X * 2.0f) < 1e-3f);
+
+    /* E: X suppressed during a Y slam. */
+    cursor_track_start(TOP, 0.0f);
+    CHECK(cursor_track_is_slamming());
+    cursor_track_update(TOP, 10.0f, false, V, &dx, &dy);
+    CHECK(dx == 0.0f);
+    drain_slam(TOP, 10.0f);
+
+    /* F: cone-gate hysteresis -- off below INVALIDATE, holds off in the band,
+     * back on above REVALIDATE. */
+    cursor_track_start(TOP, 0.0f);
+    drain_slam(TOP, 0.0f);
+    cursor_track_update(TOP, 0.0f, false, V, &dx, &dy);
+    cursor_track_update(TOP, 2.0f, false, CURSOR_ROLL_SHADOW_INVALIDATE - 0.5f, &dx, &dy);
+    CHECK(dx == 0.0f);
+    cursor_track_update(TOP, 4.0f, false,
+        (CURSOR_ROLL_SHADOW_INVALIDATE + CURSOR_ROLL_SHADOW_REVALIDATE) * 0.5f, &dx, &dy);
+    CHECK(dx == 0.0f);
+    cursor_track_update(TOP, 6.0f, false, CURSOR_ROLL_SHADOW_REVALIDATE + 0.5f, &dx, &dy);
+    CHECK(dx != 0.0f);
+    /* F2 (hold-high leg): from VALID, the mid-band keeps X ON; only dropping
+     * below INVALIDATE turns it off. Covers the asymmetric else-if branch. */
+    cursor_track_update(TOP, 8.0f, false,
+        (CURSOR_ROLL_SHADOW_INVALIDATE + CURSOR_ROLL_SHADOW_REVALIDATE) * 0.5f, &dx, &dy);
+    CHECK(dx != 0.0f);
+    cursor_track_update(TOP, 10.0f, false, CURSOR_ROLL_SHADOW_INVALIDATE - 0.5f, &dx, &dy);
+    CHECK(dx == 0.0f);
 
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
