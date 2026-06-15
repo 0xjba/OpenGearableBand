@@ -1088,30 +1088,6 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
         cursor_track_update(vert, ori.roll_deg, ori.at_rest,
                             shadow, &dx, &dy);
         cursor_pipeline_inject_motion(dx, dy);
-
-        /* DIAGNOSTIC (temporary, 2026-06-13 -- REVERT after): ~50 Hz cursor log
-         * + vinst = instantaneous inclination from RAW accel (no LPF).  `vert`
-         * is the ~1 s gravity-LPF that drives the cursor; `vinst` is un-lagged.
-         * At a STOP, vinst settles at once while vert keeps drifting -> the
-         * (vert - vinst) gap IS the lag.  The ~50 Hz rate exposes per-tick
-         * choppiness in dy. */
-        static int cursor_tel_ctr = 0;
-        if ((dx != 0.0f || dy != 0.0f || cursor_track_is_slamming()) &&
-            (++cursor_tel_ctr % 2 == 0)) {
-            float amag = sqrtf(last_raw_ax * last_raw_ax +
-                               last_raw_ay * last_raw_ay +
-                               last_raw_az * last_raw_az);
-            int vinst = (amag > 0.1f)
-                ? (int)(acosf(fminf(1.0f, fabsf(last_raw_ax) / amag)) *
-                        (180.0f / 3.14159265f))
-                : 0;
-            LOG_INF("[CURSOR] vert=%d vinst=%d vtop=%d cur_y=%d target=%d slam=%d "
-                    "roll=%d shadow=%d dx=%d dy=%d",
-                    (int)vert, vinst, (int)cursor_track_vert_top(),
-                    (int)cursor_track_cur_y(), (int)cursor_track_target_counts(),
-                    (int)cursor_track_is_slamming(),
-                    (int)ori.roll_deg, (int)shadow, (int)dx, (int)dy);
-        }
     }
 
     /* Push into the rotation-signature ring buffer (dictation-flip
