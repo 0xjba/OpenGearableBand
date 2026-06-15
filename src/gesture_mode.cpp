@@ -936,12 +936,6 @@ void gesture_mode_update_accel(float ax, float ay, float az)
          * disengage zone moves with the mount instead of a fixed gx threshold. */
         if (air_in_rest_zone() && still) {
             if (rest_dwell < STILL_EXIT_DWELL) rest_dwell++;
-            static int restdbg = 0;
-            if (++restdbg % 10 == 0) {
-                LOG_INF("[REST] vert=%d still=%d dwell=%d last_rest=%d",
-                        (int)current_vert_deg(), (int)samples_since_activity,
-                        rest_dwell, (int)last_rest_vert);
-            }
         } else {
             rest_dwell = 0;
         }
