@@ -375,6 +375,109 @@ Tracked but not yet investigated:
 
 ---
 
+## Hardware-platform optimization candidates — MAX30101 / MAX30105 switch (UN-TRIAGED)
+
+**Status:** candidate brain-dump captured 2026-06-15, **gated on the planned PPG
+sensor swap** (MAX30102 → MAX30101 or MAX30105). NOT yet verified, NOT triaged,
+NOT scheduled. This list is here so we can brainstorm → research-verify → decide
+which are apt → spec → implement. Apply the same discipline as the rest of this
+doc: **re-verify every claim against the actual datasheet / source before
+building** (the bullet summaries below are unconfirmed engineering folklore until
+checked against the MAX3010x datasheet + cited literature).
+
+**Why this section exists / why the swap matters:** the single biggest reason to
+move off the MAX30102 is the **green LED (≈530 nm)**. The MAX30102 is Red + IR
+only — it has *no* green emitter, which is the wavelength commercial bands use for
+wrist HR because of its superior SNR on superficial capillary beds. The MAX30101
+(Red + IR + **Green**) and MAX30105 (adds particle/proximity sensing) both add it.
+So several items below (green-drive, multi-light-path) are simply *unavailable* on
+our current part and become possible only post-swap. This also reactivates the
+"Multi-light-path fusion" line currently in **What we deliberately won't chase**
+(excluded *because* the MAX30102 lacks the third path) — revisit that exclusion
+once the part changes.
+
+> Triage note: each candidate must be tagged on review as one of —
+> **[apt-now]** (do post-swap), **[overlaps-existing]** (already partly built —
+> reconcile, don't duplicate), **[conflicts]** (contradicts a deliberate exclusion
+> — needs explicit justification to pursue), or **[drop]**. Pre-tags are my first
+> read, not decisions.
+
+### Scenario A — Steady-state HR (at rest)
+- **Maximize the Green LED (530 nm) drive current** for the best SNR on
+  superficial capillary beds. *[apt-now — this is the headline reason to swap.]*
+- **Physical light baffle / opaque optical barrier** between LEDs and photodiode
+  under the cover glass to kill internal optical crosstalk. *[apt-now — but it's a
+  mechanical/housing change, ties into the productionization-housing thread, not a
+  firmware task. Cross-ref `hardware_wear_position.md` + the open-PCB/duct-tape
+  mount caveat.]*
+
+### Scenario B — Minor motion (typing, gesturing)
+- **Adaptive band-pass filter ~0.5–3 Hz** to isolate the pulse band from small
+  muscular twitches. *[overlaps-existing — we already run a 4th-order Butterworth
+  band-pass; verify whether "adaptive" adds anything over our fixed band, or is
+  just a re-description of what we have.]*
+- **Offload to a dedicated biometric hub (MAX32664)** for on-chip AGC + continuous
+  smoothing. *[conflicts/large — this is adding a *second IC* and moving the whole
+  pipeline off our M4, which throws away the ~135-LOC software roadmap above. Big
+  architecture decision; treat as its own brainstorm, not a tweak. The MAX32664
+  also pairs specifically with MAX3010x parts.]*
+
+### Scenario C — Major motion (running, walking)
+- **3-axis accel reference for adaptive noise cancellation (ANC)** — subtract
+  motion spikes from the optical signal. *[overlaps-existing — we already do
+  3-axis chained NLMS motion-artifact removal (see gap table). Reconcile: is the
+  proposal a different/better ANC, or the same thing?]*
+- **Increase MAX30101 sample rate** for higher-resolution waveforms → better
+  separation of true cardiac peaks from footstep impacts. *[apt-now — verify the
+  power/I2C-bandwidth cost vs. our current ODR; interacts with Stage 2's FFT
+  window sizing.]*
+
+### Scenario D — Hand-down / arm-lowered (venous blood pooling)
+- **Detect downward arm angle via accelerometer** → lower the confidence score,
+  lean on recent averages. *[overlaps-existing — we already have the gravity
+  vector + orientation filter (cursor work) AND a confidence-score plan (Stage 3).
+  This is a *new input* to Stage 3's confidence formula (an "arm-down factor"),
+  not new machinery. Cheap, apt — fold into Stage 3.]*
+- **Dynamically boost LED brightness + photodiode sensitivity** (via the AFE) to
+  penetrate pooled venous blood when arm is down. *[apt-now — this is AGC applied
+  to the hand-down case; verify against the MAX3010x AFE register set.]*
+
+### Additional / cross-scenario
+- **Built-in proximity detection to shut down main LEDs on wrist-off** (big power
+  win). *[overlaps-existing — we already have a wear-state (`WEAR_WORN`); the
+  MAX3010x proximity mode could *drive* it in hardware instead of inferring it.
+  Apt — power + correctness win. MAX30105 has the strongest proximity support.]*
+- **Adaptive Gain Control (AGC)** generally. *[apt-now — AFE-level; underpins
+  several items above (C-rate, D-brightness). Verify the MAX3010x AGC register
+  behavior.]*
+- **Generative waveform reconstruction — GANs / Edge Impulse, trained on
+  PPG-DaLiA.** *[CONFLICTS — directly contradicts the existing "What we
+  deliberately won't chase → Deep learning models (foundation models for PPG):
+  out of scope on M4; need MB of memory; need labelled training data." If we want
+  to revisit, the doc's own rule says the justification must be written down. Note:
+  PPG-DaLiA is a real, well-known wrist-PPG+accel dataset, so the *data* exists;
+  the blocker is M4 memory/compute, not data. Edge Impulse can target M4-class
+  MCUs with small models — so the honest open question is whether a *tiny*
+  on-device model (not a GAN) is feasible within our RAM, which is a different and
+  much narrower claim than "run a GAN." Research before pursuing.]*
+
+> Open cross-cutting questions for the brainstorm:
+> 1. MAX30101 vs MAX30105 — do we need the 30105's particle/proximity extras, or
+>    is the 30101 (Green+Red+IR) enough? Proximity-driven wear-detect leans 30105.
+> 2. MAX32664 hub (offload) vs. keep-everything-on-M4 (the software roadmap above)
+>    — these are mutually-exclusive architectures. Decide early; it reframes the
+>    whole HR pipeline.
+> 3. How much of items B/C/D is genuinely NEW vs. a re-description of band-pass +
+>    NLMS + confidence-score we already have planned/built? Reconcile before
+>    speccing so we don't rebuild existing work.
+
+> TODO before implementing any of the above: add datasheet + literature citations
+> to the Sources block (MAX30101/30105 datasheet, MAX32664 user guide, PPG-DaLiA
+> dataset paper, Edge-Impulse-on-Cortex-M feasibility) — none are cited yet
+> because nothing here is verified.
+
+---
+
 ## Sources
 
 Listed by which stage they primarily support.
