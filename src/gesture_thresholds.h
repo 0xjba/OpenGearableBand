@@ -293,10 +293,22 @@
 
 /* Desk-settle exit (Amendment A.3).  gx_filt is the forearm-axis gravity
  * component in m/s^2 (~9.81 = 1g vertical, 0 = flat). */
-/* Low/near-flat zone: gx_filt below this = "low zone" for rest-capture + the
- * stillness/tap disengage.  Seed 2.5 ~= vert > 75 deg, ~5-9 deg margin below the
- * measured ~80-84 deg desk rest (cf. old DESK_ZONE 1.7 ~= vert>80).  M2-tuned. [USER] */
-#define CURSOR_LOW_ZONE_GX              2.5f
+/* COARSE capture gate: gx_filt below this = "flat-ish posture" where recording a
+ * resting bottom anchor makes sense.  Deliberately GENEROUS (4.0 ~= vert > 65 deg)
+ * so the bottom anchor is captured across re-wears -- the rest angle is mount-
+ * dependent and has been measured anywhere from ~70 to ~84 deg (HW 2026-06-14: a
+ * re-wear rested at vert=75 / gx~2.5, sitting exactly on the old 2.5 seed and
+ * starving the gate of margin).  This is the ABSOLUTE gate for capture + the
+ * stillness dwell; the desk-tap/stillness DISENGAGE keys off the calibrated rest
+ * via CURSOR_LOW_ZONE_MARGIN_DEG instead, so it self-heals with the mount. [USER][HOUSING] */
+#define CURSOR_LOW_ZONE_GX              4.0f
+
+/* Anchor-relative low zone for the DISENGAGE gates.  "Near rest" = current vert is
+ * within this many degrees of the auto-calibrated resting bottom (last_rest_vert).
+ * Mount-INDEPENDENT (degrees from the user's own rest), unlike a fixed gx threshold:
+ * when the mount shifts and the bottom anchor recalibrates, this zone moves with it.
+ * 10 deg gives comfortable margin while staying clear of mid-screen pointing. [USER] */
+#define CURSOR_LOW_ZONE_MARGIN_DEG      10.0f
 
 /* Stillness-held disengage: consecutive settled-in-low-zone samples (still =
  * samples_since_activity >= ACTIVITY_GATE_DWELL) required to exit AIR_MOUSE.  Seed

@@ -273,6 +273,18 @@ static float last_rest_vert  = 0.0f;
 static bool  bottom_valid     = false;
 static int   rest_dwell       = 0;
 
+/* Anchor-relative "low zone" for the AIR_MOUSE disengage gates (desk-tap +
+ * stillness).  True when the current inclination is within CURSOR_LOW_ZONE_MARGIN_DEG
+ * of the auto-calibrated resting bottom (last_rest_vert), so the disengage zone
+ * tracks the rest across re-wears instead of a fixed gx threshold (which over-fits
+ * one mount -- HW 2026-06-14: a re-wear's 75deg rest landed exactly on the old
+ * fixed seed).  Returns false until a rest has been captured (bottom_valid). */
+static inline bool air_in_rest_zone(void)
+{
+    return bottom_valid &&
+           (current_vert_deg() >= last_rest_vert - CURSOR_LOW_ZONE_MARGIN_DEG);
+}
+
 /* RAM-only calibration state (no NVS): false until the first complete entry ritual
  * seeds the anchors.  cursor_track holds the anchor values; this just tracks "have
  * we calibrated since boot" for the cold-start branch. */
@@ -366,6 +378,19 @@ static void pose_fsm_update(float gx, float gy, float gz)
     float score = 0.0f;
     pose_id_t best = pose_classify_best(gx, gy, gz,
                                           POSE_MATCH_THRESH, &score);
+
+    /* SURFACE mode was retired (2026-06-13): do NOT arm POSE_SURFACE in the live
+     * FSM.  An armed SURFACE pose has no consumer now (it can enter no mode -- see
+     * the log-only case in multi_tap_commit_handler) and only produces noise.  The
+     * canonical (gesture_poses.cpp k_canonical_poses) and the hard-surface spectral
+     * detector (surface_spectral_confirms_hard_surface) are intentionally KEPT in
+     * code as ready scaffolding: when the high-ODR bio-acoustic surface-tap feature
+     * is built (the ViBand path -- see docs/research/gesture-sensing-without-ppg.md
+     * and software-optimization-roadmap.md), RE-ARM by deleting this demotion and
+     * wiring a real consumer in multi_tap_commit_handler. */
+    if (best == POSE_SURFACE) {
+        best = POSE_NONE;
+    }
 
     /* NOTE: do NOT re-add a roll/gz-based AIR_MOUSE<->DICTATION split here.
      * A held max-right air-mouse is gravity-identical to dictation (measured
@@ -900,11 +925,16 @@ void gesture_mode_update_accel(float ax, float ay, float az)
      * ALL states; captured at placement (motion -> sampling awake -> settle).  The
      * scalar never ages, so it bridges the >3 s gap to the entry snap. ---- */
     {
-        bool low_zone = (gx_filt < CURSOR_LOW_ZONE_GX);
-        bool still    = (samples_since_activity >= ACTIVITY_GATE_DWELL);
-        if (low_zone && still) {
+        bool coarse_low = (gx_filt < CURSOR_LOW_ZONE_GX);  /* flat-ish: capture gate */
+        bool still      = (samples_since_activity >= ACTIVITY_GATE_DWELL);
+        /* Capture the resting bottom on the COARSE absolute gate (re-wear robust). */
+        if (coarse_low && still) {
             last_rest_vert = current_vert_deg();   /* auto-tracks the latest rest */
             bottom_valid   = true;
+        }
+        /* Stillness dwell is gated ANCHOR-RELATIVE (near the captured rest), so the
+         * disengage zone moves with the mount instead of a fixed gx threshold. */
+        if (air_in_rest_zone() && still) {
             if (rest_dwell < STILL_EXIT_DWELL) rest_dwell++;
             static int restdbg = 0;
             if (++restdbg % 10 == 0) {
@@ -1009,16 +1039,16 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         const char *exit_reason = "";
 
         if (current_mode == MODE_AIR_MOUSE) {
-            bool low_zone = (gx_filt < CURSOR_LOW_ZONE_GX);
-
-            /* (a) chip tap in the low zone (desk landing). Read-and-clear the latch
+            /* (a) chip tap near the rest (desk landing). Read-and-clear the latch
              * every tick (atomic_set returns the prior value) so it can't go stale.
-             * The AUTHORITATIVE low-zone gate is the setter: gesture_mode_on_chip_single_tap
-             * only sets air_desk_tap when already in the low zone, so this
-             * `low_zone && tapped` guard is defense-in-depth -- a future editor must NOT
-             * loosen the setter's gate on the assumption this check covers it. */
+             * The setter (gesture_mode_on_chip_single_tap) now consumes EVERY tap in
+             * AIR_MOUSE (a tap has no other meaning here -- SURFACE entry is retired),
+             * so the AUTHORITATIVE zone gate is HERE: air_in_rest_zone() is anchor-
+             * relative, so a tap only disengages when we're actually near the
+             * calibrated rest -- a tap while pointing high sets the latch but is
+             * cleared here without exiting. */
             bool tapped   = (atomic_set(&air_desk_tap, 0) != 0);
-            bool desk_tap = low_zone && tapped;
+            bool desk_tap = air_in_rest_zone() && tapped;
 
             /* (b) stillness-held: settled in the low zone for STILL_EXIT_DWELL (the
              * rest tracker maintains rest_dwell). Long enough a floating hand can't
@@ -1198,10 +1228,14 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
 
-    /* Desk-contact exit (Part 2): a chip tap while in AIR_MOUSE and in the low
-     * zone is the band landing on the desk -> raise the exit flag (read by
-     * gesture_mode_update_accel) and consume the tap (not an entry gesture). */
-    if (current_mode == MODE_AIR_MOUSE && gx_filt < CURSOR_LOW_ZONE_GX) {
+    /* Desk-contact exit: a chip tap while in AIR_MOUSE is an exit candidate -> raise
+     * the exit flag (read by gesture_mode_update_accel) and consume the tap (never an
+     * entry gesture -- SURFACE entry is retired, so a tap has no other meaning in
+     * AIR_MOUSE).  The zone check lives in the exit branch (air_in_rest_zone(), anchor-
+     * relative): a tap while pointing high sets the latch but is cleared without
+     * exiting.  Consuming unconditionally also stops taps leaking into the pose-gated
+     * multi-tap entry path (which used to mis-fire "Mode entry rejected (SURFACE)"). */
+    if (current_mode == MODE_AIR_MOUSE) {
         atomic_set(&air_desk_tap, 1);
         /* Keep the recent-activity guard + ringing refractory live: a desk
          * landing is real motion, so record it like any tap, else a sig-motion
@@ -1345,18 +1379,13 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
         break;
 
     case POSE_SURFACE:
-        /* SURFACE has an extra check: tap must show desk-feedback
-         * spectral signature (hard surface, not lap). */
-        if (!surface_spectral_confirms_hard_surface()) {
-            LOG_INF("SURFACE entry rejected: spectral signature "
-                    "indicates soft surface (mid_band=%.0f < %.0f)",
-                    (double)last_tap_mid_band_energy,
-                    (double)SURFACE_RESONANCE_MID_BAND_THRESH);
-            goto disarm;
-        }
-        LOG_INF("MODE ENTRY: SURFACE (pose + cadenced double-tap + "
-                "hard-surface spectral confirmed)");
-        /* TODO: trigger mode transition (future task F2). */
+        /* SURFACE MODE was dropped (roadmap 2026-06-13).  The pose classifier +
+         * hard-surface spectral detector are KEPT as useful logic, but a SURFACE
+         * pose + double-tap no longer ENTERS a mode (it is unbound, like triple-tap).
+         * Log the detector result for diagnostics; enter nothing. */
+        LOG_INF("SURFACE pose + double-tap (unbound) -- detector live "
+                "(hard_surface=%d), no mode entry (SURFACE removed)",
+                (int)surface_spectral_confirms_hard_surface());
         break;
 
     default:

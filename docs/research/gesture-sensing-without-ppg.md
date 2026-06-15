@@ -116,6 +116,36 @@ ring, not a passive band.
 - **Do NOT spec:** a *motionless* finger pinch, per-finger ASL discrimination, or
   grip-force — they need PPG / EMG / active-acoustic hardware we don't have.
 
+### Firmware scaffolding already in place for the ViBand / surface-tap build
+
+The dropped SURFACE *mode* was removed, but its **detection scaffolding was deliberately
+kept** in firmware because the flat-wrist-on-a-desk posture is exactly the trigger
+context for the future bio-acoustic surface-tap feature. When we build the ViBand path,
+these are the wires to reconnect (all live in `src/gesture_mode.cpp` / `gesture_poses.cpp`
+unless noted):
+
+- **`POSE_SURFACE` canonical** (`gesture_poses.cpp` `k_canonical_poses`) — the flat-wrist
+  gravity signature, still defined and scored by `pose_classify_best`. It is currently
+  **demoted to `POSE_NONE` in `pose_fsm_update`** (a 3-line `if (best == POSE_SURFACE)`
+  guard, added 2026-06-15) so it doesn't arm with no consumer. **Re-arm = delete that
+  guard.**
+- **`surface_spectral_confirms_hard_surface()` + `last_tap_mid_band_energy` +
+  `SURFACE_RESONANCE_MID_BAND_THRESH`** — the hard-surface-vs-soft (desk vs lap) spectral
+  discriminator from the tap's FFT. Still compiled and updated on every chip tap; ready
+  to gate a real surface-tap.
+- **The `case POSE_SURFACE` branch in `multi_tap_commit_handler`** — currently log-only
+  (`"… unbound … no mode entry"`). This is where a real consumer gets wired: pose +
+  cadenced double-tap + hard-surface spectral confirm → the surface-tap action.
+- **Triple-tap (`gesture_mode_on_chip_triple_tap`, serial `y`)** — kept as a free,
+  unbound trigger to repurpose; another candidate entry point for a surface/bio-acoustic
+  verb.
+
+The missing piece is purely the **high-ODR (~4 kHz) bio-acoustic capture + feature
+extraction** itself (today's FIFO runs ~833 Hz for the tap engine). Everything *around*
+it — posture detection, hard-surface spectral gate, tap cadence, an unbound trigger — is
+already wired and waiting. Cross-ref: `finding_surface_tap_not_dead_2026_06_08`,
+`software-optimization-roadmap.md`, `gesture-architecture.md`.
+
 ---
 
 ## Sources (surfaced & verified; 3-vote adversarial)
