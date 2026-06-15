@@ -33,6 +33,9 @@ typedef struct {
     float yaw_deg;            /* gyro-only; drifts; re-zeroed at rest */
     bool  at_rest;            /* stillness flag (accel + gyro quiet) */
     float gyro_bias_dps[3];   /* estimated gyro bias, deg/s */
+    float gravity[3];         /* fused gravity DIRECTION in band frame, unit vector
+                               * (gyro-driven, accel-corrected) -- the roll-immune
+                               * source for the cursor's vertical driver */
 } orientation_state_t;
 
 void orientation_init(void);
