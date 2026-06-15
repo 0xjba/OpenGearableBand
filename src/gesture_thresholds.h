@@ -272,7 +272,14 @@
  * count->pixel scale).  X stays relative px/deg.  See
  * docs/superpowers/specs/2026-06-11-absolute-y-cursor-design.md. */
 #define CURSOR_GAIN_Y                   30.0f   /* counts/deg (servo); tune on HW [USER][HOUSING] */
-#define CURSOR_GAIN_X                   8.0f    /* px/deg (relative roll->X) [USER][HOUSING]      */
+/* X is driven by YAW (forearm sweep about the elbow), mapped linearly px/deg and
+ * tuned live via the ']' / '[' serial knob.  CURSOR_YAW_HALF_SPAN_DEG records the
+ * comfortable one-side sweep the gain is dialed against (sweep ~this far -> reach
+ * the screen edge).  It is a documented tuning target, NOT a runtime anchor: X has
+ * no fixed angle reference (no heading source on a 6-axis IMU), so the live gain
+ * does the real tuning. */
+#define CURSOR_GAIN_X                   8.0f    /* px/deg (yaw->X) [USER][HOUSING]                 */
+#define CURSOR_YAW_HALF_SPAN_DEG        35.0f   /* comfortable one-side sweep, deg [USER]          */
 
 /* Vertical map calibration (deg). vert = acos(|gx|/|g|), 0=vertical..90=flat. */
 #define CURSOR_VERT_SPAN_DEG            70.0f   /* nominal comfortable down-range [USER]           */
