@@ -601,7 +601,7 @@ static void _transition_to(GestureMode new_mode)
         if (!s_transition_via_cooldown_reengage) {
             cursor_calib_run_on_entry(top_now);
         }
-        cursor_track_start(top_now, ori.roll_deg);
+        cursor_track_start(top_now, ori.yaw_deg);
     } else {
         cursor_track_stop();
     }
@@ -1169,7 +1169,7 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
         float shadow = sqrtf(gy_filt * gy_filt + gz_filt * gz_filt);
         float vert = current_vert_deg();      /* roll-immune Y driver */
         float dx = 0.0f, dy = 0.0f;
-        cursor_track_update(vert, ori.roll_deg, ori.at_rest,
+        cursor_track_update(vert, ori.yaw_deg, ori.at_rest,
                             shadow, &dx, &dy);
         cursor_pipeline_inject_motion(dx, dy);
     }

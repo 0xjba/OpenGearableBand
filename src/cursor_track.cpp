@@ -20,8 +20,8 @@ static_assert(CURSOR_PIN_LEAVE_DEG >= CURSOR_PIN_ENTER_DEG,
  * initialised on the transition path then owned by acq from the first servo
  * tick onward (the s_started gate bounds the window).  Revisit if Y gains a
  * smoothing filter or a host-fed position correction. */
-static float s_prev_roll      = 0.0f;
-static bool  s_roll_valid     = false;
+static float s_prev_yaw       = 0.0f;
+static bool  s_x_valid        = false;
 static bool  s_started        = false;
 
 /* Absolute-Y state. */
@@ -54,7 +54,7 @@ void cursor_track_get_gain(float *gain_x, float *gain_y)
     *gain_y = s_gain_y;
 }
 
-/* Wrap an angle delta into [-180,180] so the roll (atan2) discontinuity at
+/* Wrap an angle delta into [-180,180] so the heading discontinuity at
  * +/-180 doesn't produce a ~360 deg jump. */
 static float wrap180(float d)
 {
@@ -109,14 +109,14 @@ static void start_slam(int sign)
     s_slam_sign      = sign;
 }
 
-void cursor_track_start(float vert_deg, float roll_deg)
+void cursor_track_start(float vert_deg, float yaw_deg)
 {
     /* Fixed anchor (Amendment A.1): the entry inclination no longer sets the
      * top; vert_deg is unused here now but the arg is kept for API symmetry
-     * (the slam + roll seed below still run on entry). */
+     * (the slam + yaw seed below still run on entry). */
     (void)vert_deg;
-    s_prev_roll  = roll_deg;
-    s_roll_valid = false;
+    s_prev_yaw   = yaw_deg;
+    s_x_valid    = false;
     s_cur_y      = 0.0f;
     s_at_top     = true;     /* we enter at the top */
     start_slam(-1);          /* entry slam to the top edge */
@@ -137,7 +137,7 @@ static void update_top_repin(float vert_deg)
     }
 }
 
-void cursor_track_update(float vert_deg, float roll_deg, bool at_rest,
+void cursor_track_update(float vert_deg, float yaw_deg, bool at_rest,
                          float shadow, float *out_dx, float *out_dy)
 {
     if (!s_started) { *out_dx = 0.0f; *out_dy = 0.0f; return; }
@@ -168,20 +168,24 @@ void cursor_track_update(float vert_deg, float roll_deg, bool at_rest,
         update_top_repin(vert_deg);   /* may re-arm a to-top slam */
     }
 
-    /* ---- X axis: relative roll (UNCHANGED), but SUPPRESSED during a slam so
-     * the slam emits only its Y burst (spec §5).  prev stays synced so X has no
-     * jump when tracking resumes. ---- */
-    float droll = wrap180(roll_deg - s_prev_roll);
-    if (fabsf(droll) > CURSOR_MAX_DELTA_DEG) droll = 0.0f;
-    if (shadow >= CURSOR_ROLL_SHADOW_REVALIDATE)      s_roll_valid = true;
-    else if (shadow <  CURSOR_ROLL_SHADOW_INVALIDATE) s_roll_valid = false;
-    bool x_frozen = at_rest && (fabsf(droll) < CURSOR_FREEZE_RELEASE_DELTA);
+    /* ---- X axis: LINEAR yaw-angle -> px (pseudo-absolute arc).  dx = gain *
+     * per-tick yaw delta, so a given sweep ANGLE maps to a fixed screen distance
+     * regardless of sweep speed.  Suppressed during a Y slam.  Cone-gated near
+     * vertical (yaw degenerates at gimbal, shadow -> 0).  Frozen at rest: the
+     * MAX_DELTA clamp + freeze absorb the filter's at-rest yaw re-zero
+     * discontinuity, and s_prev_yaw is resynced EVERY tick (incl.
+     * frozen/invalid/slamming) so X never jumps on resume. ---- */
+    float dyaw = wrap180(yaw_deg - s_prev_yaw);
+    if (fabsf(dyaw) > CURSOR_MAX_DELTA_DEG) dyaw = 0.0f;
+    if (shadow >= CURSOR_ROLL_SHADOW_REVALIDATE)      s_x_valid = true;
+    else if (shadow <  CURSOR_ROLL_SHADOW_INVALIDATE) s_x_valid = false;
+    bool x_frozen = at_rest && (fabsf(dyaw) < CURSOR_FREEZE_RELEASE_DELTA);
     float dx = 0.0f;
-    if (!slamming && !x_frozen && s_roll_valid) dx = s_gain_x * droll;
+    if (!slamming && !x_frozen && s_x_valid) dx = s_gain_x * dyaw;
 
     *out_dx = dx;
     *out_dy = dy;
-    s_prev_roll = roll_deg;
+    s_prev_yaw = yaw_deg;
 }
 
 bool  cursor_track_is_slamming(void)     { return s_slam_remaining > 0; }
@@ -198,7 +202,7 @@ void cursor_track_set_anchors(float vert_top, float vert_bottom_in)
 
 void cursor_track_stop(void)
 {
-    s_roll_valid = false;
+    s_x_valid    = false;
     s_started    = false;
     /* Note: absolute-Y state (s_at_top, s_cur_y, s_slam_remaining, s_slam_sign)
      * is intentionally NOT reset here -- cursor_track_start resets it on the

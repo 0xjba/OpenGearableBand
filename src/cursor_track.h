@@ -20,20 +20,25 @@ extern "C" {
 
 /* Begin a session: capture the reference angles (no entry jump) and gate X
  * until the shadow clearly clears the cone. */
-void cursor_track_start(float vert_deg, float roll_deg);
+void cursor_track_start(float vert_deg, float yaw_deg);
 
 /* One tick (~100 Hz).
  *   vert_deg : angle-from-vertical (deg), the Y driver.  Use the GRAVITY-based
  *     inclination (acos(|gx|/|g|)), NOT Euler pitch -- hardware showed Euler
  *     pitch saturates at high roll (roll-contaminated) and freezes the cursor
  *     over the lower third of the stroke; the gravity inclination is immune.
- *   roll_deg : fused roll (orientation_get), the X driver.
+ *   yaw_deg  : fused heading (orientation_get, bias-tracked, at-rest re-zeroed),
+ *     the X driver.  X is a LINEAR angle->px map of the yaw delta (a forearm
+ *     sweep about the elbow), so a given sweep angle moves a fixed screen
+ *     distance regardless of speed.  No absolute heading reference exists on a
+ *     6-axis IMU, so X is pseudo-absolute: cone-gated near vertical and
+ *     re-anchored (prev resynced) at every at-rest pause to bound gyro drift.
  *   at_rest  : orientation stillness flag.
  *   shadow   : sqrt(gy^2+gz^2) from the GRAVITY-LPF (NEVER the fused
- *     quaternion -- inside the cone the fused roll drifts on gyro alone; the
- *     gate needs the raw gravity signal).
+ *     quaternion -- it is the distance-from-vertical the cone gate needs; yaw
+ *     degenerates at gimbal where shadow -> 0).
  * Writes the relative cursor delta (px) to *out_dx, *out_dy. */
-void cursor_track_update(float vert_deg, float roll_deg, bool at_rest,
+void cursor_track_update(float vert_deg, float yaw_deg, bool at_rest,
                          float shadow, float *out_dx, float *out_dy);
 
 /* End the session (clears latched state). */
