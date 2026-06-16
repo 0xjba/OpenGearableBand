@@ -9,6 +9,7 @@ target_sources(app PRIVATE
     src/WearableDSP.cpp
     src/power_ctrl.cpp
     src/gesture_mode.cpp
+    src/bio_acoustic.cpp
     src/gesture_poses.cpp
     src/orientation.cpp
 )

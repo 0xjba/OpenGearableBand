@@ -18,6 +18,7 @@
 #include "WearableDSP.h"
 #include "power_ctrl.h"
 #include "gesture_mode.h"
+#include "bio_acoustic.h"
 #include "orientation.h"
 #include <zephyr/settings/settings.h>
 
@@ -1035,7 +1036,7 @@ static bool service_chip_int1(bool handle_sigmotion) {
                     "(threshold=0x%02x ~%d mg)",
                     tap_src, axis, sign, current_tap_ths, current_tap_ths * 62);
         }
-        gesture_mode_bio_acoustic_on_tap();
+        bio_acoustic_on_tap();
         gesture_mode_on_chip_single_tap(axis, sign);
     }
 
@@ -1383,7 +1384,7 @@ int main(void) {
     // buffer at 1.66 kHz + starts the worker thread.  Must happen
     // AFTER tap engine enable so the FIFO ODR override correctly
     // supersedes the tap engine's 416 Hz default.
-    gesture_mode_bio_acoustic_init();
+    bio_acoustic_init();
 
     // From this point on, the power state machine thread (started
     // automatically by K_THREAD_DEFINE) drives all sensor power and

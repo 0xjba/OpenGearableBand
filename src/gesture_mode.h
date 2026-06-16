@@ -183,13 +183,6 @@ void gesture_mode_pose_trace_start(uint32_t n_samples);
 GestureMode gesture_mode_get(void);
 
 /*
- * Force the mode to a specific value.  Used by serial test commands
- * and unit-test scaffolding.  Production callers should rely on
- * trigger-gesture-driven transitions, not this.
- */
-void gesture_mode_set(GestureMode mode);
-
-/*
  * Read the current orientation classification.  Diagnostics-only --
  * mode transitions happen automatically inside the detector based on
  * this, callers don't need to drive it manually.
@@ -237,22 +230,6 @@ typedef void (*gesture_acq_request_cb_t)(bool needs);
  * the callback (used in unit tests / shutdown).
  */
 void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb);
-
-/*
- * Bio-acoustic capture pipeline (Stage E).  Initialises the chip
- * FIFO in continuous mode at 1.66 kHz and starts the background
- * worker thread.  Call once from main() at boot, after the LSM6DSL
- * tap engine is enabled but before any taps could arrive.
- *
- * After init, gesture_mode_bio_acoustic_on_tap() should be invoked
- * from the INT1 dispatcher in main.cpp on every chip tap event.
- * That function reads the FIFO into a static buffer and signals the
- * worker to extract features + classify.  The classification is
- * logged for now; FSM routing wiring comes after the rules are
- * validated empirically.
- */
-void gesture_mode_bio_acoustic_init(void);
-void gesture_mode_bio_acoustic_on_tap(void);
 
 #ifdef __cplusplus
 }
