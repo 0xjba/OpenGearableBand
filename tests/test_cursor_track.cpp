@@ -232,6 +232,52 @@ int main(void)
     cursor_track_update(TOP, 10.0f, false, CURSOR_ROLL_SHADOW_INVALIDATE - 0.5f, &dx, &dy);
     CHECK(dx == 0.0f);
 
+    /* ===== Sweep-coupling compensation (X-arc fix) =====
+     * Helper inline: sweep to yaw=D (sweep_deg == D) while holding a fixed vert,
+     * then settle the Y servo, and read the servo target. */
+    cursor_track_set_gain(CURSOR_GAIN_X, CURSOR_GAIN_Y);
+
+    /* SC1: k=0 is identity -- a swept cursor still targets GAIN_Y*(vert-top). */
+    cursor_track_set_swing_comp(0.0f);
+    cursor_track_start(TOP, 0.0f);
+    drain_slam(TOP, 0.0f);
+    cursor_track_update(TOP + 20.0f, 0.0f, false, V, &dx, &dy);          /* sync, sweep 0 */
+    for (int i = 1; i <= 30; i++) cursor_track_update(TOP + 20.0f, (float)i, false, V, &dx, &dy);
+    for (int i = 0; i < 30; i++)  cursor_track_update(TOP + 20.0f, 30.0f, false, V, &dx, &dy);
+    CHECK(fabsf(cursor_track_target_counts() - CURSOR_GAIN_Y * 20.0f) < 1e-3f);
+
+    /* SC2: parabola subtraction -- k=0.01, sweep_deg=30 -> correction 0.01*900=9deg,
+     * so target = GAIN_Y*(20-9) = GAIN_Y*11. */
+    cursor_track_set_swing_comp(0.01f);
+    cursor_track_start(TOP, 0.0f);
+    drain_slam(TOP, 0.0f);
+    cursor_track_update(TOP + 20.0f, 0.0f, false, V, &dx, &dy);
+    for (int i = 1; i <= 30; i++) cursor_track_update(TOP + 20.0f, (float)i, false, V, &dx, &dy);
+    for (int i = 0; i < 30; i++)  cursor_track_update(TOP + 20.0f, 30.0f, false, V, &dx, &dy);
+    CHECK(fabsf(cursor_track_target_counts() - CURSOR_GAIN_Y * 11.0f) < 1e-3f);
+
+    /* SC3: center is unaffected -- at sweep 0, k>0 still applies no correction. */
+    cursor_track_set_swing_comp(0.01f);
+    cursor_track_start(TOP, 0.0f);
+    drain_slam(TOP, 0.0f);
+    for (int i = 0; i < 30; i++) cursor_track_update(TOP + 20.0f, 0.0f, false, V, &dx, &dy);
+    CHECK(fabsf(cursor_track_target_counts() - CURSOR_GAIN_Y * 20.0f) < 1e-3f);
+
+    /* SC4: deliberate vertical survives -- at a fixed nonzero sweep, raising vert
+     * beyond the parabola still raises the Y target (intent preserved). */
+    cursor_track_set_swing_comp(0.01f);
+    cursor_track_start(TOP, 0.0f);
+    drain_slam(TOP, 0.0f);
+    cursor_track_update(TOP + 20.0f, 0.0f, false, V, &dx, &dy);
+    for (int i = 1; i <= 30; i++) cursor_track_update(TOP + 20.0f, (float)i, false, V, &dx, &dy);
+    for (int i = 0; i < 30; i++)  cursor_track_update(TOP + 20.0f, 30.0f, false, V, &dx, &dy);
+    float t_low = cursor_track_target_counts();
+    for (int i = 0; i < 30; i++)  cursor_track_update(TOP + 40.0f, 30.0f, false, V, &dx, &dy);
+    float t_high = cursor_track_target_counts();
+    CHECK(t_high > t_low + 100.0f);
+
+    cursor_track_set_swing_comp(CURSOR_SWING_COMP_K);   /* restore default for hygiene */
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }

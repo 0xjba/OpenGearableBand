@@ -1172,6 +1172,17 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
         cursor_track_update(vert, ori.yaw_deg, ori.at_rest,
                             shadow, &dx, &dy);
         cursor_pipeline_inject_motion(dx, dy);
+
+        /* DIAGNOSTIC (temporary, 2026-06-16 -- REMOVE after the X-arc question is
+         * resolved): does a "horizontal" sweep also move vert (elevation)?  Logs
+         * the Y driver (vert) vs the X driver (yaw) + the emitted deltas at ~25 Hz
+         * whenever the cursor is actually moving.  During a deliberately-horizontal
+         * sweep, watch whether vert drifts (-> dy != 0 -> the arc) while yaw drives dx. */
+        static int xarc_ctr = 0;
+        if ((dx != 0.0f || dy != 0.0f) && (++xarc_ctr % 4 == 0)) {
+            LOG_INF("[XARC] vert=%d yaw=%d shadow=%d dx=%d dy=%d",
+                    (int)vert, (int)ori.yaw_deg, (int)shadow, (int)dx, (int)dy);
+        }
     }
 
     /* Push into the rotation-signature ring buffer (dictation-flip

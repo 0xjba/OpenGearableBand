@@ -658,6 +658,12 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
         } else if (c == '{') {
             // Vertical (Y) cursor gain DOWN.
             pending_cmd = '{';
+        } else if (c == 'p') {
+            // Sweep-coupling compensation strength UP (straighten the X arc).
+            pending_cmd = 'p';
+        } else if (c == 'o') {
+            // Sweep-coupling compensation strength DOWN.
+            pending_cmd = 'o';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -695,6 +701,7 @@ void reset_thread_entry(void *, void *, void *) {
             "then Forget on host + re-pair)");
     LOG_INF("  ']'/'['=horizontal(X) gain up/down   "
             "'}'/'{'=vertical(Y) gain up/down");
+    LOG_INF("  'p'/'o'=sweep-coupling comp up/down (straighten the X arc)");
 
     /* Per-step cursor delta for the mouse-test injects.  10 pixels
      * per press gives a clearly visible cursor jump on the host. */
@@ -832,14 +839,33 @@ void reset_thread_entry(void *, void *, void *) {
             bool is_up = (cmd == ']' || cmd == '}');
             float factor = is_up ? 1.25f : 0.8f;
             if (is_x) gx *= factor; else gy *= factor;
-            if (gx > 60.0f) gx = 60.0f;
+            /* X may be NEGATIVE (its sign sets the L/R direction for the mount):
+             * clamp its MAGNITUDE to [1,60] and keep the sign, so tuning the gain
+             * never silently un-flips the axis.  Y must stay positive -- a
+             * negative GAIN_Y zeroes the servo span (max_counts). */
+            float gx_sign = (gx < 0.0f) ? -1.0f : 1.0f;
+            float gx_mag  = gx * gx_sign;            /* |gx| without <math.h> */
+            if (gx_mag > 60.0f) gx_mag = 60.0f;
+            if (gx_mag < 1.0f)  gx_mag = 1.0f;
+            gx = gx_sign * gx_mag;
             if (gy > 60.0f) gy = 60.0f;
-            if (gx < 1.0f)  gx = 1.0f;
             if (gy < 1.0f)  gy = 1.0f;
             cursor_track_set_gain(gx, gy);
             LOG_INF("Cursor gain %s %s -> X=%.1f Y=%.1f px/deg",
                     is_x ? "X" : "Y", is_up ? "UP" : "DOWN",
                     (double)gx, (double)gy);
+        } else if (cmd == 'o' || cmd == 'p') {
+            pending_cmd = 0;
+            /* Sweep-coupling compensation 'k': additive step (k is a small
+             * deg/deg^2 number, so additive tunes finer than multiplicative).
+             * Clamp to [0, 0.05]; 0 disables (straight pass-through). */
+            float k = cursor_track_get_swing_comp();
+            k += (cmd == 'p') ? 0.001f : -0.001f;
+            if (k < 0.0f)   k = 0.0f;
+            if (k > 0.05f)  k = 0.05f;
+            cursor_track_set_swing_comp(k);
+            LOG_INF("Sweep-comp k %s -> %.4f deg/deg^2 (X-arc straighten)",
+                    (cmd == 'p') ? "UP" : "DOWN", (double)k);
         } else if (cmd == 'y') {
             pending_cmd = 0;
             LOG_INF("Simulating chip triple-tap event");

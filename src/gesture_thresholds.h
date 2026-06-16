@@ -277,9 +277,18 @@
  * comfortable one-side sweep the gain is dialed against (sweep ~this far -> reach
  * the screen edge).  It is a documented tuning target, NOT a runtime anchor: X has
  * no fixed angle reference (no heading source on a 6-axis IMU), so the live gain
- * does the real tuning. */
-#define CURSOR_GAIN_X                   8.0f    /* px/deg (yaw->X) [USER][HOUSING]                 */
+ * does the real tuning.  The SIGN sets the left/right direction for this mount
+ * (negative here so a leftward sweep moves the cursor left); the ']' / '[' knob
+ * scales MAGNITUDE only and preserves the sign. */
+#define CURSOR_GAIN_X                   -8.0f   /* px/deg (yaw->X); sign = L/R for mount [USER][HOUSING] */
 #define CURSOR_YAW_HALF_SPAN_DEG        35.0f   /* comfortable one-side sweep, deg [USER]          */
+
+/* Sweep-plane coupling compensation: a tilted-plane forearm sweep drags elevation
+ * into the Y driver, bowing the cursor into an arc.  corrected_vert = vert -
+ * CURSOR_SWING_COMP_K * sweep_deg^2 cancels it (sweep_deg = horizontal cursor
+ * displacement / X gain).  First guess from HW trace: ~15 deg of coupling at ~70
+ * deg sweep -> k ~= 15/70^2 ~= 0.003.  Tuned live via 'o'/'p'; 0 disables. */
+#define CURSOR_SWING_COMP_K             0.003f  /* deg elevation per deg^2 sweep [USER][HOUSING]   */
 
 /* Vertical map calibration (deg). vert = acos(|gx|/|g|), 0=vertical..90=flat. */
 #define CURSOR_VERT_SPAN_DEG            70.0f   /* nominal comfortable down-range [USER]           */

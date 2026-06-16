@@ -53,6 +53,13 @@ void cursor_track_stop(void);
 void  cursor_track_set_gain(float gain_x, float gain_y);
 void  cursor_track_get_gain(float *gain_x, float *gain_y);
 
+/* Sweep-plane coupling correction strength (deg of elevation removed per deg^2 of
+ * horizontal sweep): corrected_vert = vert - k*sweep^2.  Cancels the elevation a
+ * tilted-plane forearm sweep drags into the Y driver (the cursor "arc").  Tuned
+ * live over serial; k=0 disables it (identity with the pre-feature Y axis). */
+void  cursor_track_set_swing_comp(float k);
+float cursor_track_get_swing_comp(void);
+
 /* Introspection for telemetry + host tests. */
 bool  cursor_track_is_slamming(void);
 float cursor_track_cur_y(void);           /* Y position estimate, counts from top  */

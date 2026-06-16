@@ -36,11 +36,25 @@ static int   s_slam_remaining = 0;                       /* >0 => slamming      
 static int   s_slam_sign      = -1;                      /* -1 up(top), +1 down     */
 static bool  s_at_top         = false;                   /* re-pin hysteresis latch */
 
+/* Horizontal sweep position: running integral of the emitted dx (counts from the
+ * entry center).  Used ONLY to evaluate the swing-plane coupling correction
+ * (sweep-coupling compensation) -- it does NOT change the X output. */
+static float s_cur_x          = 0.0f;                    /* counts from entry center */
+
 /* Runtime gains, seeded from the compile-time defaults.  Tuned live over
  * serial (reachable span = gain * usable-wrist-range), so they are variables
  * rather than the #define constants used directly. */
 static float s_gain_x = CURSOR_GAIN_X;
 static float s_gain_y = CURSOR_GAIN_Y;
+
+/* Sweep-plane coupling correction strength (deg of elevation removed per deg^2 of
+ * horizontal sweep): corrected_vert = vert - k * sweep_deg^2.  Cancels the
+ * elevation a tilted-plane forearm sweep drags into vert (the cursor "arc").
+ * Runtime-tunable over serial; k=0 disables (identity with the pre-feature Y). */
+static float s_swing_comp_k = CURSOR_SWING_COMP_K;
+
+void cursor_track_set_swing_comp(float k) { s_swing_comp_k = k; }
+float cursor_track_get_swing_comp(void)   { return s_swing_comp_k; }
 
 void cursor_track_set_gain(float gain_x, float gain_y)
 {
@@ -89,6 +103,18 @@ static float target_counts(float vert_deg)
     return t;
 }
 
+/* Sweep-plane coupling correction: subtract the elevation a tilted-plane forearm
+ * sweep drags into vert (the cursor "arc").  sweep_deg = horizontal cursor
+ * displacement / X gain = net yaw swept from the entry center (deg) -- gain- and
+ * sign-invariant since it is squared; correction = k * sweep^2.  k=0 (or no X
+ * gain) -> identity, so the pre-feature Y behavior is exactly recovered. */
+static float corrected_vert(float vert_deg)
+{
+    if (s_swing_comp_k == 0.0f || s_gain_x == 0.0f) return vert_deg;
+    float sweep_deg = s_cur_x / s_gain_x;
+    return vert_deg - s_swing_comp_k * sweep_deg * sweep_deg;
+}
+
 /* Arm a slam burst.  sign -1 => up (to top), +1 => down (to bottom).  Size is a
  * GAIN_Y-independent floor max'd with margin*max_counts so it reaches the edge
  * even untuned; over-travel is harmless (OS clamps).
@@ -118,6 +144,7 @@ void cursor_track_start(float vert_deg, float yaw_deg)
     s_prev_yaw   = yaw_deg;
     s_x_valid    = false;
     s_cur_y      = 0.0f;
+    s_cur_x      = 0.0f;     /* entry = horizontal center (sweep 0) */
     s_at_top     = true;     /* we enter at the top */
     start_slam(-1);          /* entry slam to the top edge */
     s_started    = true;
@@ -158,14 +185,15 @@ void cursor_track_update(float vert_deg, float yaw_deg, bool at_rest,
             s_cur_y = (s_slam_sign < 0) ? 0.0f : max_counts();
         }
     } else {
-        float target = target_counts(vert_deg);
+        float cv = corrected_vert(vert_deg);   /* swing-coupling-compensated elevation */
+        float target = target_counts(cv);
         s_target_counts = target;
         float err = target - s_cur_y;
         if (err >  127.0f) err =  127.0f;
         if (err < -127.0f) err = -127.0f;
         dy = err;
         s_cur_y += dy;
-        update_top_repin(vert_deg);   /* may re-arm a to-top slam */
+        update_top_repin(cv);   /* re-pin on the corrected elevation (servo-consistent) */
     }
 
     /* ---- X axis: LINEAR yaw-angle -> px (pseudo-absolute arc).  dx = gain *
@@ -182,6 +210,7 @@ void cursor_track_update(float vert_deg, float yaw_deg, bool at_rest,
     bool x_frozen = at_rest && (fabsf(dyaw) < CURSOR_FREEZE_RELEASE_DELTA);
     float dx = 0.0f;
     if (!slamming && !x_frozen && s_x_valid) dx = s_gain_x * dyaw;
+    s_cur_x += dx;   /* track horizontal position (for the sweep-coupling correction) */
 
     *out_dx = dx;
     *out_dy = dy;
