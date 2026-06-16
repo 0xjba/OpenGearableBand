@@ -18,9 +18,6 @@
 #include "WearableDSP.h"
 #include "power_ctrl.h"
 #include "gesture_mode.h"
-#include "ble_hid.h"
-#include "cursor_pipeline.h"
-#include "cursor_track.h"
 #include "orientation.h"
 #include <zephyr/settings/settings.h>
 
@@ -86,8 +83,8 @@ K_SEM_DEFINE(motion_wake_sem, 0, 1);
 // clean per-burst sample counter for accurate Hz reporting.
 static volatile bool acq_active = false;
 
-// Set true by the gesture-mode callback when AIR_MOUSE / SURFACE is
-// active.  Controls two behaviours:
+// Set true by the gesture-mode callback (always-on policy) so the pose
+// FSM keeps getting IMU samples in MODE_IDLE.  Controls two behaviours:
 //   1) When the power state machine wants to enter IDLE, stop_acquisition
 //      will only actually halt the timer if gesture_needs_acq is false;
 //      otherwise the timer keeps ticking on IMU samples for the gesture
@@ -187,18 +184,16 @@ K_TIMER_DEFINE(acq_timer, acq_timer_handler, NULL);
 
 // Bluetooth Advertisement Data
 //
-// Primary advertising payload lists the HRS, BAS, and HIDS service UUIDs
-// so hosts can filter on whichever they care about during discovery.
-// Fitness apps look for HRS (0x180D), hosts pairing as mouse look for
-// HIDS (0x1812).  We have 31 bytes of payload available; three 16-bit
-// UUIDs in BT_DATA_UUID16_ALL cost 8 bytes (1 type + 1 len + 3 x 2 UUID)
-// plus 3 bytes for the flags = 11 bytes total.  Plenty of room.
+// Primary advertising payload lists the HRS and BAS service UUIDs so
+// hosts can filter on whichever they care about during discovery.
+// Fitness apps look for HRS (0x180D).  We have 31 bytes of payload
+// available; two 16-bit UUIDs in BT_DATA_UUID16_ALL cost 6 bytes
+// (1 type + 1 len + 2 x 2 UUID) plus 3 bytes for the flags.
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA_BYTES(BT_DATA_UUID16_ALL,
                   BT_UUID_16_ENCODE(BT_UUID_HRS_VAL),
-                  BT_UUID_16_ENCODE(BT_UUID_BAS_VAL),
-                  BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL)),
+                  BT_UUID_16_ENCODE(BT_UUID_BAS_VAL)),
 };
 
 static const struct bt_data sd[] = {
@@ -220,7 +215,7 @@ static void start_advertising(void) {
         LOG_ERR("Advertising failed to start (err %d)", err);
         return;
     }
-    LOG_INF("Advertising successfully started (HRS + BAS + HIDS)");
+    LOG_INF("Advertising successfully started (HRS + BAS)");
 }
 
 /* When a connection object is fully freed after a disconnect, re-arm
@@ -244,25 +239,14 @@ static void bt_ready(int err) {
     }
     LOG_INF("Bluetooth initialized");
 
-    // Load any previously-stored bonded-host keys.  Required for the
-    // HID service (which insists on encrypted/bonded pairing); the
-    // existing HRS doesn't require it but doesn't object either.
+    // Load any previously-stored bonded-host keys / settings.  HRS / BAS
+    // don't require bonding, but loading persisted settings is harmless.
     if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
         int sl_err = settings_load();
         if (sl_err) {
             LOG_WRN("settings_load failed (err %d) -- continuing without "
                     "persisted bonds", sl_err);
         }
-    }
-
-    // Register the HID mouse service.  The GATT service definition is
-    // installed automatically by BT_GATT_SERVICE_DEFINE; this call
-    // gives the module a hook for future runtime state init and logs
-    // the registration so traces show the service came up.
-    int hid_err = ble_hid_init();
-    if (hid_err) {
-        LOG_ERR("HID init failed (err %d)", hid_err);
-        /* Continue anyway -- HRS still works without HID. */
     }
 
     start_advertising();
@@ -286,10 +270,10 @@ void acq_thread_entry(void *, void *, void *) {
         }
 
         // "Gesture-only" mode: MAX30102 is currently shut down but
-        // gesture_mode (AIR_MOUSE / SURFACE) wants continuous IMU
-        // samples to drive orientation + cursor.  In this path we
-        // skip MAX entirely -- the HR pipeline doesn't get any signal
-        // but the gesture detector keeps running.
+        // gesture_mode wants continuous IMU samples to drive the pose
+        // FSM + orientation filter.  In this path we skip MAX entirely
+        // -- the HR pipeline doesn't get any signal but the gesture
+        // detector keeps running.
         bool gesture_only = !max_is_awake && gesture_needs_acq;
 
         if (sample_index >= BUFFER_SIZE && !gesture_only) {
@@ -554,13 +538,6 @@ static volatile bool tap_calibration_mode = false;
 // 1 LSB ≈ 62.5 mg at FS=±2g.
 static volatile uint8_t current_tap_ths = 0x08;
 
-// Serial-console "mouse test mode" -- set by the 'm' command.  While
-// active, WASD inject cursor deltas, 1/2 generate clicks, comma/period
-// scroll.  Lets us prove the cursor pipeline + HID + host integration
-// end-to-end before Item 2 wires gyro tracking.  Any unrecognized char
-// in this mode exits back to normal command parsing.
-static volatile bool mouse_test_active = false;
-
 static void uart_rx_cb(const struct device *dev, void *user_data) {
     ARG_UNUSED(user_data);
     if (!uart_irq_update(dev)) {
@@ -571,32 +548,10 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
     }
     uint8_t c;
     while (uart_fifo_read(dev, &c, 1) == 1) {
-        // Mouse-test commands intercept the byte stream when active.
-        // We do the injections directly here at ISR context because
-        // cursor_pipeline_inject_* takes a mutex and the mutex is
-        // safe-but-not-recommended from ISRs.  Use a small "pending
-        // motion command" code that the reset thread will consume in
-        // thread context.
-        if (mouse_test_active) {
-            switch (c) {
-            case 'w': case 'W': pending_cmd = 'w'; continue;
-            case 'a': case 'A': pending_cmd = 'a'; continue;
-            case 's': case 'S': pending_cmd = 's'; continue;
-            case 'd': case 'D': pending_cmd = 'd'; continue;
-            case '1':           pending_cmd = '1'; continue;
-            case '2':           pending_cmd = '2'; continue;
-            case ',':           pending_cmd = ','; continue;
-            case '.':           pending_cmd = '.'; continue;
-            case 'm': case 'M': pending_cmd = 'M'; continue;  // exit
-            default: continue;  // ignore newlines / unknown
-            }
-        }
         if (c == 'r' || c == 'R') {
             pending_cmd = 'r';
         } else if (c == 'b' || c == 'B') {
             pending_cmd = 'b';
-        } else if (c == 'm' || c == 'M') {
-            pending_cmd = 'm';
         } else if (c == 'g' || c == 'G') {
             // Calibration helper: dump the current filtered gravity
             // vector so the user can hold the band in a pose, type 'g',
@@ -640,24 +595,9 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
         } else if (c == 'u' || c == 'U') {
             // Clear ALL stored BLE bonds.  A UF2 reflash does not erase the
             // settings partition, so a stale bond survives and a host that
-            // re-pairs (or was "Forgotten") then mismatches keys -- the HID
-            // link fails encryption and the host drops with reason 0x13.
-            // After 'u', also Forget the device on the host, then re-pair.
+            // re-pairs (or was "Forgotten") then mismatches keys.  After
+            // 'u', also Forget the device on the host, then re-pair.
             pending_cmd = 'u';
-        } else if (c == ']') {
-            // Horizontal (X) cursor gain UP.  Per-axis because a wide screen
-            // + a roll range that differs from the pitch range need different
-            // px/deg on each axis.  Live-tune; reach = gain * wrist-range.
-            pending_cmd = ']';
-        } else if (c == '[') {
-            // Horizontal (X) cursor gain DOWN.
-            pending_cmd = '[';
-        } else if (c == '}') {
-            // Vertical (Y) cursor gain UP.
-            pending_cmd = '}';
-        } else if (c == '{') {
-            // Vertical (Y) cursor gain DOWN.
-            pending_cmd = '{';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -683,22 +623,14 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("Serial console armed:");
     LOG_INF("  'r'=reboot   'b'=UF2 bootloader");
     LOG_INF("  'g'=dump current gravity vector (pose calibration)");
-    LOG_INF("  't'=simulate chip double-tap (AIR_MOUSE entry)");
-    LOG_INF("  'y'=simulate chip triple-tap (unbound; SURFACE removed)");
-    LOG_INF("  'm'=force mouse test mode (wasd=move, 1/2=click, ,/.=scroll, m again exits)");
+    LOG_INF("  't'=simulate chip double-tap (gesture detect, no mode bound)");
+    LOG_INF("  'y'=simulate chip triple-tap (unbound)");
     LOG_INF("  'c'=toggle chip-tap calibration logging");
     LOG_INF("  '+'=lower TAP_THS (more sensitive)   '-'=raise TAP_THS (less sensitive)");
     LOG_INF("  'q'=PPG quality probe (20s perfusion-index capture for wear position)");
     LOG_INF("  'z'=gyro bias trace (hold still 60s -> bias/noise per axis)");
     LOG_INF("  'v'=pose trace (hold a pose 30s -> gravity/shadow/pitch/roll)");
-    LOG_INF("  'u'=clear ALL BLE bonds (fixes reason-0x13 stale-bond drop; "
-            "then Forget on host + re-pair)");
-    LOG_INF("  ']'/'['=horizontal(X) gain up/down   "
-            "'}'/'{'=vertical(Y) gain up/down");
-
-    /* Per-step cursor delta for the mouse-test injects.  10 pixels
-     * per press gives a clearly visible cursor jump on the host. */
-    const float MOUSE_TEST_STEP = 10.0f;
+    LOG_INF("  'u'=clear ALL BLE bonds (then Forget on host + re-pair)");
 
     while (1) {
         uint8_t cmd = pending_cmd;
@@ -720,53 +652,6 @@ void reset_thread_entry(void *, void *, void *) {
             NRF_POWER->GPREGRET = 0x57;
             sys_reboot(SYS_REBOOT_COLD);
             // not reached
-        } else if (cmd == 'm') {
-            pending_cmd = 0;
-            mouse_test_active = true;
-            // Force mode to AIR_MOUSE so the cursor pipeline accepts
-            // and publishes our injected deltas regardless of wrist
-            // orientation.  Manual mode override is fine for testing.
-            gesture_mode_set(MODE_AIR_MOUSE);
-            LOG_INF("Mouse test ENABLED (mode forced AIR_MOUSE).  "
-                    "wasd=move, 1=left, 2=right, ,=scroll up, "
-                    ".=scroll down, m=exit");
-        } else if (cmd == 'M') {
-            pending_cmd = 0;
-            mouse_test_active = false;
-            gesture_mode_set(MODE_IDLE);
-            LOG_INF("Mouse test DISABLED (mode -> IDLE)");
-        } else if (cmd == 'w') {
-            pending_cmd = 0;
-            cursor_pipeline_inject_motion(0.0f, -MOUSE_TEST_STEP);
-            LOG_INF("mouse test: up");
-        } else if (cmd == 's') {
-            pending_cmd = 0;
-            cursor_pipeline_inject_motion(0.0f, +MOUSE_TEST_STEP);
-            LOG_INF("mouse test: down");
-        } else if (cmd == 'a') {
-            pending_cmd = 0;
-            cursor_pipeline_inject_motion(-MOUSE_TEST_STEP, 0.0f);
-            LOG_INF("mouse test: left");
-        } else if (cmd == 'd') {
-            pending_cmd = 0;
-            cursor_pipeline_inject_motion(+MOUSE_TEST_STEP, 0.0f);
-            LOG_INF("mouse test: right");
-        } else if (cmd == '1') {
-            pending_cmd = 0;
-            LOG_INF("mouse test: LEFT click");
-            cursor_pipeline_click(BLE_HID_BTN_LEFT);
-        } else if (cmd == '2') {
-            pending_cmd = 0;
-            LOG_INF("mouse test: RIGHT click");
-            cursor_pipeline_click(BLE_HID_BTN_RIGHT);
-        } else if (cmd == ',') {
-            pending_cmd = 0;
-            cursor_pipeline_inject_scroll(+1.0f);
-            LOG_INF("mouse test: scroll up");
-        } else if (cmd == '.') {
-            pending_cmd = 0;
-            cursor_pipeline_inject_scroll(-1.0f);
-            LOG_INF("mouse test: scroll down");
         } else if (cmd == 'g') {
             pending_cmd = 0;
             // Do a FRESH IMU read here rather than reading the cached
@@ -797,13 +682,12 @@ void reset_thread_entry(void *, void *, void *) {
                     (double)gx_raw, (double)gy_raw, (double)gz_raw,
                     (double)gx_f, (double)gy_f, (double)gz_f);
             LOG_INF("CALIBRATION raw magnitudes=[%.2f %.2f %.2f]  "
-                    "orientation=%s  mode=%s  cooldown=%d ms",
+                    "orientation=%s  mode=%s",
                     (double)(gx_raw >= 0 ? gx_raw : -gx_raw),
                     (double)(gy_raw >= 0 ? gy_raw : -gy_raw),
                     (double)(gz_raw >= 0 ? gz_raw : -gz_raw),
                     wrist_orientation_str(gesture_mode_get_orientation()),
-                    gesture_mode_str(gesture_mode_get()),
-                    gesture_mode_get_cursor_cooldown_remaining() * 10);
+                    gesture_mode_str(gesture_mode_get()));
         } else if (cmd == 't') {
             pending_cmd = 0;
             LOG_INF("Simulating chip double-tap event");
@@ -821,25 +705,6 @@ void reset_thread_entry(void *, void *, void *) {
                 LOG_INF("All BLE bonds cleared -- now Forget the device on "
                         "the host and re-pair");
             }
-        } else if (cmd == ']' || cmd == '[' || cmd == '}' || cmd == '{') {
-            pending_cmd = 0;
-            /* Per-axis multiplicative gain step.  []=horizontal(X),
-             * {}=vertical(Y).  Multiplicative so the reachable span scales
-             * smoothly; clamp each axis to a sane band. */
-            float gx, gy;
-            cursor_track_get_gain(&gx, &gy);
-            bool is_x = (cmd == ']' || cmd == '[');
-            bool is_up = (cmd == ']' || cmd == '}');
-            float factor = is_up ? 1.25f : 0.8f;
-            if (is_x) gx *= factor; else gy *= factor;
-            if (gx > 60.0f) gx = 60.0f;
-            if (gy > 60.0f) gy = 60.0f;
-            if (gx < 1.0f)  gx = 1.0f;
-            if (gy < 1.0f)  gy = 1.0f;
-            cursor_track_set_gain(gx, gy);
-            LOG_INF("Cursor gain %s %s -> X=%.1f Y=%.1f px/deg",
-                    is_x ? "X" : "Y", is_up ? "UP" : "DOWN",
-                    (double)gx, (double)gy);
         } else if (cmd == 'y') {
             pending_cmd = 0;
             LOG_INF("Simulating chip triple-tap event");
@@ -1024,11 +889,11 @@ static void start_acquisition(void) {
 }
 
 static void stop_acquisition(void) {
-    // If gesture_mode (AIR_MOUSE / SURFACE) still needs the IMU
-    // sampling pipeline running, don't actually stop -- just let
-    // the power-state side go to IDLE while gesture keeps using the
-    // tick.  acq_thread's gesture_only path skips MAX entirely so
-    // PPG power stays off.
+    // If gesture_mode still needs the IMU sampling pipeline running
+    // (always-on policy, for the pose FSM), don't actually stop -- just
+    // let the power-state side go to IDLE while gesture keeps using the
+    // tick.  acq_thread's gesture_only path skips MAX entirely so PPG
+    // power stays off.
     if (gesture_needs_acq) {
         LOG_DBG("stop_acquisition deferred: gesture mode still active");
         return;
@@ -1466,9 +1331,9 @@ int main(void) {
     // itself runs from the acquisition thread once samples start
     // flowing.
     gesture_mode_init();
-    // Wire gesture_mode -> acquisition request callback so
-    // AIR_MOUSE / SURFACE modes can keep the IMU sampling pipeline
-    // alive even when the HR power state is IDLE.
+    // Wire gesture_mode -> acquisition request callback so the pose FSM
+    // can keep the IMU sampling pipeline alive (always-on policy) even
+    // when the HR power state is IDLE.
     gesture_mode_set_acq_request_cb(gesture_acq_request_handler);
 
     init_xiao_pins();
@@ -1519,11 +1384,6 @@ int main(void) {
     // AFTER tap engine enable so the FIFO ODR override correctly
     // supersedes the tap engine's 416 Hz default.
     gesture_mode_bio_acoustic_init();
-
-    // Start the cursor publish thread.  Idle until the gesture mode
-    // transitions into a cursor-bearing mode (AIR_MOUSE or SURFACE),
-    // so this is safe to start unconditionally at boot.
-    cursor_pipeline_init();
 
     // From this point on, the power state machine thread (started
     // automatically by K_THREAD_DEFINE) drives all sensor power and

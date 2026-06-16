@@ -2,9 +2,6 @@
 #include "gesture_poses.h"
 #include "orientation.h"
 #include "gesture_thresholds.h"
-#include "cursor_track.h"
-#include "cursor_calib.h"
-#include "cursor_pipeline.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -35,33 +32,12 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 /* Atomically published mode; read by other threads. */
 static atomic_t mode_atomic = ATOMIC_INIT(MODE_IDLE);
 
-/* Filtered gravity vector -- TWO distinct consumers, do NOT merge/deduplicate:
- *  - gx/gy/gz_filt: SLOW ~1 s LPF (GRAVITY_LP_ALPHA).  Stability IS the feature
- *    here -- used by pose classification, the orientation classifier, the cone
- *    gate, and `shadow`.  Keep it slow.
- *  (The cursor's vertical driver no longer has its own accel LPF -- it now reads
- *  the Mahony filter's fused gravity via current_vert_deg(); see orientation.cpp.) */
+/* Filtered gravity vector (gx/gy/gz_filt): SLOW ~1 s LPF (GRAVITY_LP_ALPHA).
+ * Stability IS the feature here -- used by pose classification, the orientation
+ * classifier, and `shadow`.  Keep it slow. */
 static float gx_filt = 0.0f;
 static float gy_filt = 0.0f;
 static float gz_filt = -9.81f;   /* assume face-up at boot */
-
-/* Angle-from-vertical (deg) for the cursor Y driver, from the Mahony filter's
- * FUSED gravity vector (gyro-driven, accel-corrected -- responsive AND immune to
- * linear-accel transients, unlike the old accel-only LPF).  Roll-immune: scalar
- * projection of gravity onto the forearm axis (X), NOT Euler pitch (which is
- * roll-contaminated near high roll -- see cursor_track.h).  Single source of
- * truth for `vert`: cursor servo, entry-snap top, rest-bottom capture, and the
- * anchor-relative low zone all read this. */
-static inline float current_vert_deg(void)
-{
-    orientation_state_t ori;
-    orientation_get(&ori);
-    float gx = ori.gravity[0], gy = ori.gravity[1], gz = ori.gravity[2];
-    float mag = sqrtf(gx * gx + gy * gy + gz * gz);
-    return (mag > 0.1f)
-        ? acosf(fminf(1.0f, fabsf(gx) / mag)) * (180.0f / 3.14159265f)
-        : 0.0f;
-}
 
 /* Filter initialised flag (so first sample seeds the state instead
  * of being heavily attenuated by the LP filter). */
@@ -71,22 +47,6 @@ static bool filter_initialised = false;
 static WristOrientation orientation_current = WRIST_NEUTRAL;
 static WristOrientation orientation_candidate = WRIST_NEUTRAL;
 static int orientation_candidate_dwell = 0;
-
-/* Trigger gesture dwell counters. */
-/* Re-engage-dwell counter used during the cursor-mode cooldown to
- * detect the user holding the expected pose long enough to re-engage
- * the previously-active cursor mode.  Counts up while orientation
- * matches the cooldown's mode's expected pose. */
-static int reengage_dwell = 0;
-
-/* True from the moment a passive exit opens the cooldown until the wrist is
- * first seen OUT of the expected pose.  The orientation classifier rides the
- * slow gravity LPF (~1 s lag), so right after a lower-to-rest exit it still
- * reads UP_RAISED while the wrist is already low -- without this gate the
- * re-engage fires mid-lowering and the cursor re-pins to the top then sweeps
- * to the bottom (the observed exit glitch).  Re-engage may only arm after a
- * genuine release, so it fires on a real raise-back where the top-pin matches. */
-static bool reengage_needs_release = false;
 
 /* Pose FSM state.  Updated each accel sample from update_accel. */
 static pose_id_t pose_armed_state = POSE_NONE;
@@ -153,77 +113,6 @@ static bool is_cadenced_double_tap_window(int interval_ms)
  * value so the gate is open at boot. */
 static int     samples_since_activity = ACTIVITY_GATE_DWELL;
 
-/* Cooldown after a cursor mode exits via orientation-drop.  During
- * the cooldown window, the user can return to the same mode by
- * holding the expected pose for COOLDOWN_REENGAGE_DWELL samples --
- * no fresh trigger required.  Outside the cooldown, an explicit
- * double-tap (AIR_MOUSE) / triple-tap (SURFACE) is needed.
- *
- * cooldown_remaining: samples remaining; decremented every accel
- *                     sample.  0 = window closed.
- * cooldown_mode:      which mode to re-engage when the re-engage
- *                     dwell completes.  Tracks the last cursor
- *                     mode that exited via orientation drop. */
-static int cursor_cooldown_remaining = 0;
-static GestureMode cursor_cooldown_mode = MODE_IDLE;
-
-/* "Has the user actually reached the expected pose since entering
- * the current cursor mode?"  Reset on every transition INTO a cursor
- * mode; set the first time orientation matches the mode's expected
- * pose after that.
- *
- * Purpose: the natural sequence is "press trigger -> assume pose,"
- * not "be in pose -> press trigger."  Without this latch the exit
- * dwell would start counting immediately on entry while the user
- * is still in whatever pose they were in.  500 ms later the FSM
- * exits before the user has had a chance to reach the pose.
- *
- * With this latch, exit detection only arms after we've SEEN the
- * expected pose at least once.  If the user never reaches it
- * within the per-mode entry-grace window (see entry_grace_remaining),
- * the FSM bounces back to IDLE without ever arming exit dwell --
- * prevents the band sitting in a cursor mode indefinitely if the
- * user pressed the entry trigger and got distracted. */
-static bool cursor_has_reached_pose = false;
-
-/* Counts down from the per-mode entry grace on every accel sample
- * while we're in a cursor mode AND haven't yet reached the expected
- * pose.  Hits zero -> the FSM bounces back to IDLE (no cooldown --
- * the user never engaged, no point allowing quick re-engage). */
-static int entry_grace_remaining = 0;
-
-/* AIR_MOUSE desk-settle exit state (Amendment A.3). */
-/* (a) DESK-contact exit: the chip tap engine fires on the volar landing.  Set
- * by gesture_mode_on_chip_single_tap (power thread) when AIR_MOUSE + low zone;
- * read+cleared by gesture_mode_update_accel (acq thread) -> atomic. */
-static atomic_t air_desk_tap     = ATOMIC_INIT(0);
-static int      air_past_plane_dwell = 0;  /* (b) consecutive samples forearm is past horizontal */
-
-/* Deliberate-exit double-tap counter (acq-thread-only).  A SINGLE tap near rest
- * is a passive desk landing (keeps the raise-to-resume cooldown); TWO taps
- * within MULTI_TAP_WINDOW_MS while the wrist is POINTING (not in the rest zone)
- * is the deliberate "switch the mouse off" gesture -> exit with NO cooldown.
- * The rest-zone test separates the two: a desk landing is one tap down-low; a
- * deliberate exit is two taps while up. */
-static int      air_exit_tap_count  = 0;
-static int      air_exit_tap_window = 0;  /* samples remaining in the double-tap window */
-
-/* Reference gravity vector captured at the moment a cursor mode
- * first engages (cursor_has_reached_pose flips false -> true).
- *
- * For SURFACE this is the "desk plane reference" -- the gravity
- * orientation at the instant the wrist was placed on the desk.
- * Item 2 (cursor tracking) will compute cursor motion as deviations
- * from this reference, so gliding the wrist around at desk level
- * produces relative motion correctly even though every position is
- * roughly DOWN_FLAT to the orientation classifier.  Lifting the
- * wrist will then read as "gravity left the reference plane,"
- * giving us the mouse-lift semantic precisely.
- *
- * For AIR_MOUSE the same idea applies but for the raised pose --
- * tracking is relative to the at-engagement orientation rather than
- * absolute angles. */
-
 /* Acquisition-request callback registered by main.cpp. */
 static gesture_acq_request_cb_t s_acq_request_cb = NULL;
 
@@ -239,21 +128,9 @@ static float last_tap_mid_band_energy = 0.0f;
  * section later in the file. */
 static bool surface_spectral_confirms_hard_surface(void);
 
-/* Was the previous mode a "needs IMU continuously" mode?  Tracks the
- * acq-request edges so we only call the callback on transitions. */
+/* Tracks the acq-request edges so we only call the callback on
+ * transitions. */
 static bool s_prev_needs_acq = false;
-
-static inline bool _mode_needs_continuous_imu(GestureMode m)
-{
-    return (m == MODE_AIR_MOUSE);
-}
-
-/* Per-mode timing accessors -- centralise the mode-vs-constant
- * lookups so the FSM body doesn't sprinkle conditionals throughout. */
-static inline int _entry_grace_for(GestureMode m)
-{
-    return (m == MODE_AIR_MOUSE) ? AIR_MOUSE_ENTRY_GRACE : 0;
-}
 
 /* Wrist-flick state. */
 static int flick_burst_samples_remaining = 0;
@@ -270,34 +147,6 @@ static float flick_burst_sign = 0.0f;
 #define RAD_TO_DEG          57.29578f
 static float gyro_hist[GYRO_HIST_SAMPLES][3];
 static int   gyro_hist_idx = 0;
-
-/* Bottom-anchor capture (replaces the old 3-second ring buffer, which aged the rest
- * out before the >3 s raise->snap ritual completed -- see the 2026-06-13 [CALDBG]
- * finding).  `last_rest_vert` is a PERSISTENT scalar (never ages): the most-recent
- * settled desk-rest angle, captured at placement (the motion of setting the wrist
- * down keeps sampling awake long enough to register the settle).  Fed to
- * cursor_calib at AIR_MOUSE entry.  `rest_dwell` counts consecutive settled-low
- * samples and drives the stillness-held disengage. */
-static float last_rest_vert  = 0.0f;
-static bool  bottom_valid     = false;
-static int   rest_dwell       = 0;
-
-/* Anchor-relative "low zone" for the AIR_MOUSE disengage gates (desk-tap +
- * stillness).  True when the current inclination is within CURSOR_LOW_ZONE_MARGIN_DEG
- * of the auto-calibrated resting bottom (last_rest_vert), so the disengage zone
- * tracks the rest across re-wears instead of a fixed gx threshold (which over-fits
- * one mount -- HW 2026-06-14: a re-wear's 75deg rest landed exactly on the old
- * fixed seed).  Returns false until a rest has been captured (bottom_valid). */
-static inline bool air_in_rest_zone(void)
-{
-    return bottom_valid &&
-           (current_vert_deg() >= last_rest_vert - CURSOR_LOW_ZONE_MARGIN_DEG);
-}
-
-/* RAM-only calibration state (no NVS): false until the first complete entry ritual
- * seeds the anchors.  cursor_track holds the anchor values; this just tracks "have
- * we calibrated since boot" for the cold-start branch. */
-static bool cursor_have_calib = false;
 
 /* Latest raw accel (m/s^2), stashed by gesture_mode_update_accel so the
  * orientation filter can fuse it with the gyro sample that arrives in
@@ -462,8 +311,6 @@ static const char *_mode_str(GestureMode m)
 {
     switch (m) {
     case MODE_IDLE:             return "IDLE";
-    case MODE_SURFACE:          return "SURFACE";
-    case MODE_AIR_MOUSE:        return "AIR_MOUSE";
     case MODE_GESTURE_AMBIENT:  return "GESTURE_AMBIENT";
     default:                    return "UNKNOWN";
     }
@@ -510,67 +357,6 @@ static WristOrientation _classify_orientation(float gx, float gy, float gz)
  * from inside _transition_to to notify acq edges. */
 static void _update_acq_request(void);
 
-/* Flag set by the cooldown re-engage path before calling
- * _transition_to(), so the "entered while already in pose" log can
- * be suppressed -- the re-engage path already logged "Cooldown
- * re-engage (MODE): N ms remaining when fired" which provides full
- * context.  Without this, cooldown re-engages produce a misleading
- * "entered while already in pose" line that reads like a fresh cold
- * entry.  Cleared inside _transition_to after the check. */
-static bool s_transition_via_cooldown_reengage = false;
-
-
-static const char *cal_decision_str(cursor_calib_decision_t d)
-{
-    switch (d) {
-        case CAL_SEED:             return "SEED";
-        case CAL_ADOPT:            return "ADOPT";
-        case CAL_SHADOW_TRANSLATE: return "SHADOW-TRANSLATE";
-        default:                   return "REJECT";
-    }
-}
-static const char *cal_reason_str(cursor_calib_reason_t r)
-{
-    switch (r) {
-        case CAL_REASON_OK:                return "ok";
-        case CAL_REASON_COLD_START_DEFAULT:return "cold-start-default";
-        case CAL_REASON_NO_PLATEAU:        return "no-plateau";
-        case CAL_REASON_INSUFFICIENT_SWEEP:return "insufficient-sweep";
-        case CAL_REASON_IMPLAUSIBLE_TOP:   return "implausible-top";
-        case CAL_REASON_BELOW_MIN_DELTA:   return "below-min-delta";
-        case CAL_REASON_MID_AIR_SHADOW:    return "mid-air-shadow";
-        default:                           return "?";
-    }
-}
-
-/* Run natural calibration for an AIR_MOUSE entry.  MUST be called BEFORE
- * cursor_track_start (the entry slam is sized from the anchors).  top_now is the
- * snap-moment inclination; the bottom comes from the persistent last_rest_vert. */
-static void cursor_calib_run_on_entry(float top_now)
-{
-    float prior_top    = cursor_track_vert_top();
-    float prior_bottom = cursor_track_vert_bottom();
-
-    cursor_calib_result_t res =
-        cursor_calib_decide(cursor_have_calib, prior_top, prior_bottom,
-                            top_now, last_rest_vert, bottom_valid);
-
-    if (res.apply) {
-        cursor_track_set_anchors(res.new_top, res.new_bottom);
-        cursor_have_calib = true;
-    }
-
-    LOG_INF("[CAL] top %d->%d bottom %d->%d span=%d | "
-            "bottom_valid=%d cand=%d sweep=%d | decision=%s reason=%s shadow_bottom=%d",
-            (int)prior_top, (int)(res.apply ? res.new_top : prior_top),
-            (int)prior_bottom, (int)(res.apply ? res.new_bottom : prior_bottom),
-            (int)((res.apply ? res.new_bottom : prior_bottom) -
-                  (res.apply ? res.new_top : prior_top)),
-            (int)bottom_valid, (int)res.bottom_candidate, (int)res.sweep_deg,
-            cal_decision_str(res.decision), cal_reason_str(res.reason),
-            (int)res.shadow_bottom);
-}
-
 static void _transition_to(GestureMode new_mode)
 {
     GestureMode old = (GestureMode)atomic_get(&mode_atomic);
@@ -578,113 +364,14 @@ static void _transition_to(GestureMode new_mode)
         return;
     }
     atomic_set(&mode_atomic, (atomic_val_t)new_mode);
-    /* Air-mouse cursor: start tracking on entry (capture the reference
-     * angles so there's no jump), stop on any transition away. */
-    if (new_mode == MODE_AIR_MOUSE) {
-        orientation_state_t ori;
-        orientation_get(&ori);
-        float top_now = current_vert_deg();
-        /* Natural calibration FIRST: it may set_anchors() based on the entry
-         * ritual.  cursor_track_start (below) sizes the entry slam from those
-         * anchors, so the order MUST be decide -> set_anchors -> start, or the
-         * recalibrating entry would slam against the previous mount.
-         *
-         * BUT skip calibration on a cooldown RE-ENGAGE: a re-engage fires
-         * automatically when the user raises back to the pose within the exit
-         * cooldown -- it is NOT a deliberate rest->raise->snap ritual, so the
-         * last_rest_vert at that moment may be a mid-air hover the user
-         * paused at, and capturing it can SEED a garbage bottom (HW-observed
-         * 2026-06-12: a 45deg hover became the bottom -> span 25, hyper-sensitive).
-         * A re-engage should RESUME with the current anchors; only a fresh
-         * deliberate entry recalibrates.  s_transition_via_cooldown_reengage is
-         * still set here (cleared later in this function). */
-        if (!s_transition_via_cooldown_reengage) {
-            cursor_calib_run_on_entry(top_now);
-        }
-        cursor_track_start(top_now, ori.yaw_deg);
-    } else {
-        cursor_track_stop();
-    }
     LOG_INF("Mode transition: %s -> %s",
             _mode_str(old), _mode_str(new_mode));
-    /* Reset dwell counters on every transition so the next trigger
-     * starts cleanly. */
-    reengage_dwell = 0;
     /* Multi-tap counter and activity gate persist across transitions
-     * by design: a tap arriving DURING the disambiguation window
-     * that triggers a mode change (e.g., AIR_MOUSE entry on tap 2)
-     * should still be folded if a 3rd tap arrives quickly, upgrading
-     * to triple-tap.  We rely on _check_tap_timeout() in the per-sample
-     * update to commit and reset cleanly.  No reset here. */
+     * by design; the multi-tap commit handler resets them cleanly.
+     * No reset here. */
 
-    /* Manage the cursor-mode entry-grace state machine.  Same logic
-     * for AIR_MOUSE and SURFACE -- only the "expected pose" varies.
-     *
-     * Entering a cursor mode while already in the expected pose:
-     *   - cursor_has_reached_pose = TRUE immediately
-     *   - entry_grace_remaining = 0 (never counts down)
-     *   - exit detection armed right away
-     *
-     * Entering from any other orientation:
-     *   - cursor_has_reached_pose = FALSE; set when orientation matches
-     *   - entry_grace_remaining loaded from _entry_grace_for(new_mode);
-     *     if it counts down to zero without the user reaching the pose,
-     *     the FSM bounces back to IDLE
-     *
-     * Leaving a cursor mode (any cause):
-     *   - cursor_has_reached_pose cleared
-     *   - entry_grace_remaining cleared
-     */
-    if (_mode_needs_continuous_imu(new_mode)) {
-        /* Clear desk-settle state from any prior cursor session so a stale
-         * impact latch can't false-exit right after a fast re-engage. */
-        atomic_set(&air_desk_tap, 0);
-        air_past_plane_dwell = 0;
-
-        WristOrientation expected =
-            (new_mode == MODE_AIR_MOUSE) ? WRIST_UP_RAISED
-                                         : WRIST_DOWN_FLAT;
-        cursor_has_reached_pose = (orientation_current == expected);
-        const char *mode_str = _mode_str(new_mode);
-        const char *pose_str =
-            (new_mode == MODE_AIR_MOUSE) ? "raised wrist (palm-facing)"
-                                         : "flat wrist (palm-down)";
-        if (cursor_has_reached_pose) {
-            entry_grace_remaining = 0;
-            /* During a cooldown re-engage the user has just returned
-             * to the expected pose, so cursor_has_reached_pose is
-             * naturally true.  The re-engage path already logged
-             * "Cooldown re-engage" with context, so suppress the
-             * otherwise-misleading "already in pose" line.  Only log
-             * for fresh cold entries (e.g. user double-taps the band
-             * while their wrist happens to already be raised). */
-            if (!s_transition_via_cooldown_reengage) {
-                LOG_INF("%s entered while already in %s pose -- "
-                        "exit detection armed immediately",
-                        mode_str, pose_str);
-            }
-        } else {
-            entry_grace_remaining = _entry_grace_for(new_mode);
-            LOG_INF("%s entered -- assume %s pose within %d ms to "
-                    "engage, or it auto-exits to IDLE",
-                    mode_str, pose_str, entry_grace_remaining * 10);
-        }
-    } else {
-        cursor_has_reached_pose = false;
-        entry_grace_remaining = 0;
-        atomic_set(&air_desk_tap, 0);
-        air_past_plane_dwell = 0;
-    }
-
-    /* Clear the cooldown-reengage flag unconditionally so it never
-     * leaks across transitions (the entry-grace -> IDLE path skips
-     * the branches above that would otherwise consume it). */
-    s_transition_via_cooldown_reengage = false;
-
-    /* Re-evaluate the acq-request edge.  Acq must stay alive while a
-     * cursor mode is active OR a cooldown is open -- without samples
-     * during cooldown the decrement freezes and the re-engage check
-     * goes blind (the 2026-06-07 bug).  See _update_acq_request(). */
+    /* Re-evaluate the acq-request edge so the pose FSM keeps getting
+     * accel samples (always-on policy -- see _update_acq_request()). */
     _update_acq_request();
 }
 
@@ -694,22 +381,17 @@ static void _transition_to(GestureMode new_mode)
  * ALWAYS-ON policy (2026-06-10 fix): the acq pipeline must stay alive
  * continuously so the pose FSM receives accel samples in MODE_IDLE
  * (the always-listening trigger state).  Previously this was gated on
- * _mode_needs_continuous_imu(m) || cursor_cooldown_remaining > 0,
- * which meant pose detection only ran during AIR_MOUSE/SURFACE/
- * SNAPSHOT states -- broken for the trigger-detection use case since
- * the user is in MODE_IDLE when they want to trigger.
+ * the active mode, which meant pose detection only ran during
+ * SNAPSHOT-type states -- broken for the trigger-detection use case
+ * since the user is in MODE_IDLE when they want to trigger.
  *
  * Power cost: ~30-50 µA additional vs gated-acq IDLE.  The IMU is
  * already running at 833 Hz continuously (for the chip tap engine);
  * this only adds the MCU's per-sample read + processing at 100 Hz.
  * Acceptable for an always-listening gesture device.
  *
- * Reference m is preserved (via (void)m) for future per-state
- * optimisation (e.g., lower acq rate in IDLE specifically).
- *
- * Called from _transition_to (mode changes) and from the cooldown
- * decrement site (cooldown crossing zero).  Both are real edges of
- * the "needs alive" predicate; both must notify. */
+ * Called from _transition_to (mode changes) and once at boot when the
+ * callback is registered. */
 static void _update_acq_request(void)
 {
     if (!s_acq_request_cb) {
@@ -717,22 +399,16 @@ static void _update_acq_request(void)
     }
     /* Acq pipeline must stay alive continuously so the pose FSM
      * receives accel samples in IDLE (the always-listening trigger
-     * state).  Previously this was gated on
-     * _mode_needs_continuous_imu() || cursor_cooldown_remaining > 0,
-     * which meant pose detection only ran during AIR_MOUSE/SURFACE/
-     * SNAPSHOT states -- broken for the trigger detection use case
-     * since the user is in MODE_IDLE when they want to trigger.
+     * state).  Previously this was gated on the active mode, which
+     * meant pose detection only ran during SNAPSHOT-type states --
+     * broken for the trigger detection use case since the user is in
+     * MODE_IDLE when they want to trigger.
      *
      * Power cost: ~30-50 µA additional vs gated-acq IDLE.  The
      * IMU is already running at 833 Hz continuously (for the chip
      * tap engine); this only adds the MCU's per-sample read+
      * processing at 100 Hz.  Acceptable for an always-listening
-     * gesture device.
-     *
-     * Reference m for future per-state optimisation if needed
-     * (e.g., lower acq rate in IDLE specifically). */
-    GestureMode m = (GestureMode)atomic_get(&mode_atomic);
-    (void)m;  /* not currently used for gating; preserved for future */
+     * gesture device. */
     bool now_needs = true;
     if (now_needs != s_prev_needs_acq) {
         s_acq_request_cb(now_needs);
@@ -754,16 +430,6 @@ void gesture_mode_init(void)
     orientation_current = WRIST_NEUTRAL;
     orientation_candidate = WRIST_NEUTRAL;
     orientation_candidate_dwell = 0;
-    reengage_dwell = 0;
-    reengage_needs_release = false;
-    cursor_cooldown_remaining = 0;
-    cursor_cooldown_mode = MODE_IDLE;
-    cursor_has_reached_pose = false;
-    entry_grace_remaining = 0;
-    atomic_set(&air_desk_tap, 0);
-    air_past_plane_dwell = 0;
-    air_exit_tap_count = 0;
-    air_exit_tap_window = 0;
     pose_armed_state = POSE_NONE;
     pose_armed_time_ms = 0;
     multi_tap_count = 0;
@@ -888,29 +554,7 @@ void gesture_mode_update_accel(float ax, float ay, float az)
                 (double)gx_filt, (double)gy_filt, (double)gz_filt);
     }
 
-    /* --- Mode-transition logic --- */
-
-    GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
-
-    /* Decrement cursor-mode cooldown each sample.  Once it hits 0,
-     * the orientation-only re-engage path is closed and the user has
-     * to deliberately re-tap (double-tap for AIR_MOUSE, triple-tap
-     * for SURFACE) to re-enter.  At that crossing we also release
-     * the acq-keep-alive hold so the IMU pipeline can suspend back
-     * to whatever the underlying power state wants. */
-    if (cursor_cooldown_remaining > 0) {
-        cursor_cooldown_remaining--;
-        if (cursor_cooldown_remaining == 0) {
-            LOG_INF("Cooldown for %s expired -- explicit re-tap required",
-                    _mode_str(cursor_cooldown_mode));
-            cursor_cooldown_mode = MODE_IDLE;
-            reengage_dwell = 0;
-            _update_acq_request();
-        }
-    }
-
-    /* Motion residual (accel - gravity); drives the activity gate AND the
-     * AIR_MOUSE desk-contact impact detector below. */
+    /* Motion residual (accel - gravity); drives the activity gate. */
     float rx_resid = ax - gx_filt;
     float ry_resid = ay - gy_filt;
     float rz_resid = az - gz_filt;
@@ -921,226 +565,14 @@ void gesture_mode_update_accel(float ax, float ay, float az)
         samples_since_activity++;
     }
 
-    /* ---- Rest tracker: capture the bottom anchor + drive the stillness-exit dwell.
-     * "Settled" = in the low zone AND still (activity gate saturated -> low variance).
-     * current_vert_deg() is stable when still, so it's a clean rest reading.  Runs in
-     * ALL states; captured at placement (motion -> sampling awake -> settle).  The
-     * scalar never ages, so it bridges the >3 s gap to the entry snap. ---- */
-    {
-        bool coarse_low = (gx_filt < CURSOR_LOW_ZONE_GX);  /* flat-ish: capture gate */
-        bool still      = (samples_since_activity >= ACTIVITY_GATE_DWELL);
-        /* Capture the resting bottom on the COARSE absolute gate (re-wear robust). */
-        if (coarse_low && still) {
-            last_rest_vert = current_vert_deg();   /* auto-tracks the latest rest */
-            bottom_valid   = true;
-        }
-        /* Stillness dwell is gated ANCHOR-RELATIVE (near the captured rest), so the
-         * disengage zone moves with the mount instead of a fixed gx threshold. */
-        if (air_in_rest_zone() && still) {
-            if (rest_dwell < STILL_EXIT_DWELL) rest_dwell++;
-        } else {
-            rest_dwell = 0;
-        }
-    }
-
     /* Update pose state machine.  Arms on canonical pose match alone. */
     pose_fsm_update(gx_filt, gy_filt, gz_filt);
 
-    /* Multi-tap commit-on-timeout MOVED to a k_work_delayable
-     * scheduled from gesture_mode_on_chip_single_tap().  Reason:
-     * gesture_mode_update_accel runs from the acq pipeline, which
-     * is NOT active in IDLE with no cursor mode and no cooldown.
-     * Without acq running, the per-sample timeout check would
-     * never fire and multi-tap sequences would never commit (real
-     * bug observed 2026-06-08).  See multi_tap_commit_handler. */
-
-    /* Helper: which orientation does the given cursor mode expect? */
-    auto expected_pose_for = [](GestureMode m) -> WristOrientation {
-        return (m == MODE_AIR_MOUSE) ? WRIST_UP_RAISED : WRIST_DOWN_FLAT;
-    };
-
-    /* Cooldown re-engage: in IDLE with cooldown open, the user
-     * holding the previously-active mode's expected pose for
-     * COOLDOWN_REENGAGE_DWELL re-enters that mode without a fresh
-     * trigger.  This covers "I was using AIR_MOUSE, briefly lowered
-     * to rest, raising again" and the analogous SURFACE case.
-     *
-     * Gated on reengage_needs_release: the wrist must first be seen OUT
-     * of the expected pose since the exit before a raise-back can arm.
-     * Without it the slow-LPF orientation still reads UP_RAISED for ~1 s
-     * after a lower-to-rest exit and re-engages mid-lowering (cursor
-     * re-pins to top then sweeps to bottom -- the exit glitch). */
-    if (current_mode == MODE_IDLE &&
-        cursor_cooldown_remaining > 0 &&
-        cursor_cooldown_mode != MODE_IDLE) {
-        bool in_expected =
-            (orientation_current == expected_pose_for(cursor_cooldown_mode));
-        if (!in_expected) {
-            /* Wrist has left the raised pose -> a genuine raise-back can now
-             * re-engage. */
-            reengage_needs_release = false;
-            reengage_dwell = 0;
-        } else if (!reengage_needs_release) {
-            if (reengage_dwell < COOLDOWN_REENGAGE_DWELL) {
-                reengage_dwell++;
-                if (reengage_dwell == COOLDOWN_REENGAGE_DWELL) {
-                    LOG_INF("Cooldown re-engage (%s): %d ms remaining when fired",
-                            _mode_str(cursor_cooldown_mode),
-                            cursor_cooldown_remaining * 10);
-                    GestureMode target = cursor_cooldown_mode;
-                    cursor_cooldown_remaining = 0;
-                    /* Flag the upcoming transition so _transition_to
-                     * suppresses the "entered while already in pose"
-                     * log -- the line above already explains we're
-                     * coming back from cooldown. */
-                    s_transition_via_cooldown_reengage = true;
-                    _transition_to(target);
-                }
-            }
-        }
-        /* else: in expected pose but not yet released -> wait (no dwell). */
-    } else {
-        reengage_dwell = 0;
-    }
-
-    /* The remaining per-sample logic only matters while we're in a
-     * cursor mode.  Compute "what pose does the current mode expect"
-     * once and use it below. */
-    bool in_cursor_mode = (current_mode == MODE_AIR_MOUSE);
-    WristOrientation expected = in_cursor_mode
-        ? expected_pose_for(current_mode)
-        : WRIST_NEUTRAL;
-
-    /* Arm "has reached pose" latch the first time orientation matches
-     * the expected pose for the current cursor mode.  Exit detection
-     * below only runs when the latch is true -- the user has the
-     * entry_grace_remaining window to assume the pose. */
-    if (in_cursor_mode && !cursor_has_reached_pose &&
-        orientation_current == expected) {
-        cursor_has_reached_pose = true;
-        entry_grace_remaining = 0;  /* engaged -- stop the timeout */
-
-        LOG_INF("%s: expected pose reached -- exit detection armed",
-                _mode_str(current_mode));
-    }
-
-    /* Entry-grace timeout: counts down while in a cursor mode and
-     * the user hasn't reached the pose.  Hits zero -> bounce back to
-     * IDLE so the band doesn't sit in a cursor mode indefinitely.
-     * No cooldown started -- the user never actually engaged. */
-    if (in_cursor_mode && !cursor_has_reached_pose &&
-        entry_grace_remaining > 0) {
-        entry_grace_remaining--;
-        if (entry_grace_remaining == 0) {
-            LOG_INF("%s entry grace expired -- user never assumed "
-                    "pose, exiting to IDLE", _mode_str(current_mode));
-            _transition_to(MODE_IDLE);
-            /* No cooldown -- explicit re-tap required */
-        }
-    }
-
-    /* --- Exit detection (per mode) ---
-     * AIR_MOUSE disengage ladder.  Three exits are PASSIVE (resting the hand like
-     * lifting off a mouse -- they keep the raise-to-resume cooldown open):
-     *   (a) a single chip tap in the low zone (the band landing on a desk),
-     *   (b) stillness held in the low zone (resting-on-desk settle),
-     *   (c) the forearm drooping past the horizontal plane (no desk).
-     * One exit is DELIBERATE ("switch the mouse off" -- no cooldown, re-entry needs
-     * the full raise + double-tap ritual):
-     *   (d) a double-tap while POINTING (two taps, not in the rest zone). */
-    if (in_cursor_mode && cursor_has_reached_pose) {
-        bool do_exit = false;
-        bool deliberate_exit = false;
-        const char *exit_reason = "";
-
-        if (current_mode == MODE_AIR_MOUSE) {
-            /* Read-and-clear the tap latch every tick (atomic_set returns the prior
-             * value) so it can't go stale.  The setter raises it on EVERY tap in
-             * AIR_MOUSE; the rest-zone test here (air_in_rest_zone(), anchor-relative)
-             * decides what the tap means. */
-            bool tapped  = (atomic_set(&air_desk_tap, 0) != 0);
-            bool in_rest = air_in_rest_zone();
-
-            /* Tick down the deliberate-exit double-tap window; reset the count when
-             * it lapses so two unrelated taps far apart never combine. */
-            if (air_exit_tap_window > 0) {
-                air_exit_tap_window--;
-                if (air_exit_tap_window == 0) air_exit_tap_count = 0;
-            }
-
-            /* (a) single tap near rest = desk landing = PASSIVE. */
-            bool desk_tap = in_rest && tapped;
-
-            /* (d) deliberate double-tap = two taps while POINTING (not near rest).
-             * A desk landing is one tap down-low; a deliberate "mouse off" is two
-             * taps while up.  Count taps that arrive outside the rest zone within the
-             * window; the 2nd one fires the deliberate exit. (Caveat from prior HW
-             * testing: a 2nd tap can be missed if the hand is moving while tapping --
-             * pause briefly to double-tap.) */
-            bool deliberate_dbltap = false;
-            if (tapped && !in_rest) {
-                air_exit_tap_count++;
-                air_exit_tap_window = (MULTI_TAP_WINDOW_MS / 10);  /* ms -> 100 Hz samples */
-                if (air_exit_tap_count >= 2) {
-                    deliberate_dbltap = true;
-                    air_exit_tap_count = 0;
-                    air_exit_tap_window = 0;
-                }
-            }
-
-            /* (b) stillness-held: settled in the low zone for STILL_EXIT_DWELL (the
-             * rest tracker maintains rest_dwell). Long enough a floating hand can't
-             * hold it; a parked desk rest fires. */
-            bool still_held = (rest_dwell >= STILL_EXIT_DWELL);
-
-            /* (c) past-plane (no desk): signed gx crosses past horizontal (drooping). */
-            if (gx_filt < CURSOR_PAST_PLANE_GX) {
-                if (air_past_plane_dwell < CURSOR_PAST_PLANE_DWELL) air_past_plane_dwell++;
-            } else {
-                air_past_plane_dwell = 0;
-            }
-            bool past_plane = (air_past_plane_dwell >= CURSOR_PAST_PLANE_DWELL);
-
-            if      (deliberate_dbltap) { do_exit = true; deliberate_exit = true; exit_reason = "deliberate double-tap"; }
-            else if (desk_tap)          { do_exit = true; exit_reason = "desk contact (chip tap)"; }
-            else if (still_held)        { do_exit = true; exit_reason = "rest-settle (stillness)"; }
-            else if (past_plane)        { do_exit = true; exit_reason = "past horizontal plane (no desk)"; }
-        }
-
-        if (do_exit) {
-            if (deliberate_exit) {
-                /* Deliberate double-tap = "switch the mouse off." NO cooldown: re-entry
-                 * requires the full raise + double-tap ritual.  Passive exits (a/b/c)
-                 * keep the convenience raise-to-resume cooldown -- they are just the
-                 * hand coming to rest, not a decision to quit. */
-                cursor_cooldown_mode = MODE_IDLE;
-                cursor_cooldown_remaining = 0;
-                reengage_dwell = 0;
-                LOG_INF("%s exit: %s -- deliberate, explicit re-tap required",
-                        _mode_str(current_mode), exit_reason);
-            } else {
-                cursor_cooldown_mode = current_mode;
-                cursor_cooldown_remaining = CURSOR_COOLDOWN_SAMPLES;
-                /* Require a genuine release before raise-to-resume can re-engage,
-                 * so the laggy orientation classifier can't re-engage mid-lowering. */
-                reengage_needs_release = true;
-                reengage_dwell = 0;
-                LOG_INF("%s exit: %s -- starting %d ms re-engage cooldown",
-                        _mode_str(current_mode), exit_reason, CURSOR_COOLDOWN_SAMPLES * 10);
-            }
-            atomic_set(&air_desk_tap, 0);
-            air_past_plane_dwell = 0;
-            air_exit_tap_count = 0;
-            air_exit_tap_window = 0;
-            _transition_to(MODE_IDLE);
-        }
-    } else {
-        atomic_set(&air_desk_tap, 0);
-        air_past_plane_dwell = 0;
-        air_exit_tap_count = 0;
-        air_exit_tap_window = 0;
-    }
-
+    /* Multi-tap commit-on-timeout lives in a k_work_delayable scheduled
+     * from gesture_mode_on_chip_single_tap().  Reason: this function
+     * runs from the acq pipeline; the work item fires regardless of
+     * whether acq is ticking, so multi-tap sequences always commit (the
+     * bug fixed 2026-06-08).  See multi_tap_commit_handler. */
 }
 
 void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
@@ -1151,28 +583,13 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
      * looking for a sign-reversed burst.  If we get one inside the
      * window, that's a flick.
      *
-     * For now we only act on flicks from a cursor mode -> IDLE
-     * (the cancel direction).  Future extensions could add directional
-     * flicks for app-side commands. */
+     * After the air-mouse extraction the flick is detect + log only (no
+     * mode bound) -- kept live so a future mode can wire it. */
 
     /* Update the orientation filter, fusing this gyro sample with the
      * accel stashed in the immediately-preceding update_accel call. */
     orientation_update(last_raw_ax, last_raw_ay, last_raw_az,
                        gx_rps, gy_rps, gz_rps);
-
-    /* Air-mouse cursor tracking: fused angles -> relative delta -> pipeline.
-     * Cone gate uses the GRAVITY-LPF shadow (gy_filt/gz_filt), NEVER the
-     * fused quaternion (inside the cone the fused roll drifts on gyro alone). */
-    if ((GestureMode)atomic_get(&mode_atomic) == MODE_AIR_MOUSE) {
-        orientation_state_t ori;
-        orientation_get(&ori);
-        float shadow = sqrtf(gy_filt * gy_filt + gz_filt * gz_filt);
-        float vert = current_vert_deg();      /* roll-immune Y driver */
-        float dx = 0.0f, dy = 0.0f;
-        cursor_track_update(vert, ori.yaw_deg, ori.at_rest,
-                            shadow, &dx, &dy);
-        cursor_pipeline_inject_motion(dx, dy);
-    }
 
     /* Push into the rotation-signature ring buffer (dictation-flip
      * prototype).  Stored in rad/s; gyro_signature() converts. */
@@ -1180,8 +597,6 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
     gyro_hist[gyro_hist_idx][1] = gy_rps;
     gyro_hist[gyro_hist_idx][2] = gz_rps;
     gyro_hist_idx = (gyro_hist_idx + 1) % GYRO_HIST_SAMPLES;
-
-    GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
 
     /* Find largest-magnitude axis. */
     float ax = fabsf(gx_rps);
@@ -1198,10 +613,7 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
         /* Look for a reversal of the original burst direction. */
         if (largest_mag >= FLICK_BURST_THRESH_RPS &&
             ((largest_val > 0.0f) != (flick_burst_sign > 0.0f))) {
-            if (current_mode == MODE_AIR_MOUSE) {
-                LOG_INF("Wrist flick detected -- cancelling mode");
-                _transition_to(MODE_IDLE);
-            }
+            LOG_INF("Wrist flick detected (no mode bound)");
             flick_burst_samples_remaining = 0;
         }
     } else if (largest_mag >= FLICK_BURST_THRESH_RPS) {
@@ -1214,30 +626,11 @@ void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
 void gesture_mode_on_chip_double_tap(void)
 {
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
-    /* Double-tap is the AIR_MOUSE ENTRY trigger ONLY.  Per design
-     * discussion: exit is by lowering the wrist, not by re-tapping.
-     * Double-tap while already in a non-IDLE mode is a no-op (logged
-     * for visibility so accidental taps during cursor use show up in
-     * the trace).
-     *
-     * Why entry-only:
-     *   - The user defined the model: tap to engage, lower to
-     *     disengage, raise within cooldown to re-engage
-     *   - Toggle-on-tap would let an accidental tap mid-cursor-use
-     *     yank the user out of AIR_MOUSE mid-action
-     *   - There's no benefit to having a redundant exit path that
-     *     bypasses the natural orientation-based one
-     */
-    if (current_mode == MODE_IDLE) {
-        LOG_INF("Chip double-tap from IDLE -- entering AIR_MOUSE");
-        cursor_cooldown_remaining = 0;  /* explicit entry skips cooldown */
-        cursor_cooldown_mode = MODE_IDLE;
-        _transition_to(MODE_AIR_MOUSE);
-    } else {
-        LOG_INF("Chip double-tap from %s -- ignored (double-tap is "
-                "entry-only; exit by lowering the wrist)",
-                _mode_str(current_mode));
-    }
+    /* The double-tap previously entered AIR_MOUSE.  After the air-mouse
+     * extraction the detection is kept live but routes to no mode --
+     * log only, ready to wire a future mode here. */
+    LOG_INF("Chip double-tap detected from %s -- gesture detected "
+            "(no mode bound)", _mode_str(current_mode));
 }
 
 void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
@@ -1262,26 +655,6 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
      * the pose-gated trigger redesign spec. */
 
     GestureMode current_mode = (GestureMode)atomic_get(&mode_atomic);
-
-    /* Desk-contact exit: a chip tap while in AIR_MOUSE is an exit candidate -> raise
-     * the exit flag (read by gesture_mode_update_accel) and consume the tap (never an
-     * entry gesture -- SURFACE entry is retired, so a tap has no other meaning in
-     * AIR_MOUSE).  The zone check lives in the exit branch (air_in_rest_zone(), anchor-
-     * relative): a tap while pointing high sets the latch but is cleared without
-     * exiting.  Consuming unconditionally also stops taps leaking into the pose-gated
-     * multi-tap entry path (which used to mis-fire "Mode entry rejected (SURFACE)"). */
-    if (current_mode == MODE_AIR_MOUSE) {
-        atomic_set(&air_desk_tap, 1);
-        /* Keep the recent-activity guard + ringing refractory live: a desk
-         * landing is real motion, so record it like any tap, else a sig-motion
-         * a few ms later could slip past gesture_mode_recent_activity() into
-         * WORKOUT_VERIFY. (gx_filt: written by acq thread, read here on the power
-         * thread -- a single float is one word on Cortex-M, torn read is
-         * impossible, one-sample staleness is fine for a threshold gate.) */
-        prev_chip_tap_time_ms = last_chip_tap_time_ms;
-        last_chip_tap_time_ms = k_uptime_get();
-        return;
-    }
 
     int64_t now = k_uptime_get();
 
@@ -1347,9 +720,10 @@ void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign)
 
 /* Multi-tap commit-on-timeout handler.  Fires once MULTI_TAP_WINDOW_MS
  * after the last tap arrival.  Walks the accumulated count to a
- * 1/2/3+-tap action and chains to the existing chip-event handlers
- * (_on_chip_double_tap for AIR_MOUSE entry, _on_chip_triple_tap for
- * SURFACE entry).
+ * 1/2/3-tap gesture.  Post air-mouse extraction these are UNBOUND:
+ * a committed double-/triple-tap is DETECTED + LOGGED ("no mode bound")
+ * via _on_chip_double_tap / _on_chip_triple_tap, which no longer enter
+ * any mode -- kept live as hooks for a future mode to bind.
  *
  * Runs in system workqueue context.  Concurrent access with
  * gesture_mode_on_chip_single_tap (which runs in the run_idle thread)
@@ -1406,11 +780,12 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
         goto disarm;
     }
 
-    /* Apply per-pose extra checks then trigger mode entry. */
+    /* The committed pose + cadenced double-tap is detected and logged
+     * but routes to NO mode after the air-mouse extraction -- ready to
+     * wire a future mode here.  Pose + tap detection stays fully alive. */
     switch (armed) {
     case POSE_AIR_MOUSE:
-        LOG_INF("MODE ENTRY: AIR_MOUSE (pose + cadenced double-tap)");
-        _transition_to(MODE_AIR_MOUSE);
+        LOG_INF("GESTURE: raised-pose + cadenced double-tap (no mode bound)");
         break;
 
     case POSE_SURFACE:
@@ -1477,11 +852,6 @@ void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz)
     if (out_gz) *out_gz = gz_filt;
 }
 
-int gesture_mode_get_cursor_cooldown_remaining(void)
-{
-    return cursor_cooldown_remaining;
-}
-
 void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb)
 {
     s_acq_request_cb = cb;
@@ -1490,8 +860,8 @@ void gesture_mode_set_acq_request_cb(gesture_acq_request_cb_t cb)
      *
      * Root cause of the 2026-06-10 "pose only arms during SNAPSHOT"
      * bug: _update_acq_request() is otherwise only called from
-     * _transition_to() (mode changes) and the cooldown-expiry edge.
-     * In the IDLE steady state neither fires, so gesture_needs_acq
+     * _transition_to() (mode changes).  In the IDLE steady state that
+     * never fires, so gesture_needs_acq
      * stayed false, acq stopped after each SNAPSHOT, and
      * gesture_mode_update_accel() never ran in IDLE -- freezing the
      * gravity LPF and the pose FSM.

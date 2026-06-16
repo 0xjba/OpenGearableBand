@@ -184,21 +184,8 @@
 #define FFT_BIN_MID_END                 246    /* ~400 Hz, exclusive */
 
 /* ---------------------------------------------------------------------------
- *  5. Cursor-mode cooldown / exit dwell (AIR_MOUSE)
- *  --------------------------------------------------------------------------- */
-
-/* Cooldown after a cursor mode exits, during which re-entry is orientation-
- * only (no fresh gesture).  Samples @100 Hz (2000 = 20 s).  [USER] */
-#define CURSOR_COOLDOWN_SAMPLES         2000
-
-/* Orientation dwell to re-engage during cooldown.  Samples @100 Hz.  [USER] */
-#define COOLDOWN_REENGAGE_DWELL         50
-
-/* Entry grace (ms) after mode entry before exit logic arms.  [USER] */
-#define AIR_MOUSE_ENTRY_GRACE           500
-
-/* ---------------------------------------------------------------------------
- *  6. Wrist-flick (gyro) — flick-to-cancel a cursor mode
+ *  5. Wrist-flick (gyro) — sharp flick gesture (detect + log; unbound since
+ *     air-mouse extraction, kept as a hook for a future mode)
  *  --------------------------------------------------------------------------- */
 
 /* Flick = a sharp gyro burst above THRESH (rad/s) followed by a sign-reversed
@@ -207,7 +194,8 @@
 #define FLICK_WINDOW_SAMPLES            25
 
 /* ---------------------------------------------------------------------------
- *  7. Orientation filter (Mahony) + stillness / ZARU (cursor foundation)
+ *  6. Orientation filter (Mahony) + stillness / ZARU (shared IMU foundation:
+ *     pose detection, dictation discriminator, future modes)
  *  --------------------------------------------------------------------------- */
 
 /* Mahony proportional / integral gains.  Kp = how fast pitch/roll lock to
@@ -257,103 +245,5 @@
  *     The Mahony integral tracks this adaptively; documented for reference.
  * ============================================================================
  */
-
-/* ---------------------------------------------------------------------------
- *  8. Air-mouse cursor (pointing v1)
- *  ---------------------------------------------------------------------------
- *  See docs/superpowers/specs/2026-06-11-air-mouse-cursor-design.md.
- *  Y is an absolute gravity-anchored servo (counts/deg); X is relative/rate
- *  px/deg.  Constants are a mix of [USER] and [STRUCTURAL] — see inline tags. */
-
-/* --- Absolute-Y cursor (gravity-anchored vertical) --------------------------
- * Y is no longer a relative px/deg gain.  CURSOR_GAIN_Y is now COUNTS/DEG: the
- * servo target is GAIN_Y * (vert - vert_top), tuned on '}' / '{' so a full
- * comfortable down-sweep fills the screen (this folds in the unknown host
- * count->pixel scale).  X stays relative px/deg.  See
- * docs/superpowers/specs/2026-06-11-absolute-y-cursor-design.md. */
-#define CURSOR_GAIN_Y                   30.0f   /* counts/deg (servo); tune on HW [USER][HOUSING] */
-/* X is driven by YAW (forearm sweep about the elbow), mapped linearly px/deg and
- * tuned live via the ']' / '[' serial knob.  CURSOR_YAW_HALF_SPAN_DEG records the
- * comfortable one-side sweep the gain is dialed against (sweep ~this far -> reach
- * the screen edge).  It is a documented tuning target, NOT a runtime anchor: X has
- * no fixed angle reference (no heading source on a 6-axis IMU), so the live gain
- * does the real tuning. */
-#define CURSOR_GAIN_X                   8.0f    /* px/deg (yaw->X) [USER][HOUSING]                 */
-#define CURSOR_YAW_HALF_SPAN_DEG        35.0f   /* comfortable one-side sweep, deg [USER]          */
-
-/* Vertical map calibration (deg). vert = acos(|gx|/|g|), 0=vertical..90=flat. */
-#define CURSOR_VERT_SPAN_DEG            70.0f   /* nominal comfortable down-range [USER]           */
-#define CURSOR_VERT_BOTTOM_MAX          85.0f   /* comfort clamp on implied bottom [USER]          */
-
-/* Fixed top anchor (deg-from-vertical).  12deg keeps screen-top out of the
- * acos near-vertical jitter zone (~5x noise) while using almost the full
- * range. [USER][HOUSING] -- re-check after a re-tape/housing change. */
-#define CURSOR_VERT_TOP_DEG             12.0f
-
-/* Desk-settle exit (Amendment A.3).  gx_filt is the forearm-axis gravity
- * component in m/s^2 (~9.81 = 1g vertical, 0 = flat). */
-/* COARSE capture gate: gx_filt below this = "flat-ish posture" where recording a
- * resting bottom anchor makes sense.  Deliberately GENEROUS (4.0 ~= vert > 65 deg)
- * so the bottom anchor is captured across re-wears -- the rest angle is mount-
- * dependent and has been measured anywhere from ~70 to ~84 deg (HW 2026-06-14: a
- * re-wear rested at vert=75 / gx~2.5, sitting exactly on the old 2.5 seed and
- * starving the gate of margin).  This is the ABSOLUTE gate for capture + the
- * stillness dwell; the desk-tap/stillness DISENGAGE keys off the calibrated rest
- * via CURSOR_LOW_ZONE_MARGIN_DEG instead, so it self-heals with the mount. [USER][HOUSING] */
-#define CURSOR_LOW_ZONE_GX              4.0f
-
-/* Anchor-relative low zone for the DISENGAGE gates.  "Near rest" = current vert is
- * within this many degrees of the auto-calibrated resting bottom (last_rest_vert).
- * Mount-INDEPENDENT (degrees from the user's own rest), unlike a fixed gx threshold:
- * when the mount shifts and the bottom anchor recalibrates, this zone moves with it.
- * 10 deg gives comfortable margin while staying clear of mid-screen pointing. [USER] */
-#define CURSOR_LOW_ZONE_MARGIN_DEG      10.0f
-
-/* Stillness-held disengage: consecutive settled-in-low-zone samples (still =
- * samples_since_activity >= ACTIVITY_GATE_DWELL) required to exit AIR_MOUSE.  Seed
- * 120 (~1.2 s) -- long enough a floating-to-point hand can't hold it, short enough
- * a real desk rest fires.  M1-tuned. [USER] */
-#define STILL_EXIT_DWELL                120
-#define CURSOR_PAST_PLANE_GX            (-1.0f) /* (b) no-desk exit: forearm past horizontal [USER] */
-#define CURSOR_PAST_PLANE_DWELL         15      /* samples gx must stay past-plane [USER] */
-
-/* Slam (manufactured edge clamp).  Over-travel is free (OS clamps); undershoot
- * poisons registration -> a GAIN_Y-INDEPENDENT floor guarantees the edge even
- * untuned. */
-#define CURSOR_SLAM_MARGIN              2.0f    /* 2× max_counts [STRUCTURAL]                      */
-#define CURSOR_SLAM_FLOOR_COUNTS        6000.0f /* absolute min over-travel, counts [USER][HOUSING] */
-#define CURSOR_SLAM_MAX_REPORTS         80      /* generous burst cap (mis-tune) [STRUCTURAL]      */
-
-/* Top re-pin hysteresis band (deg around vert_top). LEAVE >= ENTER. */
-#define CURSOR_PIN_ENTER_DEG            3.0f    /* [USER] */
-#define CURSOR_PIN_LEAVE_DEG            6.0f    /* [USER] */
-
-/* Cone gate (X axis) with HYSTERESIS, on the GRAVITY-LPF shadow
- * sqrt(gy^2+gz^2): roll is unobservable near a vertical forearm.  Below
- * INVALIDATE -> gate X off; above REVALIDATE -> back on; between -> hold.
- * Brackets the measured cone (vert 15 -> shadow 2.4 invalid, vert 31 ->
- * shadow 5.0 valid).  REVALIDATE must be >= INVALIDATE (static_assert in
- * cursor_track.cpp). */
-#define CURSOR_ROLL_SHADOW_INVALIDATE   3.5f
-#define CURSOR_ROLL_SHADOW_REVALIDATE   4.5f
-
-/* Freeze release: per-tick |Δangle| (deg) above which the freeze lets go
- * immediately (so SLOW precision moves aren't eaten).  Start LOW, just above
- * the still-pose per-tick angle-noise floor -- a HIGH value would freeze
- * precision pointing (and smuggle in a 'ratchet' clutch, which we do NOT want
- * here -- add a deliberate ratchet gesture later if the range bites). */
-#define CURSOR_FREEZE_RELEASE_DELTA     0.05f
-
-/* Discard any per-tick |Δangle| above this as a wrap/glitch (a real wrist
- * move is far smaller per 10 ms).  Belt-and-suspenders with wrap180(). */
-#define CURSOR_MAX_DELTA_DEG            30.0f
-
-/* ---- Natural entry-time cursor calibration (auto top+bottom anchors) ----
- * See docs/superpowers/specs/2026-06-12-natural-cursor-calibration-design.md.
- * All seeds; tune from the per-entry [CAL] traces. */
-#define CAL_SWEEP_MIN_DEG     25.0f   /* min (bottom - top) to count as a real raise [USER] */
-#define CAL_TOP_MAX           30.0f   /* plausibility clamp: reject a top above this (lazy raise) [USER] */
-#define CAL_MIN_DELTA         5.0f    /* ignore anchor shifts smaller than this (stable within a wear) [USER] */
-#define CAL_BLEND_ALPHA       0.4f    /* adoption blend factor (1.0 effective on cold-start seed) [USER] */
 
 #endif /* GESTURE_THRESHOLDS_H */

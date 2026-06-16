@@ -7,9 +7,9 @@
  * flick, double-tap-on-band via LSM6DSL chip event) and transitions
  * a mode finite-state-machine accordingly.
  *
- * The mode is published via atomic_t and read by the cursor pipeline
- * and any future gesture-classifier layer to decide whether their
- * output is bound to BLE HID, custom GATT, or discarded.
+ * The mode is published via atomic_t and read by any future
+ * gesture-classifier layer to decide whether their output is bound to
+ * custom GATT or discarded.
  *
  * Architecture reference: see docs/research/gesture-architecture.md
  * sections 2 and 3.  This module implements the "MODE DETECTOR" box
@@ -27,35 +27,23 @@ extern "C" {
 #endif
 
 /*
- * Top-level operating mode.  Set by trigger gestures, observed by
- * cursor / classifier / BLE output stages to decide what to do with
- * detected gesture events.
+ * Top-level operating mode.  Set by trigger gestures, observed by the
+ * classifier output stages to decide what to do with detected gesture
+ * events.
  *
  * MODE_IDLE:
  *   No gesture-driven output.  Chip-embedded sig-motion / tap events
- *   still fire (we use them to wake into other modes), but the
- *   cursor pipeline does NOT publish HID reports and the gesture
- *   classifier (when later wired) does NOT publish custom-GATT events.
- *   This is the default state on boot and after any cancel / timeout.
- *
- * MODE_SURFACE:
- *   Wrist is resting flat on a surface (typical desk position).
- *   Cursor pipeline publishes HID reports.  LSM6 tap engine is
- *   retuned (later) to detect impulses propagating through the desk.
- *
- * MODE_AIR_MOUSE:
- *   Wrist is raised in air.  Cursor pipeline publishes HID reports.
- *   Pinch classifier (when later wired) generates click events.
+ *   still fire (we detect + log them), but the gesture classifier
+ *   (when later wired) does NOT publish custom-GATT events.  This is
+ *   the default state on boot and after any cancel / timeout.
  *
  * MODE_GESTURE_AMBIENT:
  *   Reserved for a future ambient-gesture mode that needs no explicit
- *   trigger.  Not used in Item 0; declared so the enum reflects the
- *   roadmap.
+ *   trigger.  Not yet wired; declared so the enum reflects the roadmap
+ *   and a future mode is a small addition to the FSM.
  */
 typedef enum {
     MODE_IDLE = 0,
-    MODE_SURFACE,
-    MODE_AIR_MOUSE,
     MODE_GESTURE_AMBIENT,
 } GestureMode;
 
@@ -122,9 +110,9 @@ void gesture_mode_update_gyro(float gx, float gy, float gz);
 
 /*
  * Inform the mode detector that the LSM6DSL chip-embedded double-tap
- * interrupt fired.  Double-tap is the AIR_MOUSE entry trigger -- the
- * raised "drawing on whiteboard" pose.  Called from IDLE -> enters
- * AIR_MOUSE.  Called from any non-IDLE state -> ignored (logged).
+ * interrupt fired.  After the air-mouse extraction a committed
+ * double-tap is detect + log only (no mode bound) -- the detection is
+ * kept live so a future mode can be wired here.
  *
  * Called from the GPIO INT1 callback in main.cpp once Stage 2 wires
  * the chip-embedded tap engine.  Stage 1 wires it to the serial 't'
@@ -138,17 +126,14 @@ void gesture_mode_on_chip_double_tap(void);
  * dispatcher in main.cpp prefers DOUBLE_TAP when both are set on
  * the same TAP_SRC read).
  *
- * This entry point feeds a firmware-side multi-tap counter (added
- * in stage C).  Per the design:
- *   - 3 single-tap events inside a window -> chained to
- *     _on_chip_triple_tap() (SURFACE entry).  This is the firmware-
- *     side path because the chip is native single + double only.
- *   - 1 event, no follow-up within window -> currently a no-op; the
- *     surface-tap re-engage path (later) will hook here.
- *   - 2 single-taps without a co-asserted DOUBLE_TAP would be
- *     unusual (the chip's hardware double-tap classifier should
- *     fire on the second shock) -- if observed, gets counted toward
- *     the 3-for-triple window.
+ * This entry point feeds a firmware-side multi-tap counter.  The
+ * counter classifies the sequence (single / double / triple) and,
+ * post air-mouse extraction, the commit handler DETECTS + LOGS the
+ * gesture but binds it to no mode (the cursor that consumed taps was
+ * removed; the detection stays live as a hook for future modes).
+ *   - 2 single-taps inside a window -> "double-tap" gesture (log-only).
+ *   - 3 inside a window -> "triple-tap" gesture (log-only).
+ *   - 1 with no follow-up -> no-op.
  *
  * The counter is gated by an activity check (must have been still
  * for ~500 ms prior) to suppress gait-driven false positives.
@@ -164,13 +149,13 @@ void gesture_mode_on_chip_double_tap(void);
 void gesture_mode_on_chip_single_tap(char peak_axis, char tap_sign);
 
 /*
- * Inform the mode detector that a triple-tap was detected.  Triple-tap
- * is the SURFACE entry trigger -- the wrist-on-desk "touchpad" pose.
- * Called from IDLE -> enters SURFACE.  Called from any non-IDLE state
- * -> ignored (logged).
+ * Inform the mode detector that a triple-tap was detected.  Post
+ * air-mouse extraction this is UNBOUND: it detects + logs the gesture
+ * but enters no mode (SURFACE was retired and air-mouse extracted).
+ * Kept as a free trigger for a future mode to bind.
  *
  * Wired to the serial 'y' test command and to the firmware multi-tap
- * counter (stage C) when 3 single-taps land inside the window.
+ * counter when 3 single-taps land inside the window.
  */
 void gesture_mode_on_chip_triple_tap(void);
 
@@ -229,28 +214,20 @@ const char *wrist_orientation_str(WristOrientation o);
 void gesture_mode_get_gravity(float *out_gx, float *out_gy, float *out_gz);
 
 /*
- * Diagnostic: cooldown samples remaining (each sample = 10 ms at
- * 100 Hz acquisition).  Zero means cooldown is closed and the user
- * must double-tap to re-enter AIR_MOUSE; nonzero means the
- * orientation-only re-engage path is still open.
- */
-int gesture_mode_get_cursor_cooldown_remaining(void);
-
-/*
- * Acquisition-request callback signature.  Registered by main.cpp
- * so gesture_mode can ask the power-state machine to keep the IMU
- * sampling pipeline alive while AIR_MOUSE / SURFACE modes need it.
+ * Acquisition-request callback signature.  Registered by main.cpp so
+ * gesture_mode can ask the power-state machine to keep the IMU sampling
+ * pipeline alive.  Under the always-on policy the gesture mode requests
+ * continuous IMU samples so the pose FSM keeps running in MODE_IDLE
+ * (the always-listening trigger state) even when the HR power state is
+ * IDLE.
  *
- *   needs = true   -- gesture mode is entering a state that requires
- *                     continuous IMU samples (cursor + orientation).
- *                     Callback should ensure acq is running.
- *   needs = false  -- gesture mode is leaving such a state.  Callback
- *                     may stop acq if no other consumer needs it
+ *   needs = true   -- ensure acq is running.
+ *   needs = false  -- acq may stop if no other consumer needs it
  *                     (typically: power state is IDLE).
  *
- * The callback is invoked from inside _transition_to (i.e. acq thread
- * context or wherever gesture_mode_on_chip_double_tap was called from).
- * Implementations should be quick and safe to call from those contexts.
+ * The callback is invoked from inside gesture_mode (acq thread context
+ * or wherever the registering call ran).  Implementations should be
+ * quick and safe to call from those contexts.
  */
 typedef void (*gesture_acq_request_cb_t)(bool needs);
 
