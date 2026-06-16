@@ -27,8 +27,8 @@
  * 'g' (gravity/pose), 'q' (PPG perfusion), and 'z' (gyro bias) serial
  * commands + the pose/cadence hardware tests.
  *
- * Findings & rationale: docs/research/orientation-and-pose-discrimination-
- * findings.md and docs/research/cursor-drift-mitigation.md.
+ * Findings & rationale: docs/research/gesture-architecture.md (§13 orientation
+ * & pose-discrimination findings, §14 observability-aware pose).
  *
  * NOTE: a number of tunables physically cannot live in this C header
  * (Kconfig values, chip-register encodings, DSP-internal literals).  They are

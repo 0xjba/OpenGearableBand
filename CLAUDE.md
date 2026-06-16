@@ -82,8 +82,9 @@ logging · `+`/`-` TAP_THS · `q` PPG probe · `z` gyro-bias trace · `v` pose t
   supervision timeout (RF/idle); the device re-advertises on disconnect, so it
   self-heals.
 - Geometry: `gx`=forearm elevation, `gy`=left-right sweep, `gz`=volar-normal.
-- Process: design/roadmap in `docs/research/gesture-architecture.md`; HR roadmap
-  in `docs/research/software-optimization-roadmap.md`; specs + plans under
+- Process: gesture design/roadmap/feasibility in `docs/research/gesture-architecture.md`
+  (the consolidated gesture doc); HR algorithm + roadmap in
+  `docs/research/hr-algorithm-decisions.md`; specs + plans under
   `docs/superpowers/`. We use brainstorm → spec → plan → subagent build.
 - (Air-mouse only, on `feature/air-mouse`): macOS pointer-accel must be OFF;
   `CURSOR_SENSITIVITY` stays 1.0; HID chars are `PERM_READ_ENCRYPT`.

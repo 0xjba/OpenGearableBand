@@ -3,8 +3,8 @@
 **Date:** 2026-06-11
 **Status:** Design for approval (no code yet).
 **Supersedes:** the roll-split dictation discriminator (commit `60feb91`).
-**Grounding:** `docs/research/observability-aware-pose-and-cursor-design.md`
-(measurement campaign), memory `decision_dictation_voice_gated_entry`.
+**Grounding:** `docs/research/gesture-architecture.md` §14 (observability-aware
+pose, the measurement campaign), memory `decision_dictation_voice_gated_entry`.
 
 ---
 

@@ -243,8 +243,9 @@ static void pose_fsm_update(float gx, float gy, float gz)
      * canonical (gesture_poses.cpp k_canonical_poses) and the hard-surface spectral
      * detector (surface_spectral_confirms_hard_surface) are intentionally KEPT in
      * code as ready scaffolding: when the high-ODR bio-acoustic surface-tap feature
-     * is built (the ViBand path -- see docs/research/gesture-sensing-without-ppg.md
-     * and software-optimization-roadmap.md), RE-ARM by deleting this demotion and
+     * is built (the ViBand path -- see docs/research/gesture-architecture.md §12
+     * feasibility + docs/research/hr-algorithm-decisions.md §10 roadmap), RE-ARM
+     * by deleting this demotion and
      * wiring a real consumer in multi_tap_commit_handler. */
     if (best == POSE_SURFACE) {
         best = POSE_NONE;

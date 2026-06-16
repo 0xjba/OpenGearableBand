@@ -5,7 +5,15 @@ track.  Captures the three product use cases (surface touchpad, air
 mouse, advanced gestures), the unification insight that they share a
 single underlying engine, verified hardware capabilities, the staged
 implementation roadmap with realistic effort estimates, and the
-research that grounds each decision.
+research that grounds each decision.  Also covers: **feasibility and
+the realistic gesture-verb menu** for IMU + mic without PPG (§12,
+was `gesture-sensing-without-ppg.md`); **orientation estimation and
+pose-discrimination findings** including the Mahony-filter build, gyro
+bias data, and the retracted roll-split (§13, was
+`orientation-and-pose-discrimination-findings.md`); and **observability-
+aware pose classification** including the observability cone, unified
+gravity-component geometry, and the adversarial pose campaign result
+(§14, was `observability-aware-pose-and-cursor-design.md`).
 
 **Status:** research and architecture complete; implementation has
 not started.  Update this doc as we learn from real hardware behavior
@@ -1266,8 +1274,8 @@ feature is post-event ring-down duration (F9 future task).
 See spec: `docs/superpowers/specs/2026-06-10-gesture-trigger-redesign-design.md`
 See plan: `docs/superpowers/plans/2026-06-10-gesture-trigger-redesign.md`
 See findings (orientation filter + roll-based AIR_MOUSE/DICTATION split,
-gyro-integral failure, bias measurement, references): `docs/research/orientation-and-pose-discrimination-findings.md`
-See cursor foundation spec: `docs/research/cursor-drift-mitigation.md`
+gyro-integral failure, bias measurement, references): §13 below
+See cursor foundation spec: on the `feature/air-mouse` branch
 
 ---
 
@@ -1354,7 +1362,692 @@ See cursor foundation spec: `docs/research/cursor-drift-mitigation.md`
 
 - See `hr-algorithm-decisions.md` for the parallel HR-algorithm
   decision doc.  Step counting and activity classification are parked
-  in `software-optimization-roadmap.md` (Stage 5+ section).
-- See `google-phrm-notes.md` for confidence-gated aggregation pattern
+  in `docs/research/hr-algorithm-decisions.md` §10 (Stage 5+ section).
+- See `docs/research/hr-algorithm-decisions.md` §11 for confidence-gated aggregation pattern
   -- some of the same UX patterns apply to gesture confidence
   thresholds.
+
+---
+
+## 12. Feasibility — the realistic verb menu (IMU + mic, no PPG)
+
+*(was `docs/research/gesture-sensing-without-ppg.md` — deep-research
+2026-06-15, 149 verified claims)*
+
+**Source:** deep-research session 2026-06-15 (fan-out web search → fetch →
+3-vote adversarial verification → synthesis; 149 verified claims). Compiled
+from the verified-claim set after the workflow stalled before its own final
+synthesis step.
+
+**Status:** research reference. **REFER TO THIS WHEN BUILDING GESTURE VERBS** —
+it defines what the hardware can/can't do so we don't spec a gesture that needs
+sensors we don't have.
+
+**Hardware grounding:** Seeed XIAO nRF52840 Sense (Cortex-M4F), **LSM6DSL**
+6-axis IMU (accel+gyro, **NO magnetometer**) over I2C with on-chip tap +
+sig-motion + 6D-orientation engines and a tap INT line, **PDM mic**, worn RIGHT
+wrist / VOLAR / radial(thumb)-side, output = BLE HID mouse+keyboard to a Mac.
+**No PPG used for gestures, no EMG** (architectural decision — see
+`decision_ppg_fusion_session_only_2026_06_10`).
+
+---
+
+### 12.1 Bottom line
+
+The reliable menu on this hardware is **whole-wrist motions + orientation poses
++ tap-class impulses**, plus — if we build a high-ODR bio-acoustic path — **on-body
+taps and finger flicks/rubs**. The one thing genuinely **lost without PPG** is the
+**subtle finger-pinch with near-zero wrist motion** (Apple "Double Tap"). True
+per-finger discrimination (ASL hand-shapes) needs *active* acoustics + a thumb
+ring, not a passive band.
+
+---
+
+### 12.2 The verb menu (tagged by confidence on OUR hardware)
+
+| Verb | Modality on our band | Confidence | Notes |
+|---|---|---|---|
+| Single / double tap (band or surface) | LSM6DSL **on-chip tap engine** (416 Hz, 2g, INT) | **High** — already in use | dedicated single+double-tap engines, threshold/shock/quiet/dur regs, INT1/INT2 |
+| Static wrist/forearm poses (gravity) | Accel gravity vector / on-chip **6D orientation** | **High** | per-axis face data, no mag needed |
+| Shake, tilt, lift, "hands up" (coarse) | Accel+gyro, ~100 Hz | **High** — >98% / 0.995 in studies | robust whole-wrist; needs null class |
+| Flick/swipe, thumbs up/down, fist, okay, victory | Accel+gyro (+ optional mic fusion) | **Medium–High** — per-user ~80%, cross-user ~75% | pick distinct-motion verbs |
+| Static finger/grip poses (extend, pinch-shape, grip) | Accelerometer (**tendon micro-movement**) | **Medium** — accel *beat* EMG here | gyro is useless for static holds |
+| On-body taps (forearm/palm/back-of-hand), finger flicks/rubs/scratches/claps | **High-ODR accel bio-acoustics** (ViBand ~4 kHz) | **Medium** — needs high-ODR path we don't have yet | localizes on-body tap site |
+| Snap / knock | Mic (airborne) OR high-ODR accel (contact) | **Medium** — mic noise-prone; contact-accel noise-immune | prefer contact-accel |
+| Held-object / tool ID (toothbrush, drill) | High-ODR accel bio-acoustics | **Medium** (bonus) | distinct vibration signatures |
+| Cursor / continuous pointing | Accel+gyro tilt (gravity-referenced) | **High** — already built | cf. Apple AssistiveTouch "Motion Pointer" |
+
+---
+
+### 12.3 Modality cheat-sheet (which sensor earns its keep)
+
+- **Accelerometer (low-rate):** gravity poses, tap impulses, and — surprisingly —
+  **static finger poses via tendon micro-movement**. The workhorse.
+- **Gyroscope:** dynamic/rotational gestures (flicks, twists, shake). **Useless
+  for static poses** (no rotational velocity) — don't rely on it for holds.
+- **On-chip engines (free, ~zero MCU):** tap/double-tap, 6D orientation, tilt,
+  free-fall, wake-up, pedometer — all on the LSM6DSL with an INT line.
+- **High-ODR accelerometer (~4 kHz) = the big unlock:** body-coupled vibration
+  "mic" → on-body taps, finger flicks/rubs, object ID. **Noise-immune** (senses
+  mechanical coupling, not airborne sound). Highest-leverage R&D direction;
+  aligns with the deferred ViBand thread (`finding_surface_tap_not_dead_2026_06_08`).
+- **PDM mic:** snaps/taps acoustically + voice (dictation path). ~7% over
+  IMU-only in fusion — real but secondary (one study: only 2 of top-25 features
+  were acoustic).
+
+---
+
+### 12.4 Reliability / gotchas (now evidence-backed)
+
+- **Tap-while-moving / segmentation is a *named* hard problem.** Onset detection
+  in continuous IMU data needs real machinery (GestureKeeper used recurrence-
+  quantification analysis, not a threshold). = our "2nd tap lost while sweeping"
+  finding (`finding_tap_while_moving_2026_06_11`).
+- **MUST train an explicit null / everyday-activity class** or false positives
+  ruin it. The best real-world numbers (0.6 FP/hr, 0.995 balanced acc) all
+  depended on a rest/negative class.
+- **Similar-wrist-motion gestures get confused** (okay/victory/stop share a
+  twist; minimal-motion taps blur). Choose verbs with *distinct gross motions*.
+- **Per-user calibration matters:** cross-subject ~75% vs intra-subject >80%+;
+  few-shot custom gestures hit ~87% at 5 shots. A short enrollment ritual pays off.
+- **No-magnetometer caveat:** several high IMU accuracies (88–89%) used a
+  magnetometer and/or 4–8 sensors. Our single 6-axis volar band targets the
+  IMU-only / 2-sensor numbers (~75–95% w/ per-user tuning), not those ceilings.
+- **Drift:** gyro-only orientation drifts (no mag for yaw) — why the cursor uses
+  the gravity-locked `vert` signal. Gravity-referenced poses are drift-free;
+  yaw-based verbs are not.
+
+---
+
+### 12.5 The hard line — what PPG/EMG buys that we can't replicate
+
+- **Subtle finger-pinch with ~no wrist motion (Apple "Double Tap"): PPG-dependent,
+  full stop.** Fuses accel+gyro **with optical blood-flow disruption**, on a
+  dedicated neural engine, gated to display-on for power. Without PPG we do **not**
+  get this exact motionless pinch reliably. *(A pinch/clench that DOES move the
+  wrist/tendons is partially recoverable via accel tendon-micro-movement or
+  high-ODR bio-acoustics — it's the* motionless *pinch that's lost.)*
+- **Fine individual-finger discrimination (ASL shapes, thumb-to-each-phalanx):**
+  94–96% achievable — but only with **FingerPing-style *active* acoustics** (thumb-
+  ring chirp emitter 20 Hz–6 kHz + multiple receivers). A passive IMU+mic band
+  can't; needs extra worn hardware.
+- **Pinch/grip *force*, intent during arm motion:** EMG/SNC territory (Mudra
+  Band) — the excluded modality.
+- **Degrades badly in bursty real use:** finger-level or minimal-motion gestures
+  while the arm moves; anything needing held stillness a moving hand can't give;
+  mic-based snap/tap in noisy rooms (use contact-accel instead).
+
+---
+
+### 12.6 Roadmap implications
+
+- **Safe high-confidence verb set (most already on-chip):** single/double/triple
+  tap, orientation poses, tilt-cursor, shake/lift, a few distinct-motion
+  flicks/swipes.
+- **Worth R&D:** high-ODR accelerometer **bio-acoustics (ViBand path)** for
+  on-body taps + finger flicks + noise-robust snap detection. This is the realistic
+  way to expand the vocabulary without PPG.
+- **Do NOT spec:** a *motionless* finger pinch, per-finger ASL discrimination, or
+  grip-force — they need PPG / EMG / active-acoustic hardware we don't have.
+
+### Firmware scaffolding already in place for the ViBand / surface-tap build
+
+The dropped SURFACE *mode* was removed, but its **detection scaffolding was deliberately
+kept** in firmware because the flat-wrist-on-a-desk posture is exactly the trigger
+context for the future bio-acoustic surface-tap feature. When we build the ViBand path,
+these are the wires to reconnect (all live in `src/gesture_mode.cpp` / `gesture_poses.cpp`
+unless noted):
+
+- **`POSE_SURFACE` canonical** (`gesture_poses.cpp` `k_canonical_poses`) — the flat-wrist
+  gravity signature, still defined and scored by `pose_classify_best`. It is currently
+  **demoted to `POSE_NONE` in `pose_fsm_update`** (a 3-line `if (best == POSE_SURFACE)`
+  guard, added 2026-06-15) so it doesn't arm with no consumer. **Re-arm = delete that
+  guard.**
+- **`surface_spectral_confirms_hard_surface()` + `last_tap_mid_band_energy` +
+  `SURFACE_RESONANCE_MID_BAND_THRESH`** — the hard-surface-vs-soft (desk vs lap) spectral
+  discriminator from the tap's FFT. Still compiled and updated on every chip tap; ready
+  to gate a real surface-tap.
+- **The `case POSE_SURFACE` branch in `multi_tap_commit_handler`** — currently log-only
+  (`"… unbound … no mode entry"`). This is where a real consumer gets wired: pose +
+  cadenced double-tap + hard-surface spectral confirm → the surface-tap action.
+- **Triple-tap (`gesture_mode_on_chip_triple_tap`, serial `y`)** — kept as a free,
+  unbound trigger to repurpose; another candidate entry point for a surface/bio-acoustic
+  verb.
+
+The missing piece is purely the **high-ODR (~4 kHz) bio-acoustic capture + feature
+extraction** itself (today's FIFO runs ~833 Hz for the tap engine). Everything *around*
+it — posture detection, hard-surface spectral gate, tap cadence, an unbound trigger — is
+already wired and waiting. Cross-ref: `finding_surface_tap_not_dead_2026_06_08`,
+`docs/research/hr-algorithm-decisions.md` §10.
+
+---
+
+### 12.7 Sources (surfaced & verified; 3-vote adversarial)
+
+- Apple Watch **Double Tap** — accel+gyro+**PPG** fusion on S9 neural engine
+  (Apple docs + coverage). The proof the marquee wrist gesture is *not* IMU-only.
+- Apple Watch **AssistiveTouch** — tap / double-tap / clench / double-clench +
+  **Motion Pointer** tilt-cursor (Apple accessibility docs).
+- **ViBand** — Laput, Xiao, Harrison; CMU Future Interfaces Group, **UIST 2016**.
+  4 kHz accel bio-acoustics; on-body taps/flicks + object ID; noise-immune.
+- **FingerPing** — Cheng Zhang et al., Georgia Tech, **CHI 2018**. *Active*
+  acoustic (thumb-ring chirps + 4 receivers); 22 poses incl. ASL 1–10;
+  93.77%/95.64%. Not achievable passively.
+- **Siddiqui & Chan 2020**, *Multimodal hand gesture recognition using single IMU
+  + acoustic at wrist*, **PLOS ONE** 15(1):e0227039. 13–14 gestures; +~7% from
+  mic; cross-subject ~75%, intra >80%.
+- **GestureKeeper** — IMU-only (accel+gyro), RQA onset detection + SVM, >98%.
+- IMU-only cross-user gesture study — 95.7% cross-user, 0.6 FP/hr, few-shot
+  custom gestures (1/3/5 shots → 55/83/87%).
+- IMU-only shake/tilt vs everyday-activity — >98%, 0.995 balanced acc, explicit
+  null class, small CNN feasible on Cortex-M-class MCU.
+- Accel-vs-EMG static-pose study — accel-only 84±8% **beat** EMG 76±11% on 17
+  poses; gyro poor at static; tendon micro-movement is the mechanism;
+  magnetometer/8-sensor caveat noted.
+- **LSM6DSL** datasheet / app notes — on-chip single+double tap (416 Hz/2g,
+  INT1/INT2), 6D orientation, tilt, free-fall, wake-up, pedometer.
+
+---
+
+## 13. Orientation estimation & pose-discrimination findings
+
+*(was `docs/research/orientation-and-pose-discrimination-findings.md` —
+2026-06-10)*
+
+> **PARTIALLY SUPERSEDED (2026-06-11).** The **roll-based dictation
+> discriminator** documented below (roll = atan2(gy,gz), threshold 85°) was a
+> **WRONG TURN** — it reads the palm twist, which is in the gravity blind spot
+> and contradicts the settled `decision_dictation_voice_gated_entry`
+> (dictation = bring-to-face geometry + voice, NOT the twist). It mislabeled a
+> steady near-vertical air-mouse pose as DICTATION. The corrected direction —
+> an observability-aware classifier (roll-validity cone) + bring-to-face
+> geometry + voice — is in §14 below.
+> The orientation-foundation, gyro-integral-failure, and bias-measurement
+> sections below remain valid; only the roll-split *conclusion* is retracted.
+
+**Date:** 2026-06-10
+**Status:** Orientation foundation valid; **roll-split conclusion retracted**
+(see banner). Cursor pointing deferred.
+**Scope:** Everything from the gyro-based addition (when the cursor spec
+was handed over) through to the validated orientation foundation +
+roll-based dictation discriminator.
+
+Companion docs:
+- `cursor-drift-mitigation.md` (on the `feature/air-mouse` branch) — the user's drift-free-cursor spec (the reason we built the orientation foundation).
+- `docs/superpowers/specs/2026-06-10-gesture-trigger-redesign-design.md` — pose-gated trigger design.
+- Memories: `project_orientation_foundation_2026_06_10`, `decision_dictation_voice_gated_entry_2026_06_10`, `hardware_wear_position`.
+
+---
+
+### 13.1 What we settled on (TL;DR)
+
+1. **AIR_MOUSE and DICTATION are one "raised" pose**, split by **ROLL**
+   (= `atan2(gy, gz)`), which is **gravity-derived and drift-free**.
+   Threshold 85°: roll < 85° → AIR_MOUSE (palm to screen), roll ≥ 85°
+   → DICTATION (palm supinated to face). Validated: settled air-mouse
+   ~30–64°, settled dictation ~105–117°.
+2. **The raised cone** is centred on the forearm axis `[1,0,0]` with
+   tolerance 0.45 (arms within ~43.5°), wide enough to catch *inclined*
+   raises (~38° off-axis) while rejecting NEUTRAL (~48°+) and SURFACE
+   (~80°).
+3. **A shared IMU orientation foundation** was built (Mahony filter +
+   ZARU gyro-bias tracking + stillness detection + yaw re-zero) — it
+   validated the roll discriminator, steadies pose detection, and is the
+   base for the future drift-free cursor.
+4. **Voice gating** is the chosen *future* backstop for the residual
+   air-mouse/dictation overlap in the "blurry middle" (tilted poses).
+5. **Snap-vs-tap gesture-variant discrimination** is NOT done here; it's
+   separate future work (mic + IMU fusion).
+
+---
+
+### 13.2 The problem
+
+On a wrist band (6-axis IMU, **no magnetometer**), distinguishing an
+AIR_MOUSE raise (palm toward screen) from a DICTATION pose (palm
+supinated toward the face) looked impossible at first:
+
+- The two poses' **static gravity vectors overlap**. An air-mouse
+  max-right lean and a dictation pose measured only **~4° apart** in the
+  raw gravity direction.
+- The distinguishing motion — **supination (palm flip)** — is a rotation
+  *about the forearm axis*. When the arm is raised, the forearm axis is
+  nearly aligned with gravity, so the flip is rotation *about gravity =
+  yaw*, which an **accelerometer cannot sense** (it only measures the
+  direction of "down"). This is the accelerometer's well-documented yaw
+  blind spot. [1][2]
+
+This led to an initial (wrong) decision to **merge** the two poses,
+concluding "gravity can't separate them."
+
+---
+
+### 13.3 The empirical journey (three attempts)
+
+#### Attempt 1 — simple per-axis gyro integral. FAILED.
+
+Hypothesis: the supination flip is a roll about the forearm axis (band
+X), so the **net integral of gyro-X** over the move-into-pose would be
+large for a dictation flip and small for an air-mouse raise.
+
+Research backed the *idea*: gyroscope angular-velocity signatures do
+distinguish pronation/supination, wrist flexion/extension, finger-snap,
+etc. [3]
+
+But hardware data killed the *implementation*:
+
+| Gesture | net_X (deg) | net_Y (deg) |
+|---|---|---|
+| Air-mouse raises (×10) | −4 … +24 | all negative |
+| Dictation flip *from lap* | **+2** | +61 |
+| Dictation flip *from air-mouse* | **+24** | −46 |
+
+`net_X` for dictation flips (+2, +24) sat **inside** the air-mouse range;
+`net_Y` had **opposite signs for the same gesture by different paths**.
+
+**Root cause (as the user predicted):** 3D rotations don't commute, so
+integrating *body-frame* angular velocity over a natural *compound*
+raise-and-twist is **path-dependent** — it doesn't decompose into a
+clean per-axis "supination angle." People don't move mechanically
+(raise → pause → flip); they raise-while-twisting in one motion, and the
+integral smears across axes.
+
+#### Attempt 2 — full orientation tracking (Mahony filter). SUCCEEDED, via ROLL.
+
+We built a Mahony complementary filter (accel+gyro → quaternion →
+pitch/roll/yaw) to capture the **end orientation** (path-independent)
+rather than a path-dependent integral. [1][2]
+
+Two things fell out:
+
+**(a) The yaw-as-discriminator idea backfired.** We auto-re-zero yaw at
+rest (a ZUPT analogue, correct for the *cursor*). But that *erased* the
+yaw signal the instant a pose settled — dictation yaw read 81° mid-flip
+but **0° once held**. Yaw is the wrong signal for a *static* pose
+discriminator.
+
+**(b) ROLL was the answer all along — and it's drift-free.** Because the
+raised forearm is **not** perfectly vertical (pitch ≈ −68°, so ~22° off
+gravity), the supination has a component *perpendicular* to gravity that
+the accelerometer **can** see, surfacing as Euler **roll**. Roll is
+gravity-locked → drift-free → stable even when the pose is held:
+
+| Pose (settled, `at_rest=1`) | pitch | **roll** |
+|---|---|---|
+| Air-mouse raise | −69 | **31** |
+| Air-mouse raise | −68 | **59** |
+| Dictation flip | −57 | **111** |
+| Dictation flip | −66 | **117** |
+
+~50° clean gap. Equivalent simple form: `roll = atan2(gy, gz)` from the
+gravity-LPF (no quaternion needed for the discriminator itself — the
+filter just revealed it).
+
+#### Correction of the over-generalization
+
+"Gravity can't separate them" was **only true for the worst case** (an
+air-mouse *max-right lean*, roll ~105°, which collides with dictation).
+For air-mouse as actually performed (palm to screen, roll 30–64°),
+gravity *does* separate it from dictation by ~50°. The initial merge was
+concluded from the worst case, not the typical case.
+
+#### Attempt 3 — cone tuning for inclined poses
+
+After re-splitting by roll, hardware testing showed inclined raises
+("wrist not straight up", ~38° off the forearm axis) sometimes failed to
+arm — the raised cone was too tight (armed within ~37°). Widened the
+tolerance 0.60 → 0.45 (arms within ~43.5°), which catches inclined raises
+while still rejecting NEUTRAL (~48°+) and SURFACE (~80°). Result: inclined
+poses now arm reliably.
+
+---
+
+### 13.4 Final design
+
+#### Pose classification (in `gesture_mode.cpp` / `gesture_poses.cpp`)
+
+- **SURFACE**: gravity-cosine canonical, Z-dominant `[0.18, 0.08, 0.98]`,
+  tolerance 0.94 (±20°).
+- **Raised hemisphere**: canonical `[1,0,0]` (forearm axis), tolerance
+  0.45 (arms within ~43.5°). Covers straight + forward/left/right/inclined.
+- **AIR_MOUSE vs DICTATION split**: within the raised hemisphere, compute
+  `roll = atan2(gy, gz)`. `roll ≥ 85°` → DICTATION (positive high roll =
+  supination toward face); otherwise AIR_MOUSE. Signed threshold — a left
+  lean is negative roll and stays air-mouse.
+
+#### Orientation foundation (`orientation.{h,cpp}`)
+
+A Mahony complementary filter fusing accel (gravity → drift-free
+pitch/roll) and gyro (all axes; yaw drifts on a 6-axis IMU). Plus, from
+the cursor spec [4]:
+- **ZARU gyro-bias tracking** (the filter's integral term) — estimates
+  and subtracts the gyro bias, hardest-converging when still. [8]
+- **Stillness detection** — accel residual + gyro magnitude below
+  threshold for a 300 ms dwell, gating on **both** linear and angular
+  quietness. [9]
+- **Yaw re-zero at rest** (ZUPT analogue) — bounds yaw drift to a single
+  continuous motion. [7][9]
+
+#### Mode entry (two-step, in the commit handler)
+
+Pose selects the mode; a **cadenced double-tap** (inter-tap 60–500 ms,
+tuned to this user) confirms intent. Mode-transition is currently
+LOG_INF-only (wire-up to the power state machine is future work F2).
+
+---
+
+### 13.5 Empirical data
+
+#### Roll separation (settled poses, drift-free)
+
+- Air-mouse (palm to screen): roll **30–64°** (Z positive).
+- Dictation (palm to face): roll **105–117°** clean, **88–103°** when
+  inclined (Z near/below 0).
+- Threshold 85° sits in the gap for clean poses.
+
+#### Gyro bias (this LSM6DSL unit, warm, two 6000-sample stationary traces)
+
+| Axis | bias mean (dps) | noise σ (dps, clean trace) |
+|---|---|---|
+| X | +0.66 | ~0.77* |
+| Y | **−1.59** | 0.16 |
+| Z | −0.58 | 0.18 |
+
+Two traces agreed to **within 0.04 dps** — stable and repeatable.
+(*X σ inflated by slight motion; min/max excursions in the 2nd trace,
+e.g. X −12.7 dps, were desk bumps, not noise — use σ.) Implication:
+after ZARU subtracts the ~1.6 dps bias, residual ≈ 0.2 dps → ~0.4° yaw
+drift over a 2 s motion (a few pixels), wiped at each stillness re-zero.
+This is per-unit; production needs per-unit calibration, but the adaptive
+ZARU means no value is hardcoded.
+
+---
+
+### 13.6 Known limitations
+
+1. **Blurry-middle pose overlap.** *Tilted* air-mouse and *inclined*
+   dictation are geometrically similar in gravity (X≈Y, Z≈0) and can
+   mis-classify (~1 in 10, near the roll-85° boundary). Clean poses
+   classify reliably. NOT tuned away, because tightening the threshold
+   would re-break inclined dictation. Resolved later by **voice gating**.
+2. **No absolute yaw** (no magnetometer). Yaw is gyro-only; "drift-free"
+   is *practical* (stillness re-zero), not mathematical. Long, slow,
+   pauseless sweeps can accumulate visible yaw drift (cursor concern).
+3. **Mahony bias winds up during motion.** The Ki integral absorbs some
+   linear acceleration as "bias" during active motion (observed Y bias
+   creeping to ~4 dps mid-session); it self-settles when still. The `z`
+   stationary trace gives the true bias. Freezing Ki during high motion
+   is a future tuning option.
+4. **All thresholds are device/mount/user-specific** — derived from this
+   unit's logs, not datasheet defaults. Per-user calibration is a
+   productionization item.
+
+---
+
+### 13.7 Future work
+
+- **F2** — wire mode entry to the power state machine (LOG_INF → real).
+- **Cursor pointing** — pitch→vertical, yaw→horizontal, with the
+  ZARU/ZUPT drift mitigation; foundation is ready (see cursor spec).
+- **Voice-gated dictation** — band-at-lips mic signal as the dictation
+  confirmer; resolves the blurry-middle overlap.
+- **Ki-freeze-during-motion** — prevent the bias estimate winding up.
+- **Cold bias trace** — characterize cold→warm bias swing (post-recharge
+  cold start); reminder pending for next session.
+- **Per-unit / per-user calibration** of canonicals, roll threshold,
+  cadence window, bias, stillness thresholds.
+
+---
+
+### 13.8 References
+
+**Orientation filtering**
+1. Madgwick orientation filter — AHRS docs (accel gives roll/pitch only; gyro-derived yaw drifts; needs a constant heading reference). <https://ahrs.readthedocs.io/en/latest/filters/madgwick.html>
+2. S. O. H. Madgwick, "An efficient orientation filter for inertial and inertial/magnetic sensor arrays." <https://www.researchgate.net/publication/361578937>
+
+**Gyroscope gesture discrimination**
+3. Gyroscope-Based Continuous Human Hand Gesture Recognition (MDPI Sensors 19(11):2562, 2019) — angular-velocity signatures distinguish pronation/supination, wrist flexion/extension, finger-snap, etc. <https://www.mdpi.com/1424-8220/19/11/2562>
+
+**Accelerometer yaw blind spot / sensor fusion**
+4. (User spec) `cursor-drift-mitigation.md` (feature/air-mouse branch).
+5. Accelerometer, Gyroscope and Magnetometer — Ericco Inertial (yaw cannot be estimated by accelerometers; only the gyroscope helps about the gravity axis, but drifts; magnetometer compensates). <https://www.ericcointernational.com/info/accelerometer-gyroscope-and-magnetometer.html>
+6. Magnetometer-Based Drift Correction During Rest in IMU Arm Motion Tracking (PMC6471153) — 6-axis gyro-integrated heading drifts; rest-based correction. <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6471153/>
+
+**Zero-velocity / zero-angular-rate updates (drift mitigation)**
+7. Wahdan et al., ZUPT-aided pedestrian inertial navigation — resetting at detected stationary intervals bounds integration drift. <https://www.researchgate.net/publication/353898852>
+8. Nazari et al., survey describing ZARU — a motionless gyro should read zero; any reading is bias to remove. <https://arxiv.org/pdf/1906.05917>
+9. Wahlström & Skog, "Fifteen Years of Progress at Zero Velocity" — survey of zero-velocity detection / drift correction; gate on genuine stationarity. <https://arxiv.org/pdf/2008.09208>
+
+**Hardware (no magnetometer)**
+10. Adafruit LSM6DS3TR-C — 6-DoF IMU, no magnetometer. <https://www.adafruit.com/product/4503>
+11. ST LSM6DS3 datasheet / AN4650. <https://cdn.sparkfun.com/assets/learn_tutorials/4/1/6/AN4650_DM00157511.pdf>
+12. Seeed XIAO nRF52840 Sense — nRF52840 BLE + onboard 6-axis LSM6DS3 + PDM mic. <https://www.seeedstudio.com/Seeed-XIAO-BLE-Sense-nRF52840-p-5253.html>
+
+---
+
+## 14. Observability-aware pose classification
+
+*(was `docs/research/observability-aware-pose-and-cursor-design.md` —
+2026-06-11; cursor-mapping / air-mouse cursor design portions omitted —
+those live on the `feature/air-mouse` branch)*
+
+**Date:** 2026-06-11
+**Status:** Design *direction* settled. The cone threshold and dictation
+signature are **pending measurement** (A/B/C pose traces on today's mount).
+No classifier code written yet — measure first, then spec, then implement.
+
+**Why this doc exists:** these decisions currently live in conversation +
+volatile memory. Persisting them so a context compaction can't lose them.
+Supersedes the roll-split conclusion in §13 above.
+Builds on `cursor-drift-mitigation.md` (on the `feature/air-mouse` branch) and the
+memories `decision_dictation_voice_gated_entry`, `project_orientation_foundation`.
+
+---
+
+### 14.1 The mistake being corrected (the roll-split)
+
+This session, post-compaction, a **roll/twist-based AIR_MOUSE↔DICTATION
+split** was built (commit `60feb91`: `roll = atan2(gy,gz)`, threshold 85°).
+That is the *blind-spot* approach the settled decision explicitly rejected.
+
+- **Symptom:** a steady air-mouse pose with the forearm near-vertical
+  mislabeled as DICTATION. Roll there is noise-dominated — when the forearm
+  aligns with gravity, the Y-Z "shadow" `sqrt(gy²+gz²)` collapses (~1.8 of
+  9.8), so `atan2(gy,gz)` random-walks across the threshold with no movement.
+- **Also:** the entry handler entered DICTATION on a cadenced double-tap,
+  which contradicts the voice-gated decision.
+- **Action:** remove the roll-split; replace with the observability-aware
+  classifier below.
+
+### 14.2 The settled dictation model (restated, do not re-derive)
+
+From `decision_dictation_voice_gated_entry` (the user's call, long settled):
+
+- **DICTATION = wrist brought to the mouth, volar to the face** — a
+  *bring-to-face GEOMETRY* (different forearm angle), **not** a palm twist.
+- **Confirming gesture = VOICE** (near-field loud/clear mic), not taps.
+  AIR_MOUSE / SURFACE confirm by cadenced taps. The differing gesture is
+  itself the disambiguator.
+- The bring-to-face pose **escapes the gravity blind spot** by changing the
+  forearm angle (you cannot reach your mouth with a vertical forearm). Voice
+  is the backstop for any residual overlap.
+- Dictation mode does not exist yet → **log-only in v0** until voice lands.
+
+### 14.3 The keystone — one observability cone for the whole product
+
+Forearm pronation/supination ("which way the volar faces") **is** detectable
+from gravity — but **only when the forearm is not near vertical.** When the
+forearm aligns with gravity, the twist becomes rotation about the gravity
+axis = **yaw**, which a 6-axis IMU (no magnetometer) cannot observe.
+(Search-verified — see refs.)
+
+Define the **observability cone** by the forearm-from-vertical angle,
+equivalently the Y-Z shadow magnitude `sqrt(gy²+gz²)`:
+
+- **Inside the cone** (forearm near vertical, shadow small) → **roll INVALID.**
+- **Outside the cone** (forearm angled, shadow large) → **roll VALID.**
+
+This single geometric parameter serves **both** subsystems:
+
+| Subsystem | Inside cone (roll invalid) | Outside cone (roll valid) |
+|---|---|---|
+| Pose classifier | hard-block DICTATION | roll usable to classify |
+| Cursor (roll→X mode) | horizontal axis falls back | roll drives horizontal |
+
+One concept, one threshold (lives in `gesture_thresholds.h`), whole product.
+
+### 14.4 Unified gravity-component geometry (ONE model — no parallel definitions)
+
+All pose geometry derives from the **same gravity-LPF vector**
+`(gx, gy, gz)` (the `gx_filt/gy_filt/gz_filt` 1-pole IIR), in the band
+frame. Every zone below is a test on these *same* components — there must
+not be a second, independent pose-geometry definition that can drift from
+this one. The axis roles:
+
+- **gx** — forearm axis → **elevation** (how raised the arm is).
+- **gy** — left-right / cross axis → the **SWEEP axis** (an air-mouse
+  drag across a screen swings gy large at the extremes).
+- **gz** — volar-normal (palm side) → **supination** (sign = palm past
+  edge-on toward the face).
+
+Derived zones, all on `(gx, gy, gz)`:
+
+1. **Raised (coarse orientation `UP_RAISED`):** `gx > 0` AND
+   `gx > RAISED_ELEVATION_RATIO · |gz|`. **gy is deliberately ignored** —
+   it is the sweep axis, so a wide air-mouse reach (gy large at the
+   extreme, e.g. `g=(6.0, 6.8, 0.3)`) must stay raised, not flip to
+   NEUTRAL. This replaces the old single-axis-dominance classifier whose
+   Y-dominance→NEUTRAL caused the sweep flapping (2026-06-11). `DOWN_FLAT`
+   = `gz > 0` AND `gz` dominates both `|gx|` and `|gy|`; else `NEUTRAL`.
+2. **Roll-observability cone:** the Y-Z shadow `|(gy,gz)| = √(gy²+gz²)`
+   = how far the forearm is from vertical. Small shadow → forearm near
+   vertical → roll unobservable. Used for the cursor's roll→X axis.
+3. **Supination / gz-sign:** `gz < −ε` = palm flipped past vertical (the
+   would-be dictation signal). Pose-only CANNOT discriminate air-mouse
+   from dictation (the max-right overlap, §14.8b), so this never decides the
+   mode — the gesture does. Documented here so the signal isn't re-used
+   as a discriminator.
+
+**Empirical thresholds, not designed:** `RAISED_ELEVATION_RATIO`, the cone
+threshold, and `ε` are all calibrated from the trace data + the adversarial
+sessions (sweeps, fast flicks, re-mounted band, different days), never
+midpoint arithmetic — same discipline as every other threshold. The
+**named regression test for `RAISED_ELEVATION_RATIO` is the 2026-06-11
+left-right sweep log**: the fix is proven when that exact trace produces
+**zero** `UP_RAISED↔NEUTRAL` transitions. Initial value ~1.1 (the observed
+min `gx/|gz|` across the raised sweep was ~1.31, so 1.1 leaves margin);
+refine against the cross-session traces.
+
+### 14.5 Pose classifier plan (observability-aware) — to implement after measuring
+
+1. **Roll-validity mask (A1).** Forearm within the cone of vertical → roll
+   invalid → **hard-block entry into dictation**, regardless of entry path.
+   Physically safe: dictation cannot have a vertical forearm. The crane lives
+   inside the cone; dictation outside it. Kills most false positives alone.
+2. **Dictation = conjunction (A2)**, not a region: elevation-in-band AND
+   roll-in-volar-range AND roll-valid AND short stillness dwell. Each weak
+   alone; the AND is strong.
+3. **Sticky states / hysteresis (A3).** Require sustained high-confidence
+   evidence to leave crane for dictation — no single frame flips it.
+4. **Voice = commit gate (A4).** Nothing happens until near-field speech.
+   (Future; dictation log-only until then.)
+- **Gyro supination burst** during a crane→dictation transition = a
+  confirming *tiebreaker vote*, not load-bearing (raw gyro integral was shown
+  unreliable as a primary).
+
+### 14.6 Measured facts (today's mount, 2026-06-11)
+
+- **Gyro bias (this unit):** `[+0.67, −1.64, −0.56] dps`, stable to **≤0.05
+  dps** across a cold→warm change AND a re-taped mount on a different day.
+  Noise floor ~0.15 dps (Y/Z). Cold-start swing negligible → temperature-indexed
+  bias table unneeded.
+- **PENDING (A/B/C pose traces via `v`):**
+  - the cone angle (where roll destabilizes vs forearm-from-vertical);
+  - dictation's bring-to-face gravity + roll signature;
+  - separation of air-mouse-up (A) vs air-mouse-forward (C) vs dictation (B).
+- **Caveat — fresh DIY tape mount each session:** re-measure pose canonicals,
+  cone, etc. per session; band-X may not perfectly align with the forearm.
+  Assume nothing from prior days.
+
+### 14.7 Measurement tooling (serial commands)
+
+- `z` — stationary gyro-bias trace (60 s; bias/noise per axis).
+- `v` — pose-observability trace (30 s @5 Hz: gravity, shadow, forearm-from-
+  vertical, pitch, roll, at_rest). Runs in IDLE; just hold the pose.
+- `g` — single live gravity-vector dump (pose calibration).
+
+### 14.8 References (added 2026-06-11)
+
+**6-axis yaw / heading unobservable without a magnetometer**
+- IMU guide, JOUAV. <https://www.jouav.com/blog/inertial-measurement-unit.html>
+- How many axes? Ceva. <https://www.ceva-ip.com/blog/motion-sensors-how-many-axes-do-you-need/>
+
+**Pronation/supination IS detectable from gravity orientation**
+- IMU wrist-rotation control (transradial prosthesis), PMC10734105. <https://pmc.ncbi.nlm.nih.gov/articles/PMC10734105/>
+- Single-IMU arm-motion classification, BMC. <https://biomedical-engineering-online.biomedcentral.com/articles/10.1186/s12938-019-0677-7>
+
+**Gyro captures supination during movement (roll axis), <4° RMS**
+- MediaPipe+IMU pronation/supination estimation, MDPI. <https://www.mdpi.com/2076-3417/15/19/10527>
+- IMU→joint-angle systematic review, PMC10386307. <https://pmc.ncbi.nlm.nih.gov/articles/PMC10386307/>
+
+**Mic / always-on power**
+- TDK T5838 AAD PDM mic ~20 µA. <https://invensense.tdk.com/news-media/tdk-low-power-t5838-mems-microphones-edge-ai-applications/>
+- XIAO nRF52840 Sense onboard mic = MSM261D3526H1CPM (plain PDM, no AAD). <https://www.seeedstudio.com/Seeed-XIAO-BLE-Sense-nRF52840-p-5253.html>
+
+(Madgwick/Mahony, ZUPT/ZARU refs on the `feature/air-mouse` branch in `cursor-drift-mitigation.md` and §13.8 above.)
+
+### 14.8b UPDATE 2026-06-11 — adversarial campaign result + clench resolution
+
+Held-extreme traces (today's mount) settled the discriminator question:
+
+| Pose (held, at_rest=1) | gz | roll | verdict |
+|---|---|---|---|
+| Max-LEFT air-mouse | **+4.3** | 33 | clean air-mouse (wrist not flipped) |
+| Max-RIGHT air-mouse | **−2.5** | **113** | **collides with dictation** |
+| Dictation (bring-to-face) | −2.1 | 108 | — |
+
+**Key finding:** a held **max-right** air-mouse reach supinates the wrist
+enough to flip gz negative → roll 113, *past* dictation's 108. So the
+gz-sign / roll discriminator **does NOT survive max-right** —
+it's a full overlap, not a thin margin. Gravity provably cannot separate
+the full air-mouse envelope from dictation. (Max-LEFT, by contrast, stays
+gz>0 — confirming the *wrist flip*, not the *arm position*, is the signal.)
+
+**Resolution (two layers, both already in the design intent):**
+1. **The gesture decides the mode, never the pose** — air-mouse = taps,
+   dictation = **clench → mic → voice**. Max-right has *no clench*, so it
+   is never dictation regardless of its dictation-identical gravity. The
+   collision becomes irrelevant.
+2. **Max-right is in-session** (a cursor move *after* air-mouse entry), not
+   an entry pose — so the entry decision never confronts it anyway.
+
+**=> Design pivot:** do NOT use roll/gz as the air-mouse↔dictation
+discriminator (it can't be). Keep the **cone** only for roll-*reliability*
+(blocking the near-vertical garbage zone).
+The MODE decision rides entirely on the confirming gesture.
+
+**Clench gate (refines decision_dictation_voice_gated_entry):** DICTATION =
+bring-to-face pose + **CLENCH** (the deliberate act) → powers the mic →
+listens for voice. The clench (a) separates dictation from gravity-identical
+poses like max-right, and (b) gates mic power so it isn't always-on (answers
+the battery + ambient-voice concerns).
+
+**Clench detection = PPG, NOT IMU (corrected 2026-06-11, search-verified).**
+A held clench is *isometric* → the accelerometer sees ~no mechanical work,
+so IMU-alone can't detect it. PPG can: the "white-knuckle" effect (gripping
+pushes blood from the hand + shifts forearm tendons under the volar sensor)
+perturbs the PPG — the documented basis for PPG grip/finger gesture
+recognition. So clench-gated dictation belongs with the **PPG-GESTURES
+phase**, not this IMU trigger layer. PPG is off in IDLE
+(decision_ppg_fusion_session_only), so the **power ladder** is: bring-to-face
+POSE (IMU, cheap, runs in IDLE) → wake PPG → check clench → wake mic → voice.
+The pose is the cheap IDLE gate that authorizes PPG; PPG-off-in-IDLE is
+preserved. Dictation stays log-only until the PPG-gestures phase builds it.
+Refs: PPG finger-gesture (Rutgers WINLAB); EMG-vs-IMU isometric limitation
+(arXiv 2512.07997).
+
+### 14.9 Status / next
+
+Measure A/B/C → derive cone + dictation signature on today's mount → write
+the classifier spec off those numbers → implement (remove roll-split, add the
+observability-aware classifier). Voice gating (A4) remains future.

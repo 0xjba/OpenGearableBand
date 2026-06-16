@@ -23,8 +23,9 @@ extern "C" {
  * Used for: (1) path-independent dictation-vs-air-mouse discrimination
  * (end-state yaw, not a path-dependent gyro integral), (2) steadier
  * pose detection, (3) the future drift-free air-mouse cursor.  See
- * docs/research/cursor-drift-mitigation.md and the
- * project_orientation_foundation memory.
+ * docs/research/gesture-architecture.md (§13 orientation/pose findings) and
+ * the project_orientation_foundation memory.  (The air-mouse cursor's own
+ * drift-mitigation note lives on the feature/air-mouse branch.)
  */
 typedef struct {
     float qw, qx, qy, qz;     /* orientation quaternion */
@@ -55,8 +56,8 @@ void orientation_rezero_yaw(void);
  * call this; it accumulates raw gyro for n_samples (~100 Hz) and logs
  * mean (= bias, deg/s), stddev (= noise), and min/max per axis.  Run
  * warm AND cold to get this unit's real numbers before trusting the
- * filter's stillness / bias thresholds (per cursor-drift-mitigation
- * spec, section 8). */
+ * filter's stillness / bias thresholds (per the bias-measurement note in
+ * docs/research/gesture-architecture.md §13.8). */
 void orientation_bias_trace_start(uint32_t n_samples);
 
 #ifdef __cplusplus
