@@ -46,9 +46,13 @@ known gotchas). Keep it current when these stable facts change.
   detect/arm, orientation classifier `_classify_orientation`, the firmware
   multi-tap counter + commit handler (single/double/triple → **detect + log,
   no mode bound**), chip-tap handlers, `gesture_mode_recent_activity` (HR
-  workout-suppression guard), and the bio-acoustic tap path. `GestureMode` =
-  `MODE_IDLE` + `MODE_GESTURE_AMBIENT` (reserved). FSM skeleton stays so a future
-  mode is a small add.
+  workout-suppression guard). `GestureMode` = `MODE_IDLE` + `MODE_GESTURE_AMBIENT`
+  (reserved). FSM skeleton stays so a future mode is a small add.
+- `src/bio_acoustic.{h,cpp}` — tap bio-acoustic DSP (extracted from the FSM hub
+  2026-06-17): chip-FIFO capture → FFT (CMSIS `arm_math`) → band energies →
+  hard-surface classification, on its own worker thread. Interface:
+  `bio_acoustic_init()` / `bio_acoustic_on_tap()` / `bio_acoustic_last_was_hard_surface()`.
+  Reads the IMU via `power_ctrl`'s `lsm6dsl_fifo_*`; no dependency back into the FSM.
 - `src/orientation.{h,cpp}` — Mahony complementary filter → pitch/roll
   (gravity-locked, drift-free), yaw (gyro-only, drifts), `at_rest` (ZUPT),
   gyro-bias (ZARU), fused gravity vector. Shared IMU foundation (pose detection,
