@@ -12,4 +12,6 @@ target_sources(app PRIVATE
     src/bio_acoustic.cpp
     src/gesture_poses.cpp
     src/orientation.cpp
+    src/mic_vad.cpp
+    src/mic_vad_rms.cpp
 )
