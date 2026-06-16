@@ -20,6 +20,7 @@
 #include "gesture_mode.h"
 #include "bio_acoustic.h"
 #include "orientation.h"
+#include "mic_vad.h"
 #include <zephyr/settings/settings.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -599,6 +600,11 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // re-pairs (or was "Forgotten") then mismatches keys.  After
             // 'u', also Forget the device on the host, then re-pair.
             pending_cmd = 'u';
+        } else if (c == 'm' || c == 'M') {
+            // PDM mic feasibility probe toggle.  Starts/stops the mic_vad
+            // capture thread; while running, logs [MIC] rms/floor/ratio at
+            // ~10 Hz so you can see the noise floor and voice-onset response.
+            pending_cmd = 'm';
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -632,6 +638,7 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'z'=gyro bias trace (hold still 60s -> bias/noise per axis)");
     LOG_INF("  'v'=pose trace (hold a pose 30s -> gravity/shadow/pitch/roll)");
     LOG_INF("  'u'=clear ALL BLE bonds (then Forget on host + re-pair)");
+    LOG_INF("  'm'=toggle PDM mic feasibility probe ([MIC] rms log)");
 
     while (1) {
         uint8_t cmd = pending_cmd;
@@ -761,6 +768,12 @@ void reset_thread_entry(void *, void *, void *) {
             // arms it; acq must be running (it is, always-on).  60 s at
             // 100 Hz = 6000 samples.
             orientation_bias_trace_start(6000);
+        } else if (cmd == 'm') {
+            pending_cmd = 0;
+            static bool mic_on = false;
+            mic_on = !mic_on;
+            if (mic_on) mic_vad_start(); else mic_vad_stop();
+            LOG_INF("Mic probe %s", mic_on ? "ON ([MIC] rms logging)" : "OFF");
         }
         k_sleep(K_MSEC(50));
     }
@@ -1385,6 +1398,10 @@ int main(void) {
     // AFTER tap engine enable so the FIFO ODR override correctly
     // supersedes the tap engine's 416 Hz default.
     bio_acoustic_init();
+
+    // PDM mic feasibility probe (Task A).  Initialises the PDM device
+    // and the capture thread (idle until 'm' serial command starts it).
+    mic_vad_init();
 
     // From this point on, the power state machine thread (started
     // automatically by K_THREAD_DEFINE) drives all sensor power and
