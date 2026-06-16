@@ -27,7 +27,14 @@ LOG_MODULE_REGISTER(mic_vad, LOG_LEVEL_INF);
 
 K_MEM_SLAB_DEFINE(mic_slab, MIC_BLOCK_BYTES, MIC_SLAB_BLOCKS, 4);
 
-static const struct device *mic_dev;
+/* Resolved at COMPILE time, not in mic_vad_init().  The capture thread is
+ * K_THREAD_DEFINE'd (runnable at boot) and main() yields (bt_enable, settings,
+ * ...) before it reaches mic_vad_init() late in startup -- so a runtime
+ * assignment would race: the thread could read a NULL mic_dev, log "not ready",
+ * and exit permanently.  DEVICE_DT_GET is a static initializer; the PDM driver
+ * inits at POST_KERNEL (before any app thread runs), so the pointer is valid
+ * and the device is ready by the time the thread checks. */
+static const struct device *mic_dev = DEVICE_DT_GET(DT_NODELABEL(pdm0));
 static atomic_t mic_running = ATOMIC_INIT(0);
 
 static struct dmic_cfg make_cfg(struct pcm_stream_cfg *stream)
@@ -108,7 +115,8 @@ K_THREAD_DEFINE(mic_thread_id, 2048, mic_thread, NULL, NULL, NULL, 6, 0, 0);
 
 void mic_vad_init(void)
 {
-    mic_dev = DEVICE_DT_GET(DT_NODELABEL(pdm0));
+    /* mic_dev is resolved at compile time (see its definition).  This call just
+     * reports readiness at boot; the probe stays idle until mic_vad_start(). */
     LOG_INF("[MIC] init (pdm0 %s)", device_is_ready(mic_dev) ? "ready" : "NOT READY");
 }
 
