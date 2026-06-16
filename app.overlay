@@ -21,12 +21,28 @@
     pinctrl-0 = <&i2c1_default>;
     pinctrl-1 = <&i2c1_sleep>;
     pinctrl-names = "default", "sleep";
-    clock-frequency = <I2C_BITRATE_FAST>; 
+    clock-frequency = <I2C_BITRATE_FAST>;
 
     max30102: max30102@57 {
         compatible = "maxim,max30101";
         reg = <0x57>;
         label = "MAX30102";
     };
+};
+
+/* Onboard PDM mic (MSM261D3526H1CPM): power regulator on P1.10 + enable pdm0.
+ * Board DTS already provides the pdm0 node + pdm0_default/sleep pinctrl. */
+/ {
+    msm261d3526hicpm-c-en {
+        compatible = "regulator-fixed";
+        regulator-name = "MSM261D3526HICPM-C-EN";
+        enable-gpios = <&gpio1 10 (NRF_GPIO_DRIVE_S0H1 | GPIO_ACTIVE_HIGH)>;
+        regulator-boot-on;
+    };
+};
+
+&pdm0 {
+    status = "okay";
+    clock-source = "PCLK32M";
 };
 
