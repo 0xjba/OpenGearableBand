@@ -10,6 +10,7 @@
 #include <limits.h>
 
 #include "bio_acoustic.h"
+#include "mic_vad.h"
 
 LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 
@@ -28,6 +29,12 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 
 /* Atomically published mode; read by other threads. */
 static atomic_t mode_atomic = ATOMIC_INIT(MODE_IDLE);
+
+/* POSE_EAR-held mic gate (dictation). Independent of the tap pose-arm: the mic
+ * stays on while the ear pose is held (not a one-shot arm window). */
+static bool    ear_mic_on;
+static int64_t ear_last_match_ms;   /* last time best pose == POSE_EAR */
+#define EAR_EXIT_DWELL_MS  400      /* pose must be gone this long to exit */
 
 /* Filtered gravity vector (gx/gy/gz_filt): SLOW ~1 s LPF (GRAVITY_LP_ALPHA).
  * Stability IS the feature here -- used by pose classification, the orientation
@@ -198,6 +205,56 @@ bool gesture_mode_recent_activity(void)
     return false;
 }
 
+/* Forward decl: ear_gate_update calls _transition_to which is defined below. */
+static void _transition_to(GestureMode new_mode);
+
+/* Mic gate + dictation entry/exit, driven every accel sample.
+ *
+ * The HOLD is keyed on the GRAVITY pose match alone (best == POSE_EAR), NOT on
+ * at_rest: speaking is motion, so at_rest flickers false while the user talks --
+ * gating the hold on it would drop the mic mid-speech (and exit is defined as the
+ * pose *dropping*, i.e. gravity leaving the cone -- spec §7).  at_rest is required
+ * only on the START edge, so the ambient floor latches during the brief still
+ * moment before the user speaks (spec §6).  Pose held -> mic on; voice-onset while
+ * held -> MODE_DICTATION (detect + log); pose gone > EAR_EXIT_DWELL_MS -> mic off. */
+static void ear_gate_update(pose_id_t best)
+{
+    orientation_state_t ori;
+    orientation_get(&ori);
+    int64_t now = k_uptime_get();
+
+    bool ear_pose = (best == POSE_EAR);   /* gravity match; tolerant of speech motion */
+    if (ear_pose) ear_last_match_ms = now;
+
+    if (!ear_mic_on) {
+        if (ear_pose && ori.at_rest) {    /* at_rest only here: clean floor latch */
+            ear_mic_on = true;
+            mic_vad_start();              /* begins the floor-latch window */
+            LOG_INF("POSE_EAR held + still -> mic ON (listening)");
+        }
+        return;
+    }
+
+    /* Mic is on. Enter dictation on a sustained voiced-onset. */
+    if (mic_vad_voice_onset() &&
+        (GestureMode)atomic_get(&mode_atomic) != MODE_DICTATION) {
+        _transition_to(MODE_DICTATION);   /* logs "Mode transition: ..." */
+        LOG_INF("DICTATION entry: ear-pose + voice");
+    }
+
+    /* Exit when the ear pose has been gone long enough. */
+    if ((now - ear_last_match_ms) > EAR_EXIT_DWELL_MS) {
+        ear_mic_on = false;
+        mic_vad_stop();
+        if ((GestureMode)atomic_get(&mode_atomic) == MODE_DICTATION) {
+            _transition_to(MODE_IDLE);
+            LOG_INF("DICTATION exit: pose dropped");
+        } else {
+            LOG_INF("POSE_EAR released -> mic OFF");
+        }
+    }
+}
+
 /* Update pose FSM based on current gravity vector.  Called every
  * accel sample from gesture_mode_update_accel().
  *
@@ -235,6 +292,8 @@ static void pose_fsm_update(float gx, float gy, float gz)
     if (best == POSE_SURFACE) {
         best = POSE_NONE;
     }
+
+    ear_gate_update(best);
 
     /* NOTE: POSE_EAR is gravity-discriminated (tight measured canonical,
      * cos(25°) tolerance, 2026-06-17).  The raised generic hemisphere is gone;
@@ -295,6 +354,7 @@ static const char *_mode_str(GestureMode m)
     switch (m) {
     case MODE_IDLE:             return "IDLE";
     case MODE_GESTURE_AMBIENT:  return "GESTURE_AMBIENT";
+    case MODE_DICTATION:        return "DICTATION";
     default:                    return "UNKNOWN";
     }
 }
@@ -406,6 +466,8 @@ static void _update_acq_request(void)
 void gesture_mode_init(void)
 {
     atomic_set(&mode_atomic, (atomic_val_t)MODE_IDLE);
+    ear_mic_on = false;
+    ear_last_match_ms = 0;
     gx_filt = 0.0f;
     gy_filt = 0.0f;
     gz_filt = -9.81f;

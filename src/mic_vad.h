@@ -13,8 +13,9 @@ extern "C" {
  * logs per-block RMS + voiced-band (300-3000 Hz) energy as [MIC]. (A.1 adds the
  * latched-floor voice-onset detector on top of this.) */
 void  mic_vad_init(void);
-/* Begin/end a listen session. PRECONDITION on start: mic must be stopped (pair
- * start/stop; do not re-start while running -- it races the capture thread). */
+/* Begin/end a listen session. start() is idempotent (no-op if already running),
+ * so concurrent callers (POSE_EAR gate + bench 'm' probe) can't race the session
+ * state. stop() ends the session; the next start() re-latches a fresh floor. */
 void  mic_vad_start(void);
 void  mic_vad_stop(void);
 

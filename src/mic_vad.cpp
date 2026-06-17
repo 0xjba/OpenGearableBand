@@ -224,13 +224,17 @@ void mic_vad_init(void)
 }
 
 /* Begin a listen session: reset the floor-latch + onset state, then arm the
- * capture thread.  PRECONDITION: the mic must NOT already be running -- callers
- * pair start with mic_vad_stop() and only re-start from the stopped state (the
- * POSE_EAR gate starts on rising edge, stops on pose drop).  Calling start()
- * while running races the mic thread on the non-atomic statics below.  The final
- * atomic_set(mic_running) publishes these writes (SEQ_CST) to the mic thread. */
+ * capture thread.  Idempotent -- a no-op if already running (guard below), so a
+ * second caller (e.g. the bench 'm' command racing the POSE_EAR gate) cannot
+ * re-init state under the running mic thread.  The final atomic_set(mic_running)
+ * publishes the reset writes (SEQ_CST) to the mic thread. */
 void mic_vad_start(void)
 {
+    /* Idempotent: if already running, do NOT re-init the session state -- that
+     * would race the capture thread on the non-atomic statics below. This makes
+     * the precondition self-enforcing when two callers (the POSE_EAR gate and the
+     * bench 'm' command) could both start. */
+    if (atomic_get(&mic_running)) return;
     atomic_set(&mic_onset, 0);
     mic_floor_latched = false;
     mic_floor_vem = 0.0f;
