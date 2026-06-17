@@ -87,18 +87,33 @@ already gates the expensive part (capture); the regulator toggle is a noted powe
 ## 6. VAD inside the window (mic_vad extension)
 
 - **Spectral feature:** per ~20 ms PCM block, Hann-window + zero-pad the 320 samples to a 512-pt
-  real FFT (CMSIS `arm_rfft`); sum bin energy in **300–3000 Hz** (the voiced band) → `voiced_energy`.
-  Bin width 16000/512 ≈ 31.25 Hz, so the band ≈ bins 10–96.
-- **Latched floor:** when POSE_EAR first becomes held + `at_rest`, sample `voiced_energy` over a
-  short silent window (~300–500 ms) and freeze it as `voiced_floor`. Do NOT update it live while a
-  candidate voice segment is active.
-- **Onset rule:** `voiced_energy ≥ max(ABS_MIN, K × voiced_floor)` sustained for `ONSET_DWELL_MS`
-  (~150 ms, i.e. consecutive blocks) → voice-onset. The dwell rejects single-block mechanical pops.
-- **Interface:** add `bool mic_vad_voice_onset(void)` (latches true on a sustained onset, cleared by
-  the FSM on consume/exit). Keep `mic_vad_block_rms`. Extend the `[MIC]` log to print `voiced_energy`,
-  `voiced_floor`, and the ratio (so step-1 measurement can set the thresholds — §9).
-- Thresholds `ABS_MIN`, `K`, `ONSET_DWELL_MS`, floor-sample window — all in `gesture_thresholds.h`,
-  seeded from the step-1 spectral measurement, tagged `[USER]`.
+  real FFT (CMSIS `arm_rfft`); sum |X|² in **300–3000 Hz** (the voiced band) → `voiced_energy`,
+  reported scaled to millions as **`veM`** (raw |X|² overflows an int log). Bin width 16000/512 ≈
+  31.25 Hz, so the band ≈ bins 10–96.
+- **Measured discriminator (T2, 2026-06-17 — supersedes the original plan):** on the prototype
+  skin-mount, `veM` separates speech (syllable peaks 3000–21000) from ambient (≤ ~1030) by ~3–20×.
+  The voiced/total **`frac`** was ALSO measured and **rejected**: the face-down-in-skin mic low-passes
+  ambient so the fan is itself voiced-band-dominated → `frac` ambient (400–800) overlaps speech.
+  `frac` is still logged for diagnostics but is NOT the discriminator.
+- **Adaptive latched floor (universality):** ambient level varies hugely per environment (fan / silent
+  AC / traffic / outdoor — user requirement). So do NOT use a fixed absolute threshold. When POSE_EAR
+  first becomes held + `at_rest`, sample `veM` over a short silent window (`VAD_FLOOR_SAMPLE_MS` ≈
+  500 ms) and freeze it as `veM_floor`. The threshold is `max(VAD_VEM_ABS_MIN, VAD_K × veM_floor)` —
+  the ratio term re-adapts to wherever the user is, each pose entry. Do NOT update the floor live while
+  a candidate voice segment is active (avoids floor-creep).
+- **Onset rule = M-of-N count-in-window, NOT consecutive-dwell.** Speech `veM` is *bursty* (spikes per
+  syllable, drops to ambient between syllables), so a consecutive-block dwell falls in the gaps. A
+  block is "hot" if `veM ≥ threshold`; onset fires when **≥ `VAD_ONSET_HITS` hot blocks occur within
+  `VAD_ONSET_WINDOW_MS`** (≈ 3 hits / 700 ms). This catches bursty speech and rejects the isolated
+  single-block ambient spike.
+- **Genuine-SNR-limit honesty:** if ambient is so loud/broadband that speech cannot clear
+  `VAD_K × floor` (heavy traffic/outdoor), energy VAD physically cannot separate — that is the
+  documented **Cobra Tier-2** trigger (§3), not a reason to inflate the constants.
+- **Interface:** add `bool mic_vad_voice_onset(void)` (latches true on onset, cleared on read by the
+  FSM). Keep `mic_vad_block_rms`. The `[MIC]` log keeps `veM` + `frac` for diagnostics.
+- Thresholds `VAD_VEM_ABS_MIN`, `VAD_K`, `VAD_ONSET_HITS`, `VAD_ONSET_WINDOW_MS`, `VAD_FLOOR_SAMPLE_MS`
+  — all in `gesture_thresholds.h`, **tagged `[HOUSING]`** (mount-dependent; provisional values from the
+  skin-mount T2 measurement, expected to move when the housing is built — re-tune then).
 
 ## 7. The FSM (gesture_mode)
 
