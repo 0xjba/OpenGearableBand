@@ -236,15 +236,12 @@ static void pose_fsm_update(float gx, float gy, float gz)
         best = POSE_NONE;
     }
 
-    /* NOTE: do NOT re-add a roll/gz-based AIR_MOUSE<->DICTATION split here.
-     * A held max-right air-mouse is gravity-identical to dictation (measured
-     * 2026-06-11); pose-only discrimination is impossible.  The confirming
-     * GESTURE decides the mode (see 2026-06-11-pose-trigger-realignment spec
-     * + decision_dictation_voice_gated_entry).  The raised hemisphere arms
-     * as POSE_AIR_MOUSE; dictation entry is future (clench + voice).
-     * Pose logic operates on the gravity-LPF components (gx/gy/gz) only --
-     * NEVER orientation_get().roll_deg (the quaternion Euler roll lags ~10
-     * deg in motion; it is for the cursor/logging, not pose decisions). */
+    /* NOTE: POSE_EAR is gravity-discriminated (tight measured canonical,
+     * cos(25°) tolerance, 2026-06-17).  The raised generic hemisphere is gone;
+     * only the measured ear position arms.  Pose logic uses gravity-LPF
+     * components (gx/gy/gz) only -- NEVER orientation_get().roll_deg (the
+     * quaternion Euler roll lags ~10 deg in motion; it is for logging, not
+     * pose decisions). */
 
     if (pose_armed_state != POSE_NONE) {
         /* Already armed.  If the user is still in the SAME pose,
@@ -769,10 +766,6 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
      * but routes to NO mode after the air-mouse extraction -- ready to
      * wire a future mode here.  Pose + tap detection stays fully alive. */
     switch (armed) {
-    case POSE_AIR_MOUSE:
-        LOG_INF("GESTURE: raised-pose + cadenced double-tap (no mode bound)");
-        break;
-
     case POSE_SURFACE:
         /* SURFACE MODE was dropped (roadmap 2026-06-13).  The pose classifier +
          * hard-surface spectral detector are KEPT as useful logic, but a SURFACE
@@ -784,7 +777,11 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
         break;
 
     default:
-        LOG_INF("Mode entry ABORT: unknown armed pose %d", (int)armed);
+        /* No tap-bound mode for this pose (POSE_EAR enters via voice, not taps).
+         * The tap counter/cadence/commit machinery is kept intact + exercised,
+         * unbound, ready to wire a future tap-based mode here. */
+        LOG_INF("GESTURE: %s + cadenced double-tap (no tap-bound mode)",
+                pose_name(armed));
         break;
     }
 

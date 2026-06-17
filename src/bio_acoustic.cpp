@@ -35,8 +35,9 @@ LOG_MODULE_REGISTER(bio_acoustic, LOG_LEVEL_INF);
  *     real data, the classification will feed mode-routing decisions.
  *
  * For v0 testing, the classifier output does NOT change FSM behavior
- * -- it only logs.  The existing multi-tap counter continues to drive
- * AIR_MOUSE / SURFACE entry as before.  This lets you validate the
+ * -- it only logs.  The multi-tap counter runs as unbound scaffolding
+ * (POSE_EAR enters via voice, POSE_SURFACE is dormant) -- no tap-bound
+ * mode after the air-mouse extraction.  This lets you validate the
  * classifier against ground truth (you know which gesture you did)
  * without breaking working paths.
  */

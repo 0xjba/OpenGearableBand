@@ -22,43 +22,12 @@ static const canonical_pose_t k_canonical_poses[POSE_COUNT] = {
      * normalized here to a unit vector (pose_score normalizes the
      * OBSERVED vector but assumes the canonical is already unit). */
 
-    /* POSE_AIR_MOUSE: the RAISED-arm hemisphere.  Re-measured
-     * 2026-06-10 across straight + max forward/left/right leans:
-     *   straight [0.995, 0.008, -0.098]
-     *   forward  [0.861, 0.189, +0.472]
-     *   left     [0.919, -0.292, 0.265]
-     *   right    [0.906, +0.409, -0.113]
-     * All are +X-dominant (gravity ~along the forearm axis) with the
-     * perpendicular (Y,Z) components spreading up to ~36° as the wrist
-     * leans.  Centred on the pure forearm axis [1,0,0].  Tolerance
-     * 0.45 -> arms within ~43.5° of the axis at the 0.5 score
-     * threshold.  Widened from 0.60 (37°) on 2026-06-10 because
-     * INCLINED raises (high-Y, ~38° off-axis -- "wrist not straight
-     * up") were clipped just outside the old 37° boundary and failed
-     * to arm.  43.5° catches them while still rejecting NEUTRAL
-     * (~48-54° off-axis) and SURFACE (~80° away).
-     *
-     * IMPORTANT: this pose is "raised arm", which is air-mouse AND
-     * dictation BOTH.  Gravity CANNOT separate them -- measured proof
-     * 2026-06-10: an air-mouse max-right-lean [0.906,0.409,-0.113] is
-     * only ~4° from a dictation pose [0.905,0.421,-0.045] (leaning the
-     * raised hand right rolls the band the same way supinating for
-     * dictation does -- same axis, same gravity).  So the MODE is
-     * decided by the confirming gesture, not the pose: cadenced
-     * double-tap -> AIR_MOUSE; voice -> DICTATION (see
-     * decision_dictation_voice_gated_entry memory).  DICTATION is
-     * disabled below until voice detection exists. */
-    { POSE_AIR_MOUSE, POSE_AIRMOUSE_GX, POSE_AIRMOUSE_GY, POSE_AIRMOUSE_GZ, POSE_AIRMOUSE_TOL, "AIR_MOUSE" },
-
-    /* POSE_DICTATION: DISABLED (tolerance 2.0 => pose_score always 0,
-     * never matches).  Gravity cannot distinguish dictation from an
-     * air-mouse raise (see AIR_MOUSE note above -- ~4° apart).  The
-     * raised pose is shared; dictation will be split out at the
-     * GESTURE stage via voice presence (band at the lips), not by a
-     * separate gravity pose.  Re-enable as a real discriminator only
-     * when voice-gated entry is built (decision_dictation_voice_gated_
-     * entry memory). */
-    { POSE_DICTATION, POSE_DICTATION_GX, POSE_DICTATION_GY, POSE_DICTATION_GZ, POSE_DICTATION_TOL, "DICTATION" },
+    /* POSE_EAR: raise-to-ear (phone-call) pose. Canonical = the 2026-06-17
+     * measured held-ear gravity, normalized (POSE_EAR_* in gesture_thresholds.h).
+     * Tight tolerance so it does NOT match a generic forward raise (the old broad
+     * AIR_MOUSE cone was removed). The MODE it enters (DICTATION) is gated by
+     * voice-onset in gesture_mode, not by the pose alone. */
+    { POSE_EAR,     POSE_EAR_GX, POSE_EAR_GY, POSE_EAR_GZ, POSE_EAR_TOL, "EAR" },
 
     /* POSE_SURFACE: wrist horizontal on desk, band volar facing up.
      * Gravity along band +Z with a slight +X lean (measured centre

@@ -11,12 +11,10 @@ extern "C" {
  * matched. */
 typedef enum {
     POSE_NONE = 0,
-    POSE_AIR_MOUSE,     /* forearm raised forward, band volar facing
-                         * screen (away from user's face) */
-    POSE_DICTATION,     /* forearm raised + rotated, band volar facing
-                         * user's mouth */
+    POSE_EAR,           /* raise-to-ear (phone-call) pose; enters MODE_DICTATION
+                         * via voice-onset (see gesture_mode). */
     POSE_SURFACE,       /* wrist horizontal, band volar facing up
-                         * (palm-down rest) */
+                         * (palm-down rest). Dormant scaffolding. */
     POSE_COUNT
 } pose_id_t;
 

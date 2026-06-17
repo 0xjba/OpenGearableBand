@@ -46,26 +46,16 @@
  *  housing, and users pose differently; re-measure all of these.
  */
 
-/* AIR_MOUSE = the raised hemisphere (forearm axis).  Wide cone (tol 0.45 →
- * arms within ~43.5°) to catch inclined raises while rejecting NEUTRAL
- * (~48°+) and SURFACE (~80°).  The confirming gesture (double-tap) decides
- * the mode; roll-based splitting was removed 2026-06-11. */
-#define POSE_AIRMOUSE_GX        1.0f
-#define POSE_AIRMOUSE_GY        0.0f
-#define POSE_AIRMOUSE_GZ        0.0f
-#define POSE_AIRMOUSE_TOL       0.45f
-
-/* DICTATION canonical is DISABLED for cosine matching (tol 2.0 → never
- * matches; cos can't exceed 1).  It was previously reached via a roll-based
- * split from POSE_AIR_MOUSE; that mechanism was removed 2026-06-11 (a held
- * max-right air-mouse is gravity-identical to dictation, so pose-only
- * discrimination is impossible — the confirming gesture decides the mode).
- * Values kept for future use when dictation entry is defined (clench + voice).
- * See 2026-06-11-pose-trigger-realignment spec. */
-#define POSE_DICTATION_GX       0.92f
-#define POSE_DICTATION_GY       0.39f
-#define POSE_DICTATION_GZ       0.03f
-#define POSE_DICTATION_TOL      2.0f
+/* POSE_EAR [USER][HOUSING]: phone-call/raise-to-ear pose. Measured 2026-06-17
+ * (20 s held trace, g=(8.2,-4.6,2.6) m/s^2; normalized below). Dominant gx
+ * separates it from a generic raise. TOL is PROVISIONAL -- tighten/loosen in the
+ * HW verification step so it arms ONLY when settled at the ear, not mid-raise. */
+/* Unit vector = (8.2,-4.6,2.6)/9.755; 4-dp so |canonical|~1.0 (pose_score
+ * assumes a unit canonical). */
+#define POSE_EAR_GX             0.8406f
+#define POSE_EAR_GY             (-0.4716f)
+#define POSE_EAR_GZ             0.2665f
+#define POSE_EAR_TOL            0.906f   /* cos(25 deg); PROVISIONAL, verify on HW */
 
 /* SURFACE = wrist flat on desk, volar up.  Z-dominant, slight +X lean.
  * Tighter cone (tol 0.94 ≈ ±20°) to reduce lap false positives. */
