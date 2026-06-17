@@ -33,6 +33,7 @@ static atomic_t mode_atomic = ATOMIC_INIT(MODE_IDLE);
  * stays on while the ear pose is held (not a one-shot arm window). */
 static bool    ear_mic_on;
 static bool    ear_voice_holding;   /* pose out of cone, session held by ongoing voice */
+static bool    ear_idle_suppressed; /* idled out while posed; needs a re-raise to resume */
 static int64_t ear_last_match_ms;   /* last time best pose == POSE_EAR */
 
 /* Filtered gravity vector (gx/gy/gz_filt): SLOW ~1 s LPF (GRAVITY_LP_ALPHA).
@@ -184,15 +185,34 @@ static void _transition_to(GestureMode new_mode);
  * that floor. Pose present -> mic on; voice-onset while present ->
  * MODE_DICTATION (detect + log); pose gone > EAR_EXIT_DWELL_MS with no voice
  * -> mic off. */
+/* Helper: end the listen session (mic off, leave dictation). */
+static void ear_session_end(const char *why)
+{
+    ear_mic_on = false;
+    ear_voice_holding = false;
+    mic_vad_stop();
+    if ((GestureMode)atomic_get(&mode_atomic) == MODE_DICTATION) {
+        _transition_to(MODE_IDLE);
+        LOG_INF("DICTATION exit: %s", why);
+    } else {
+        LOG_INF("mic OFF: %s", why);
+    }
+}
+
 static void ear_gate_update(pose_id_t best)
 {
     int64_t now = k_uptime_get();
 
     bool ear_pose = (best == POSE_EAR);   /* gravity match; motion-tolerant */
     if (ear_pose) ear_last_match_ms = now;
+    bool pose_stale = (now - ear_last_match_ms) > EAR_EXIT_DWELL_MS;
 
     if (!ear_mic_on) {
-        if (ear_pose) {
+        /* After a silence timeout the pose is usually still held; require the
+         * user to lower the arm (pose truly gone) before the mic re-arms, so it
+         * doesn't immediately restart and loop. */
+        if (pose_stale) ear_idle_suppressed = false;
+        if (ear_pose && !ear_idle_suppressed) {
             ear_mic_on = true;
             ear_voice_holding = false;
             mic_vad_start();              /* begins the floor-latch window */
@@ -212,12 +232,21 @@ static void ear_gate_update(pose_id_t best)
         LOG_INF("DICTATION entry: ear-pose + voice");
     }
 
-    /* Exit only when the pose has been gone AND near-field voice has stopped.
-     * Voice-continuity holds the session through a comfortable lean (pose out of
-     * the cone) while the user keeps speaking AT the near-field level. This is
-     * self-limiting: lowering the arm makes voice far-field/quiet (not hot), so
-     * it cannot hold a session when the wrist isn't actually near the mouth. */
-    bool pose_stale = (now - ear_last_match_ms) > EAR_EXIT_DWELL_MS;
+    /* Session-silence timeout: no near-field voice for VAD_SESSION_SILENCE_MS
+     * releases the session EVEN IF the pose is still held (so a forgotten hold
+     * doesn't listen forever). Comfortably long so conversational pauses don't
+     * trip it; requires a re-raise to resume (ear_idle_suppressed). */
+    if (mic_vad_idle_timed_out()) {
+        ear_idle_suppressed = true;
+        ear_session_end("silence timeout (re-raise to resume)");
+        return;
+    }
+
+    /* Otherwise exit only when the pose has been gone AND near-field voice has
+     * stopped. Voice-continuity holds the session through a comfortable lean
+     * (pose out of the cone) while the user keeps speaking AT the near-field
+     * level -- self-limiting: lowering the arm makes voice far-field/quiet (not
+     * hot), so it can't hold a session when the wrist isn't near the mouth. */
     if (!pose_stale) {
         ear_voice_holding = false;          /* pose back inside the cone */
     } else if (mic_vad_voice_active()) {
@@ -226,15 +255,7 @@ static void ear_gate_update(pose_id_t best)
             LOG_INF("POSE_EAR out of cone but voice continues -> holding (lean)");
         }
     } else {
-        ear_mic_on = false;
-        ear_voice_holding = false;
-        mic_vad_stop();
-        if ((GestureMode)atomic_get(&mode_atomic) == MODE_DICTATION) {
-            _transition_to(MODE_IDLE);
-            LOG_INF("DICTATION exit: pose dropped + voice stopped");
-        } else {
-            LOG_INF("POSE_EAR released -> mic OFF");
-        }
+        ear_session_end("pose dropped + voice stopped");
     }
 }
 
@@ -412,6 +433,7 @@ void gesture_mode_init(void)
     atomic_set(&mode_atomic, (atomic_val_t)MODE_IDLE);
     ear_mic_on = false;
     ear_voice_holding = false;
+    ear_idle_suppressed = false;
     ear_last_match_ms = 0;
     gx_filt = 0.0f;
     gy_filt = 0.0f;

@@ -87,6 +87,7 @@ static const struct device *mic_dev = DEVICE_DT_GET(DT_NODELABEL(pdm0));
 static atomic_t mic_running = ATOMIC_INIT(0);
 static atomic_t mic_onset = ATOMIC_INIT(0);   /* latched voiced-onset, read-and-clear */
 static atomic_t mic_voice_active = ATOMIC_INIT(0); /* near-field voice within VAD_VOICE_HOLD_MS */
+static atomic_t mic_idle = ATOMIC_INIT(0);    /* no voice for VAD_SESSION_SILENCE_MS */
 
 /* Floor-latch + M-of-N onset state, owned by the single mic thread. */
 static bool    mic_floor_latched;
@@ -203,6 +204,14 @@ static void mic_thread(void *, void *, void *)
                 bool voice_recent = (mic_last_hot_ms != 0) &&
                                     ((now - mic_last_hot_ms) <= VAD_VOICE_HOLD_MS);
                 atomic_set(&mic_voice_active, voice_recent ? 1 : 0);
+
+                /* Session-silence timeout: time since the later of session start
+                 * or last voice. Released even with the pose held (the gate
+                 * decides what to do). */
+                int64_t ref = (mic_last_hot_ms != 0) ? mic_last_hot_ms
+                                                     : mic_listen_start_ms;
+                atomic_set(&mic_idle,
+                           ((now - ref) >= VAD_SESSION_SILENCE_MS) ? 1 : 0);
             }
 
             if ((++log_ctr % 5) == 0) {   /* ~10 Hz */
@@ -248,6 +257,7 @@ void mic_vad_start(void)
     if (atomic_get(&mic_running)) return;
     atomic_set(&mic_onset, 0);
     atomic_set(&mic_voice_active, 0);
+    atomic_set(&mic_idle, 0);
     mic_last_hot_ms = 0;
     mic_floor_latched = false;
     mic_floor_vem = 0.0f;
@@ -271,4 +281,9 @@ bool mic_vad_voice_onset(void)
 bool mic_vad_voice_active(void)
 {
     return atomic_get(&mic_voice_active) != 0;   /* non-clearing: ongoing state */
+}
+
+bool mic_vad_idle_timed_out(void)
+{
+    return atomic_get(&mic_idle) != 0;   /* no voice for VAD_SESSION_SILENCE_MS */
 }

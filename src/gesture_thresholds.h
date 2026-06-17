@@ -196,6 +196,12 @@
  * occurred for this long. Covers natural speech gaps (breaths/sentences).
  * Self-limiting: arm-down -> far-field/quiet voice -> not hot -> releases. */
 #define VAD_VOICE_HOLD_MS    1500
+/* Session-silence timeout [USER]: no near-field voice for this long releases the
+ * dictation session even if POSE_EAR is still held (a forgotten hold shouldn't
+ * listen forever). Comfortably long so conversational/thinking pauses don't trip
+ * it; measured from session start or last voice, whichever is later. Re-raise to
+ * resume. Tune up if long pauses cut you off, down to save power. */
+#define VAD_SESSION_SILENCE_MS  15000
 
 /*
  * ============================================================================

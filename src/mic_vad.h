@@ -28,6 +28,10 @@ bool mic_vad_voice_onset(void);
  * session through a lean (pose out of cone) while the user keeps speaking. */
 bool mic_vad_voice_active(void);
 
+/* True once there's been no near-field voice for VAD_SESSION_SILENCE_MS (measured
+ * from session start or last voice). Used to release a forgotten held session. */
+bool mic_vad_idle_timed_out(void);
+
 /* Pure: RMS of a 16-bit PCM block. Exposed for host unit test. */
 float mic_vad_block_rms(const int16_t *samples, size_t n);
 
