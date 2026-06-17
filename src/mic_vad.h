@@ -13,8 +13,14 @@ extern "C" {
  * logs per-block RMS + voiced-band (300-3000 Hz) energy as [MIC]. (A.1 adds the
  * latched-floor voice-onset detector on top of this.) */
 void  mic_vad_init(void);
+/* Begin/end a listen session. PRECONDITION on start: mic must be stopped (pair
+ * start/stop; do not re-start while running -- it races the capture thread). */
 void  mic_vad_start(void);
 void  mic_vad_stop(void);
+
+/* True once a voiced-onset has been detected since the last mic_vad_start().
+ * Reading it CLEARS the latch (one-shot per session). */
+bool mic_vad_voice_onset(void);
 
 /* Pure: RMS of a 16-bit PCM block. Exposed for host unit test. */
 float mic_vad_block_rms(const int16_t *samples, size_t n);

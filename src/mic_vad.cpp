@@ -13,6 +13,7 @@
  * this TU is Zephyr-only.
  */
 #include "mic_vad.h"
+#include "gesture_thresholds.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/audio/dmic.h>
@@ -84,6 +85,17 @@ K_MEM_SLAB_DEFINE(mic_slab, MIC_BLOCK_BYTES, MIC_SLAB_BLOCKS, 4);
  * and the device is ready by the time the thread checks. */
 static const struct device *mic_dev = DEVICE_DT_GET(DT_NODELABEL(pdm0));
 static atomic_t mic_running = ATOMIC_INIT(0);
+static atomic_t mic_onset = ATOMIC_INIT(0);   /* latched voiced-onset, read-and-clear */
+
+/* Floor-latch + M-of-N onset state, owned by the single mic thread. */
+static bool    mic_floor_latched;
+static float   mic_floor_vem;          /* frozen ambient floor (veM units) */
+static float   mic_floor_sum;          /* accumulator during the latch window */
+static int     mic_floor_n;
+static int64_t mic_listen_start_ms;
+static int64_t mic_hot_ts[VAD_ONSET_HITS];   /* ring of recent hot-block times */
+static int     mic_hot_idx;
+static int     mic_hot_count;
 
 static struct dmic_cfg make_cfg(struct pcm_stream_cfg *stream)
 {
@@ -147,15 +159,45 @@ static void mic_thread(void *, void *, void *)
             mic_spectral(pcm, nsamp, &ve, &te);
             k_mem_slab_free(&mic_slab, buf);   /* return the block */
 
-            /* Display: scale voiced energy to millions (raw |X|^2 overflows an
-             * int log cast), plus the loudness-invariant voiced/total fraction
-             * in per-mille (0-1000). These are the two candidate discriminators
-             * being measured before the onset threshold is set. */
-            int veM  = (int)(ve / 1.0e6f);
-            int frac = (te > 1.0f) ? (int)(1000.0f * ve / te) : 0;
+            float veM = ve / 1.0e6f;                       /* voiced energy, millions */
+            int   frac = (te > 1.0f) ? (int)(1000.0f * ve / te) : 0;  /* diagnostic only */
+            int64_t now = k_uptime_get();
+
+            if (!mic_floor_latched) {
+                /* Mean ambient veM over the silent window, then freeze it.
+                 * Assumption: the user is silent during this window (POSE_EAR
+                 * requires at_rest + a hold before speaking); speaking now
+                 * inflates the floor and lowers sensitivity for the session. */
+                mic_floor_sum += veM;
+                mic_floor_n++;
+                if ((now - mic_listen_start_ms) >= VAD_FLOOR_SAMPLE_MS) {
+                    /* mic_floor_n >= 1 here (incremented above); guard is defensive. */
+                    mic_floor_vem = (mic_floor_n > 0) ? (mic_floor_sum / mic_floor_n) : veM;
+                    mic_floor_latched = true;
+                    LOG_INF("[MIC] floor latched veM=%d", (int)mic_floor_vem);
+                }
+            } else {
+                float thresh = VAD_K * mic_floor_vem;
+                if (thresh < VAD_VEM_ABS_MIN) thresh = VAD_VEM_ABS_MIN;  /* quiet-room backstop */
+                if (veM >= thresh) {                       /* "hot" block */
+                    mic_hot_ts[mic_hot_idx] = now;
+                    mic_hot_idx = (mic_hot_idx + 1) % VAD_ONSET_HITS;
+                    if (mic_hot_count < VAD_ONSET_HITS) mic_hot_count++;
+                    /* After advancing, mic_hot_ts[mic_hot_idx] is the oldest of the
+                     * last VAD_ONSET_HITS hot blocks. >= HITS hot within the window
+                     * (gaps allowed -- speech veM is bursty) => onset. */
+                    if (mic_hot_count == VAD_ONSET_HITS &&
+                        (now - mic_hot_ts[mic_hot_idx]) <= VAD_ONSET_WINDOW_MS) {
+                        atomic_set(&mic_onset, 1);
+                        mic_hot_count = 0;                 /* re-arm; don't spam */
+                    }
+                }
+            }
 
             if ((++log_ctr % 5) == 0) {   /* ~10 Hz */
-                LOG_INF("[MIC] rms=%d veM=%d frac=%d", (int)rms, veM, frac);
+                LOG_INF("[MIC] rms=%d veM=%d frac=%d floor=%d lat=%d",
+                        (int)rms, (int)veM, frac, (int)mic_floor_vem,
+                        (int)mic_floor_latched);
             }
         }
         dmic_trigger(mic_dev, DMIC_TRIGGER_STOP);
@@ -181,5 +223,30 @@ void mic_vad_init(void)
     }
 }
 
-void mic_vad_start(void) { atomic_set(&mic_running, 1); }
+/* Begin a listen session: reset the floor-latch + onset state, then arm the
+ * capture thread.  PRECONDITION: the mic must NOT already be running -- callers
+ * pair start with mic_vad_stop() and only re-start from the stopped state (the
+ * POSE_EAR gate starts on rising edge, stops on pose drop).  Calling start()
+ * while running races the mic thread on the non-atomic statics below.  The final
+ * atomic_set(mic_running) publishes these writes (SEQ_CST) to the mic thread. */
+void mic_vad_start(void)
+{
+    atomic_set(&mic_onset, 0);
+    mic_floor_latched = false;
+    mic_floor_vem = 0.0f;
+    mic_floor_sum = 0.0f;
+    mic_floor_n   = 0;
+    /* Set before the thread wakes + the driver starts (~50 ms poll + trigger
+     * latency later), so the effective floor window is slightly < SAMPLE_MS. */
+    mic_listen_start_ms = k_uptime_get();
+    mic_hot_idx   = 0;
+    mic_hot_count = 0;
+    atomic_set(&mic_running, 1);
+}
+
 void mic_vad_stop(void)  { atomic_set(&mic_running, 0); }
+
+bool mic_vad_voice_onset(void)
+{
+    return atomic_set(&mic_onset, 0) != 0;   /* read-and-clear */
+}

@@ -202,6 +202,18 @@
 #define STILL_ACC_RESID                 0.80f
 #define STILL_DWELL_SAMPLES             30     /* 300 ms @100 Hz */
 
+/* --- Voice-onset VAD (dictation A.1) [HOUSING] -------------------------------
+ * Mount-dependent (prototype skin-mount); EXPECTED TO MOVE when the housing is
+ * built -- re-tune then. Discriminator (from HW measurement): absolute voiced
+ * energy veM, against a floor latched per pose-entry (adaptive across
+ * environments). Onset is M-of-N (speech veM is bursty, so a consecutive-block
+ * dwell fails). */
+#define VAD_VEM_ABS_MIN      1200.0f  /* veM quiet-room backstop threshold */
+#define VAD_K                8.0f     /* x over the latched ambient floor (adaptive) */
+#define VAD_ONSET_HITS       3        /* hot blocks needed... */
+#define VAD_ONSET_WINDOW_MS  700      /* ...within this window -> onset */
+#define VAD_FLOOR_SAMPLE_MS  500      /* silent window to latch the ambient floor */
+
 /*
  * ============================================================================
  *  CATALOG — tunables that physically live elsewhere (do NOT redefine here)
