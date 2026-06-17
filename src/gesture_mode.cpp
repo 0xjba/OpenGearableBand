@@ -218,7 +218,7 @@ static void _transition_to(GestureMode new_mode);
  * only on the START edge, so the ambient floor latches during the brief still
  * moment before the user speaks (spec §6).  Pose held -> mic on; voice-onset while
  * held -> MODE_DICTATION (detect + log); pose gone > EAR_EXIT_DWELL_MS -> mic off. */
-static void ear_gate_update(pose_id_t best)
+static void ear_gate_update(pose_id_t best, float gx, float gy, float gz)
 {
     orientation_state_t ori;
     orientation_get(&ori);
@@ -228,6 +228,19 @@ static void ear_gate_update(pose_id_t best)
     if (ear_pose) ear_last_match_ms = now;
 
     if (!ear_mic_on) {
+        /* DIAGNOSTIC (temporary): the start edge needs ear_pose AND at_rest. When
+         * the mic is slow to start after raising to the ear, this shows WHICH gate
+         * is blocking -- the live POSE_EAR score (pose flicker?) vs at_rest
+         * (stillness/cold-start?). Logged ~1 Hz while roughly in/near the cone. */
+        float ear_score = pose_score(pose_get_canonical(POSE_EAR), gx, gy, gz);
+        if (ear_score > 0.2f) {
+            static int dbg_ctr = 0;
+            if ((dbg_ctr++ % 100) == 0) {
+                LOG_INF("EAR gate wait: ear_pose=%d at_rest=%d score=%d.%02d",
+                        (int)ear_pose, (int)ori.at_rest,
+                        (int)ear_score, (int)((ear_score - (int)ear_score) * 100));
+            }
+        }
         if (ear_pose && ori.at_rest) {    /* at_rest only here: clean floor latch */
             ear_mic_on = true;
             ear_voice_holding = false;
@@ -312,7 +325,7 @@ static void pose_fsm_update(float gx, float gy, float gz)
         best = POSE_NONE;
     }
 
-    ear_gate_update(best);
+    ear_gate_update(best, gx, gy, gz);
 
     /* NOTE: POSE_EAR is gravity-discriminated (tight measured canonical,
      * cos(25°) tolerance, 2026-06-17).  The raised generic hemisphere is gone;
