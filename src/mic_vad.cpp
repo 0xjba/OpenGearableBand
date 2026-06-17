@@ -44,11 +44,17 @@ static float mic_fft_out[MIC_FFT_N];            /* packed real FFT output */
 static float mic_bin_e[MIC_FFT_N / 2];          /* per-bin energy (re^2+im^2) */
 static bool  mic_fft_ready;                     /* set by a successful FFT init */
 
-/* Voiced-band energy of one int16 block: Hann-window, zero-pad to 512, rFFT,
- * sum |X|^2 over bins MIC_VOICED_LO..MIC_VOICED_HI. */
-static float mic_voiced_energy(const int16_t *s, size_t n)
+/* Spectral features of one int16 block: Hann-window, zero-pad to 512, rFFT,
+ * then *out_voiced = sum |X|^2 over the voiced band (bins 10..96, 300-3000 Hz)
+ * and *out_total = sum |X|^2 over bins 1..255 (DC excluded). The voiced/total
+ * FRACTION is loudness-invariant -- it separates concentrated, harmonic speech
+ * from broadband ambient (e.g. fan) without depending on absolute level. */
+static void mic_spectral(const int16_t *s, size_t n,
+                         float *out_voiced, float *out_total)
 {
-    if (!mic_fft_ready) return 0.0f;   /* init failed; don't read a bad instance */
+    *out_voiced = 0.0f;
+    *out_total  = 0.0f;
+    if (!mic_fft_ready) return;        /* init failed; don't read a bad instance */
     size_t m = (n < MIC_BLOCK_SAMPLES) ? n : MIC_BLOCK_SAMPLES;
     for (size_t i = 0; i < m; i++)         mic_fft_in[i] = (float)s[i] * mic_hann[i];
     for (size_t i = m; i < MIC_FFT_N; i++) mic_fft_in[i] = 0.0f;
@@ -63,7 +69,8 @@ static float mic_voiced_energy(const int16_t *s, size_t n)
         float im = mic_fft_out[2 * k + 1];
         mic_bin_e[k] = re * re + im * im;
     }
-    return mic_vad_band_sum(mic_bin_e, MIC_FFT_N / 2, MIC_VOICED_LO, MIC_VOICED_HI);
+    *out_voiced = mic_vad_band_sum(mic_bin_e, MIC_FFT_N / 2, MIC_VOICED_LO, MIC_VOICED_HI);
+    *out_total  = mic_vad_band_sum(mic_bin_e, MIC_FFT_N / 2, 1, (MIC_FFT_N / 2) - 1);
 }
 
 K_MEM_SLAB_DEFINE(mic_slab, MIC_BLOCK_BYTES, MIC_SLAB_BLOCKS, 4);
@@ -118,8 +125,6 @@ static void mic_thread(void *, void *, void *)
         return;
     }
 
-    float floor_rms = 0.0f;        /* slow ambient-floor estimate */
-    float voiced_floor = 0.0f;
     int   log_ctr = 0;
 
     for (;;) {
@@ -138,18 +143,19 @@ static void mic_thread(void *, void *, void *)
             const int16_t *pcm = (const int16_t *)buf;
             size_t nsamp = size / 2;
             float rms = mic_vad_block_rms(pcm, nsamp);
-            float ve  = mic_voiced_energy(pcm, nsamp);
+            float ve, te;
+            mic_spectral(pcm, nsamp, &ve, &te);
             k_mem_slab_free(&mic_slab, buf);   /* return the block */
 
-            /* Measurement floors (live EMA -- a later task replaces with a latch). */
-            floor_rms    = (floor_rms == 0.0f)    ? rms : (0.98f * floor_rms + 0.02f * rms);
-            voiced_floor = (voiced_floor == 0.0f) ? ve  : (0.98f * voiced_floor + 0.02f * ve);
-            float vratio = (voiced_floor > 1.0f) ? (ve / voiced_floor) : 0.0f;
+            /* Display: scale voiced energy to millions (raw |X|^2 overflows an
+             * int log cast), plus the loudness-invariant voiced/total fraction
+             * in per-mille (0-1000). These are the two candidate discriminators
+             * being measured before the onset threshold is set. */
+            int veM  = (int)(ve / 1.0e6f);
+            int frac = (te > 1.0f) ? (int)(1000.0f * ve / te) : 0;
 
             if ((++log_ctr % 5) == 0) {   /* ~10 Hz */
-                LOG_INF("[MIC] rms=%d voiced=%d vfloor=%d vratio=%d.%02d",
-                        (int)rms, (int)ve, (int)voiced_floor,
-                        (int)vratio, (int)((vratio - (int)vratio) * 100));
+                LOG_INF("[MIC] rms=%d veM=%d frac=%d", (int)rms, veM, frac);
             }
         }
         dmic_trigger(mic_dev, DMIC_TRIGGER_STOP);
