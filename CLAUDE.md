@@ -8,9 +8,11 @@ known gotchas). Keep it current when these stable facts change.
 > to branch **`feature/air-mouse`** (cursor_track / cursor_calib / cursor_pipeline
 > / ble_hid mouse + the AIR_MOUSE mode). **`feature/gesture-foundation`** (this
 > branch) is the clean **gesture-detection + HR foundation**: IMU orientation,
-> pose detection, the chip-tap / multi-tap / bio-acoustic engine, and the
-> power/HR pipeline. Gesture detection currently **detects + logs** ("no mode
-> bound") — it routes to no mode, kept open for future modes (dictation, etc.).
+> pose detection, the chip-tap / multi-tap counter, and the power/HR pipeline.
+> **Dictation entry (sub-project A.1) is built here**: raise-to-ear pose
+> (`POSE_EAR`) + voice-onset on the PDM mic → `MODE_DICTATION` (**detect + log
+> only**; no audio stream/HID yet — those are sub-projects B–E). The multi-tap
+> counter stays as unbound scaffolding for a future tap mode.
 > Resume air-mouse work on `feature/air-mouse` (its design specs are under
 > `docs/superpowers/specs/2026-06-1{5,6}-*`).
 
@@ -20,10 +22,11 @@ known gotchas). Keep it current when these stable facts change.
   pristine.
 - **Flash:** double-tap RESET on the Xiao, then
   `cp build/zephyr/zephyr.uf2 /Volumes/XIAO-SENSE/`.
-- **Host unit tests:** none on this branch — the only pure/host-testable modules
-  were the cursor ones (`cursor_track`, `cursor_calib`), which left with
-  air-mouse. Per-change verification = clean `./build.sh` + reading the serial
-  log against expected output (hardware-in-the-loop).
+- **Host unit tests:** `mic_vad`'s pure helpers (`mic_vad_block_rms`,
+  `mic_vad_band_sum` in `src/mic_vad_rms.cpp`) — build + run directly:
+  `g++ -std=c++11 -Isrc tests/test_mic_vad.cpp src/mic_vad_rms.cpp -lm -o /tmp/mv && /tmp/mv`.
+  Everything else is hardware-in-the-loop: clean `./build.sh` + read the serial
+  log against expected output.
 
 ## Toolchain / hardware (so nobody greps for "where is Zephyr")
 - NCS root `/opt/nordic/ncs`; `ZEPHYR_BASE=/opt/nordic/ncs/zephyr`; toolchain
@@ -43,21 +46,27 @@ known gotchas). Keep it current when these stable facts change.
   re-advertise on disconnect); the **serial console** (single-letter cmds);
   INT1 ISR `lsm6dsl_int1_isr` → `motion_wake_sem`; acq + DSP threads.
 - `src/gesture_mode.cpp` — gesture FSM hub (runs on the **acq thread**): pose
-  detect/arm, orientation classifier `_classify_orientation`, the firmware
-  multi-tap counter + commit handler (single/double/triple → **detect + log,
-  no mode bound**), chip-tap handlers, `gesture_mode_recent_activity` (HR
-  workout-suppression guard). `GestureMode` = `MODE_IDLE` + `MODE_GESTURE_AMBIENT`
-  (reserved). FSM skeleton stays so a future mode is a small add.
-- `src/bio_acoustic.{h,cpp}` — tap bio-acoustic DSP (extracted from the FSM hub
-  2026-06-17): chip-FIFO capture → FFT (CMSIS `arm_math`) → band energies →
-  hard-surface classification, on its own worker thread. Interface:
-  `bio_acoustic_init()` / `bio_acoustic_on_tap()` / `bio_acoustic_last_was_hard_surface()`.
-  Reads the IMU via `power_ctrl`'s `lsm6dsl_fifo_*`; no dependency back into the FSM.
+  detect/arm, orientation classifier `_classify_orientation`, the **`POSE_EAR`
+  mic gate → `MODE_DICTATION`** (`ear_gate_update`: ear pose present → `mic_vad`
+  on; voice-onset → enter; pose-gone + voice-stopped → exit; voice-continuity
+  holds through a lean — detect + log only), the firmware multi-tap counter +
+  commit handler (unbound scaffolding, benign log), chip-tap handlers,
+  `gesture_mode_recent_activity` (HR workout-suppression guard). `GestureMode` =
+  `MODE_IDLE` + `MODE_DICTATION`.
+- `src/mic_vad.{h,cpp}` + `src/mic_vad_rms.cpp` — PDM mic (16 kHz mono, DMIC) on
+  its own capture thread; per-block voiced-band (300–3000 Hz) spectral energy via
+  CMSIS rFFT (`veM`); adaptive **latched-floor + M-of-N voice-onset**
+  (`mic_vad_voice_onset`, read-and-clear) + voice-continuity (`mic_vad_voice_active`);
+  `[MIC]` serial log. Pure helpers (`mic_vad_block_rms`, `mic_vad_band_sum`) in
+  `mic_vad_rms.cpp` are host-tested. Isolated — no dependency into the FSM; the FSM
+  gates it on `POSE_EAR`.
 - `src/orientation.{h,cpp}` — Mahony complementary filter → pitch/roll
   (gravity-locked, drift-free), yaw (gyro-only, drifts), `at_rest` (ZUPT),
-  gyro-bias (ZARU), fused gravity vector. Shared IMU foundation (pose detection,
-  future dictation discriminator).
-- `src/gesture_poses.{h,cpp}` — pose canonicals (gravity direction per pose).
+  gyro-bias (ZARU). Shared IMU foundation for pose detection. (Auto yaw re-zero on
+  stillness was removed 2026-06-18 — `orientation_rezero_yaw()` kept as manual API;
+  yaw currently has no consumer.)
+- `src/gesture_poses.{h,cpp}` — pose canonicals (gravity direction per pose);
+  current set = `POSE_EAR` (`POSE_NONE` sentinel only otherwise).
 - `src/WearableDSP.{h,cpp}` — HR/PPG DSP. `src/power_ctrl.{h,cpp}` — MAX30102 +
   power helpers.
 - `src/gesture_thresholds.h` — central catalog of empirical constants, each
@@ -65,19 +74,20 @@ known gotchas). Keep it current when these stable facts change.
 
 ## Threading
 acq thread (100 Hz IMU → `gesture_mode_update_accel/gyro`) · power thread (state
-machine + chip-tap servicing) · DSP thread (HR) · BIO worker (FFT on tap).
-Cross-thread state uses `atomic_t` or a documented benign race (e.g. reading
-`gx_filt` for a threshold).
+machine + chip-tap servicing) · DSP thread (HR) · `mic_vad` capture thread (PDM
+16 kHz DMIC + FFT; runs only while `POSE_EAR` gates it on). Cross-thread state
+uses `atomic_t` (e.g. `mic_onset`, `mic_voice_active`) or a documented benign
+race (e.g. reading `gx_filt` for a threshold).
 
 ## Serial console (single letters)
 `r` reboot · `b` UF2 bootloader · `g` dump gravity · `t` sim double-tap
-(gesture detect, no mode bound) · `y` sim triple-tap (unbound) · `c` tap-cal
-logging · `+`/`-` TAP_THS · `q` PPG probe · `z` gyro-bias trace · `v` pose trace ·
-`u` clear BLE bonds.
+(unbound) · `y` sim triple-tap (unbound) · `c` tap-cal logging · `+`/`-` TAP_THS ·
+`q` PPG probe · `z` gyro-bias trace · `v` pose trace · `u` clear BLE bonds ·
+`m` PDM mic bench probe (`[MIC]` rms/veM/frac log; toggle OFF for the auto gate).
 
 ## Gotchas (do not relearn these every session)
 - **Chip taps are serviced in ALL power states** (`service_chip_int1` from every
-  state loop, not IDLE-only) — so pose/tap/bio-acoustic keep working during the
+  state loop, not IDLE-only) — so pose/tap/dictation keep working during the
   HR SNAPSHOT, and the recent-gesture guard (`gesture_mode_recent_activity`)
   stops a sig-motion → WORKOUT_VERIFY from eating taps. **This HR-independence is
   a retained must-keep.**
