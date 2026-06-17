@@ -165,10 +165,9 @@ void orientation_update(float ax, float ay, float az,
         q0 /= n; q1 /= n; q2 /= n; q3 /= n;
     }
 
-    /* Yaw re-zero the instant the wrist comes to rest (ZUPT). */
-    if (at_rest && !was_rest) {
-        orientation_rezero_yaw();
-    }
+    /* Auto yaw re-zero on stillness was removed: yaw currently has no
+     * consumer, and auto side-effects on every rest-transition add noise.
+     * orientation_rezero_yaw() remains available as a manual call. */
     was_rest = at_rest;
 }
 
@@ -194,11 +193,4 @@ void orientation_get(orientation_state_t *out)
     out->gyro_bias_dps[0] = ifb_x * RAD2DEG;
     out->gyro_bias_dps[1] = ifb_y * RAD2DEG;
     out->gyro_bias_dps[2] = ifb_z * RAD2DEG;
-
-    /* Fused gravity direction the quaternion predicts (unit vector, since q is
-     * normalised).  Identical to the vector the Mahony step uses internally;
-     * exposed for the cursor's roll-immune vertical driver. */
-    out->gravity[0] = 2.0f * (q1 * q3 - q0 * q2);
-    out->gravity[1] = 2.0f * (q0 * q1 + q2 * q3);
-    out->gravity[2] = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
 }

@@ -18,7 +18,6 @@
 #include "WearableDSP.h"
 #include "power_ctrl.h"
 #include "gesture_mode.h"
-#include "bio_acoustic.h"
 #include "orientation.h"
 #include "mic_vad.h"
 #include <zephyr/settings/settings.h>
@@ -1050,7 +1049,6 @@ static bool service_chip_int1(bool handle_sigmotion) {
                     "(threshold=0x%02x ~%d mg)",
                     tap_src, axis, sign, current_tap_ths, current_tap_ths * 62);
         }
-        bio_acoustic_on_tap();
         gesture_mode_on_chip_single_tap(axis, sign);
     }
 
@@ -1393,12 +1391,6 @@ int main(void) {
                     "without chip tap detection", err);
         }
     }
-
-    // Bio-acoustic capture pipeline (Stage E).  Enables FIFO ring
-    // buffer at 1.66 kHz + starts the worker thread.  Must happen
-    // AFTER tap engine enable so the FIFO ODR override correctly
-    // supersedes the tap engine's 416 Hz default.
-    bio_acoustic_init();
 
     // PDM mic feasibility probe (Task A).  Initialises the PDM device
     // and the capture thread (idle until 'm' serial command starts it).

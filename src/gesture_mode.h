@@ -37,14 +37,9 @@ extern "C" {
  *   (when later wired) does NOT publish custom-GATT events.  This is
  *   the default state on boot and after any cancel / timeout.
  *
- * MODE_GESTURE_AMBIENT:
- *   Reserved for a future ambient-gesture mode that needs no explicit
- *   trigger.  Not yet wired; declared so the enum reflects the roadmap
- *   and a future mode is a small addition to the FSM.
  */
 typedef enum {
     MODE_IDLE = 0,
-    MODE_GESTURE_AMBIENT,
     MODE_DICTATION,     /* raise-to-ear pose + voice-onset; detect + log only
                          * (no audio stream / HID -- that is sub-project B). */
 } GestureMode;

@@ -9,7 +9,6 @@
 #include <math.h>
 #include <limits.h>
 
-#include "bio_acoustic.h"
 #include "mic_vad.h"
 
 LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
@@ -35,7 +34,6 @@ static atomic_t mode_atomic = ATOMIC_INIT(MODE_IDLE);
 static bool    ear_mic_on;
 static bool    ear_voice_holding;   /* pose out of cone, session held by ongoing voice */
 static int64_t ear_last_match_ms;   /* last time best pose == POSE_EAR */
-#define EAR_EXIT_DWELL_MS  400      /* pose must be gone this long to exit */
 
 /* Filtered gravity vector (gx/gy/gz_filt): SLOW ~1 s LPF (GRAVITY_LP_ALPHA).
  * Stability IS the feature here -- used by pose classification, the orientation
@@ -125,46 +123,12 @@ static gesture_acq_request_cb_t s_acq_request_cb = NULL;
  * transitions. */
 static bool s_prev_needs_acq = false;
 
-/* Wrist-flick state. */
-static int flick_burst_samples_remaining = 0;
-static float flick_burst_sign = 0.0f;
-
-/* Gyro rotation-signature buffer (dictation-flip prototype, 2026-06-10).
- * Rolling ~1.5 s window of gyro samples in rad/s.  At pose-arm we
- * integrate it to report the net rotation about each band axis during
- * the move-into-pose -- the supination flip (roll about band X, the
- * forearm axis) for dictation should show a large net X that an
- * air-mouse lean does not.  150 samples * 3 * 4 B = 1800 B. */
-#define GYRO_HIST_SAMPLES   150          /* 1.5 s at 100 Hz */
-#define GYRO_DT_S           0.01f        /* 100 Hz sample period */
 #define RAD_TO_DEG          57.29578f
-static float gyro_hist[GYRO_HIST_SAMPLES][3];
-static int   gyro_hist_idx = 0;
 
 /* Latest raw accel (m/s^2), stashed by gesture_mode_update_accel so the
  * orientation filter can fuse it with the gyro sample that arrives in
  * the immediately-following gesture_mode_update_gyro() call. */
 static float last_raw_ax = 0.0f, last_raw_ay = 0.0f, last_raw_az = 9.81f;
-
-/* Integrate the gyro buffer -> net rotation (deg) and peak rate (dps)
- * about each band axis over the last ~1.5 s. */
-static void gyro_signature(float *net_deg, float *peak_dps)
-{
-    float sum[3] = {0, 0, 0};
-    float peak[3] = {0, 0, 0};
-    for (int i = 0; i < GYRO_HIST_SAMPLES; i++) {
-        for (int a = 0; a < 3; a++) {
-            float w = gyro_hist[i][a];
-            sum[a] += w;
-            float m = fabsf(w);
-            if (m > peak[a]) peak[a] = m;
-        }
-    }
-    for (int a = 0; a < 3; a++) {
-        net_deg[a]  = sum[a] * GYRO_DT_S * RAD_TO_DEG;
-        peak_dps[a] = peak[a] * RAD_TO_DEG;
-    }
-}
 
 /*
  * --- Internal helpers --------------------------------------------------
@@ -298,20 +262,6 @@ static void pose_fsm_update(float gx, float gy, float gz)
     pose_id_t best = pose_classify_best(gx, gy, gz,
                                           POSE_MATCH_THRESH, &score);
 
-    /* SURFACE mode was retired (2026-06-13): do NOT arm POSE_SURFACE in the live
-     * FSM.  An armed SURFACE pose has no consumer now (it can enter no mode -- see
-     * the log-only case in multi_tap_commit_handler) and only produces noise.  The
-     * canonical (gesture_poses.cpp k_canonical_poses) and the hard-surface spectral
-     * detector (surface_spectral_confirms_hard_surface) are intentionally KEPT in
-     * code as ready scaffolding: when the high-ODR bio-acoustic surface-tap feature
-     * is built (the ViBand path -- see docs/research/gesture-architecture.md §12
-     * feasibility + docs/research/hr-algorithm-decisions.md §10 roadmap), RE-ARM
-     * by deleting this demotion and
-     * wiring a real consumer in multi_tap_commit_handler. */
-    if (best == POSE_SURFACE) {
-        best = POSE_NONE;
-    }
-
     ear_gate_update(best);
 
     /* NOTE: POSE_EAR is gravity-discriminated (tight measured canonical,
@@ -342,39 +292,14 @@ static void pose_fsm_update(float gx, float gy, float gz)
     LOG_INF("Pose ARMED: %s (score=%.2f, gravity=(%.2f, %.2f, %.2f))",
             pose_name(best), (double)score,
             (double)gx, (double)gy, (double)gz);
-
-    /* Dictation-flip prototype: dump the gyro rotation signature for
-     * the move-into-pose.  net[X] is the net roll about the forearm
-     * axis (supination) -- expected LARGE for a dictation flip, SMALL
-     * for an air-mouse raise/lean.  Collect raises vs flips and compare
-     * net_X / peak_X to design the discriminator. */
-    float net_deg[3], peak_dps[3];
-    gyro_signature(net_deg, peak_dps);
-    LOG_INF("  GYRO-SIG net_deg[X=%.0f Y=%.0f Z=%.0f] peak_dps[X=%.0f Y=%.0f Z=%.0f]",
-            (double)net_deg[0], (double)net_deg[1], (double)net_deg[2],
-            (double)peak_dps[0], (double)peak_dps[1], (double)peak_dps[2]);
-
-    /* Orientation-filter estimate at arm.  YAW (relative to the last
-     * rest re-zero) is the path-independent dictation-vs-air-mouse
-     * discriminator we're testing: a palm-to-face flip should land at a
-     * very different yaw than a palm-to-screen raise, regardless of the
-     * path taken to get there.  pitch/roll are gravity-locked. */
-    orientation_state_t ori;
-    orientation_get(&ori);
-    LOG_INF("  ORI pitch=%.0f roll=%.0f yaw=%.0f at_rest=%d bias_dps[%.1f %.1f %.1f]",
-            (double)ori.pitch_deg, (double)ori.roll_deg, (double)ori.yaw_deg,
-            (int)ori.at_rest,
-            (double)ori.gyro_bias_dps[0], (double)ori.gyro_bias_dps[1],
-            (double)ori.gyro_bias_dps[2]);
 }
 
 static const char *_mode_str(GestureMode m)
 {
     switch (m) {
-    case MODE_IDLE:             return "IDLE";
-    case MODE_GESTURE_AMBIENT:  return "GESTURE_AMBIENT";
-    case MODE_DICTATION:        return "DICTATION";
-    default:                    return "UNKNOWN";
+    case MODE_IDLE:       return "IDLE";
+    case MODE_DICTATION:  return "DICTATION";
+    default:              return "UNKNOWN";
     }
 }
 
@@ -504,14 +429,6 @@ void gesture_mode_init(void)
     last_chip_tap_time_ms = 0;
     prev_chip_tap_time_ms = 0;
     samples_since_activity = ACTIVITY_GATE_DWELL;
-    flick_burst_samples_remaining = 0;
-    flick_burst_sign = 0.0f;
-    for (int i = 0; i < GYRO_HIST_SAMPLES; i++) {
-        gyro_hist[i][0] = 0.0f;
-        gyro_hist[i][1] = 0.0f;
-        gyro_hist[i][2] = 0.0f;
-    }
-    gyro_hist_idx = 0;
     last_raw_ax = 0.0f; last_raw_ay = 0.0f; last_raw_az = 9.81f;
     orientation_init();
     LOG_INF("gesture_mode initialised: mode=IDLE orientation=NEUTRAL");
@@ -641,50 +558,10 @@ void gesture_mode_update_accel(float ax, float ay, float az)
 
 void gesture_mode_update_gyro(float gx_rps, float gy_rps, float gz_rps)
 {
-    /* Flick detection: look for a sharp burst followed by a reversal.
-     * We pick the largest-magnitude axis for the burst direction.
-     * Once a burst is detected, we count down FLICK_WINDOW_SAMPLES
-     * looking for a sign-reversed burst.  If we get one inside the
-     * window, that's a flick.
-     *
-     * After the air-mouse extraction the flick is detect + log only (no
-     * mode bound) -- kept live so a future mode can wire it. */
-
     /* Update the orientation filter, fusing this gyro sample with the
      * accel stashed in the immediately-preceding update_accel call. */
     orientation_update(last_raw_ax, last_raw_ay, last_raw_az,
                        gx_rps, gy_rps, gz_rps);
-
-    /* Push into the rotation-signature ring buffer (dictation-flip
-     * prototype).  Stored in rad/s; gyro_signature() converts. */
-    gyro_hist[gyro_hist_idx][0] = gx_rps;
-    gyro_hist[gyro_hist_idx][1] = gy_rps;
-    gyro_hist[gyro_hist_idx][2] = gz_rps;
-    gyro_hist_idx = (gyro_hist_idx + 1) % GYRO_HIST_SAMPLES;
-
-    /* Find largest-magnitude axis. */
-    float ax = fabsf(gx_rps);
-    float ay = fabsf(gy_rps);
-    float az = fabsf(gz_rps);
-    float largest_mag;
-    float largest_val;
-    if (ax >= ay && ax >= az) { largest_mag = ax; largest_val = gx_rps; }
-    else if (ay >= az)        { largest_mag = ay; largest_val = gy_rps; }
-    else                      { largest_mag = az; largest_val = gz_rps; }
-
-    if (flick_burst_samples_remaining > 0) {
-        flick_burst_samples_remaining--;
-        /* Look for a reversal of the original burst direction. */
-        if (largest_mag >= FLICK_BURST_THRESH_RPS &&
-            ((largest_val > 0.0f) != (flick_burst_sign > 0.0f))) {
-            LOG_INF("Wrist flick detected (no mode bound)");
-            flick_burst_samples_remaining = 0;
-        }
-    } else if (largest_mag >= FLICK_BURST_THRESH_RPS) {
-        /* New burst -- arm the reversal window. */
-        flick_burst_samples_remaining = FLICK_WINDOW_SAMPLES;
-        flick_burst_sign = largest_val;
-    }
 }
 
 void gesture_mode_on_chip_double_tap(void)
@@ -846,26 +723,10 @@ static void multi_tap_commit_handler(struct k_work *work_arg)
 
     /* The committed pose + cadenced double-tap is detected and logged
      * but routes to NO mode after the air-mouse extraction -- ready to
-     * wire a future mode here.  Pose + tap detection stays fully alive. */
-    switch (armed) {
-    case POSE_SURFACE:
-        /* SURFACE MODE was dropped (roadmap 2026-06-13).  The pose classifier +
-         * hard-surface spectral detector are KEPT as useful logic, but a SURFACE
-         * pose + double-tap no longer ENTERS a mode (it is unbound, like triple-tap).
-         * Log the detector result for diagnostics; enter nothing. */
-        LOG_INF("SURFACE pose + double-tap (unbound) -- detector live "
-                "(hard_surface=%d), no mode entry (SURFACE removed)",
-                (int)bio_acoustic_last_was_hard_surface());
-        break;
-
-    default:
-        /* No tap-bound mode for this pose (POSE_EAR enters via voice, not taps).
-         * The tap counter/cadence/commit machinery is kept intact + exercised,
-         * unbound, ready to wire a future tap-based mode here. */
-        LOG_INF("GESTURE: %s + cadenced double-tap (no tap-bound mode)",
-                pose_name(armed));
-        break;
-    }
+     * wire a future mode here.  Pose + tap detection stays fully alive.
+     * (POSE_EAR enters via voice, not taps.) */
+    LOG_INF("GESTURE: %s + cadenced double-tap (no tap-bound mode)",
+            pose_name(armed));
 
 disarm:
     /* Disarm pose after a gesture attempt (whether successful or

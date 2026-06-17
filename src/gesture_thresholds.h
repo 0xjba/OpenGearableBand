@@ -65,13 +65,6 @@
  * quaternion raise detector, reuses orientation_get()'s quaternion). PROVISIONAL. */
 #define POSE_EAR_TOL            0.64f
 
-/* SURFACE = wrist flat on desk, volar up.  Z-dominant, slight +X lean.
- * Tighter cone (tol 0.94 ≈ ±20°) to reduce lap false positives. */
-#define POSE_SURFACE_GX         0.18f
-#define POSE_SURFACE_GY         0.08f
-#define POSE_SURFACE_GZ         0.98f
-#define POSE_SURFACE_TOL        0.940f
-
 /* ---------------------------------------------------------------------------
  *  2. Pose FSM (arming)
  *  --------------------------------------------------------------------------- */
@@ -165,34 +158,7 @@
 #define ACTIVITY_GATE_DWELL             50
 
 /* ---------------------------------------------------------------------------
- *  4. SURFACE discrimination (desk vs lap, via tap spectral content)
- *  --------------------------------------------------------------------------- */
-
-/* Mid-band FFT energy above which a tap is taken to be on a HARD surface
- * (desk-feedback ringing) vs soft (lap).  v0 PROXY for post-event ring-down.
- * [HOUSING] — strongly coupling-dependent; re-measure on housed hardware. */
-#define SURFACE_RESONANCE_MID_BAND_THRESH   5e7f
-
-/* FFT band edges (bins) at 833 Hz / 512-pt (≈1.63 Hz/bin).  Low band
- * ~20-200 Hz (bone-conducted), mid ~200-400 Hz (impact/feedback).
- * [STRUCTURAL] (tied to ODR + FFT size). */
-#define FFT_BIN_LOW_START               12     /* ~19.5 Hz */
-#define FFT_BIN_LOW_END                 122    /* ~199 Hz, exclusive */
-#define FFT_BIN_MID_START               122
-#define FFT_BIN_MID_END                 246    /* ~400 Hz, exclusive */
-
-/* ---------------------------------------------------------------------------
- *  5. Wrist-flick (gyro) — sharp flick gesture (detect + log; unbound since
- *     air-mouse extraction, kept as a hook for a future mode)
- *  --------------------------------------------------------------------------- */
-
-/* Flick = a sharp gyro burst above THRESH (rad/s) followed by a sign-reversed
- * burst within WINDOW samples.  [USER] */
-#define FLICK_BURST_THRESH_RPS          8.0f
-#define FLICK_WINDOW_SAMPLES            25
-
-/* ---------------------------------------------------------------------------
- *  6. Orientation filter (Mahony) + stillness / ZARU (shared IMU foundation:
+ *  4. Orientation filter (Mahony) + stillness / ZARU (shared IMU foundation:
  *     pose detection, dictation discriminator, future modes)
  *  --------------------------------------------------------------------------- */
 
@@ -209,6 +175,10 @@
 #define STILL_GYRO_THRESH_RPS           0.10f
 #define STILL_ACC_RESID                 0.80f
 #define STILL_DWELL_SAMPLES             30     /* 300 ms @100 Hz */
+
+/* Ear-pose exit dwell: pose must be absent this long before the mic gate
+ * closes (allows leaning away briefly while still speaking). [USER] */
+#define EAR_EXIT_DWELL_MS    400
 
 /* --- Voice-onset VAD (dictation A.1) [HOUSING] -------------------------------
  * Mount-dependent (prototype skin-mount); EXPECTED TO MOVE when the housing is

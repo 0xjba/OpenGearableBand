@@ -28,12 +28,6 @@ static const canonical_pose_t k_canonical_poses[POSE_COUNT] = {
      * AIR_MOUSE cone was removed). The MODE it enters (DICTATION) is gated by
      * voice-onset in gesture_mode, not by the pose alone. */
     { POSE_EAR,     POSE_EAR_GX, POSE_EAR_GY, POSE_EAR_GZ, POSE_EAR_TOL, "EAR" },
-
-    /* POSE_SURFACE: wrist horizontal on desk, band volar facing up.
-     * Gravity along band +Z with a slight +X lean (measured centre
-     * [0.18, 0.08, 0.98]; family spans ~11°).  Tolerance tighter
-     * (±20°) to reduce lap false positives. */
-    { POSE_SURFACE,   POSE_SURFACE_GX, POSE_SURFACE_GY, POSE_SURFACE_GZ, POSE_SURFACE_TOL, "SURFACE" },
 };
 
 float pose_score(const canonical_pose_t *p,

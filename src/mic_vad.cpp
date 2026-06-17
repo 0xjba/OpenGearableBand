@@ -5,8 +5,8 @@
  * DMIC API on its own thread.  A.0 logs short-term RMS energy ([MIC]); A.1
  * adds a voiced-band (300-3000 Hz) spectral-energy feature (CMSIS rFFT) to the
  * same [MIC] line so the speech-vs-ambient separability can be measured, ahead
- * of the latched-floor voice-onset detector.  Isolated like bio_acoustic: no
- * dependency into the gesture FSM.  Plans:
+ * of the latched-floor voice-onset detector.  Isolated: no dependency into
+ * the gesture FSM.  Plans:
  * docs/superpowers/plans/2026-06-17-dictation-entry-A0-mic-feasibility.md and
  * .../2026-06-17-dictation-entry-A1-voice-onset-fsm.md.  The pure helpers
  * (mic_vad_block_rms, mic_vad_band_sum) live in mic_vad_rms.cpp (host-tested);
@@ -62,8 +62,8 @@ static void mic_spectral(const int16_t *s, size_t n,
 
     arm_rfft_fast_f32(&mic_fft, mic_fft_in, mic_fft_out, 0 /* forward */);
 
-    /* Packed format: out[0]=DC real, out[1]=Nyquist real, then re,im pairs.
-     * Same convention as bio_acoustic.cpp (verified against CMSIS source). */
+    /* Packed format: out[0]=DC real, out[1]=Nyquist real, then re,im pairs
+     * (CMSIS arm_rfft_fast_f32 convention). */
     mic_bin_e[0] = mic_fft_out[0] * mic_fft_out[0];
     for (int k = 1; k < MIC_FFT_N / 2; k++) {
         float re = mic_fft_out[2 * k];
@@ -176,7 +176,7 @@ static void mic_thread(void *, void *, void *)
                     /* mic_floor_n >= 1 here (incremented above); guard is defensive. */
                     mic_floor_vem = (mic_floor_n > 0) ? (mic_floor_sum / mic_floor_n) : veM;
                     mic_floor_latched = true;
-                    LOG_INF("[MIC] floor latched veM=%d", (int)mic_floor_vem);
+                    LOG_INF("[MIC] floor latched (veM=%d) -- READY, listening for voice", (int)mic_floor_vem);
                 }
             } else {
                 float thresh = VAD_K * mic_floor_vem;
