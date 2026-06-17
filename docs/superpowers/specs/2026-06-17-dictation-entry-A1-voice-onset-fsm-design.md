@@ -111,23 +111,33 @@ already gates the expensive part (capture); the regulator toggle is a noted powe
 - **Genuine-SNR-limit honesty:** if ambient is so loud/broadband that speech cannot clear
   `VAD_K × floor` (heavy traffic/outdoor), energy VAD physically cannot separate — that is the
   documented **Cobra Tier-2** trigger (§3), not a reason to inflate the constants.
-- **Interface:** add `bool mic_vad_voice_onset(void)` (latches true on onset, cleared on read by the
-  FSM). Keep `mic_vad_block_rms`. The `[MIC]` log keeps `veM` + `frac` for diagnostics.
-- Thresholds `VAD_VEM_ABS_MIN`, `VAD_K`, `VAD_ONSET_HITS`, `VAD_ONSET_WINDOW_MS`, `VAD_FLOOR_SAMPLE_MS`
-  — all in `gesture_thresholds.h`, **tagged `[HOUSING]`** (mount-dependent; provisional values from the
-  skin-mount T2 measurement, expected to move when the housing is built — re-tune then).
+- **Voice-continuity hold (posture robustness):** also expose `bool mic_vad_voice_active(void)` (true
+  while a hot block occurred within `VAD_VOICE_HOLD_MS` ≈ 1500 ms). The FSM uses it to HOLD a session
+  through a comfortable lean that pushes gravity out of the `POSE_EAR` cone — as long as the user keeps
+  speaking at the near-field level. Self-limiting by physics: lowering the arm makes the voice
+  far-field/quiet → not hot → releases, so it can't hold a session when the wrist isn't near the mouth.
+- **Interface:** add `bool mic_vad_voice_onset(void)` (latches true on onset, cleared on read) and
+  `bool mic_vad_voice_active(void)` (non-clearing). Keep `mic_vad_block_rms`. The `[MIC]` log keeps
+  `veM` + `frac` for diagnostics.
+- Thresholds `VAD_VEM_ABS_MIN`, `VAD_K`, `VAD_ONSET_HITS`, `VAD_ONSET_WINDOW_MS`, `VAD_FLOOR_SAMPLE_MS`,
+  `VAD_VOICE_HOLD_MS` — all in `gesture_thresholds.h`, **tagged `[HOUSING]`** (mount-dependent;
+  provisional values from the skin-mount T2 measurement, expected to move when the housing is built).
 
 ## 7. The FSM (gesture_mode)
 
 ```
-IDLE ── POSE_EAR held + at_rest ──────────────→ mic ON; latch voiced_floor over silent window
-     ── voice-onset (while POSE_EAR still held) ─→ MODE_DICTATION        [A.1: detect + LOG only]
-MODE_DICTATION ── POSE_EAR drops > EXIT_DWELL_MS ─→ IDLE + mic OFF
+IDLE ── POSE_EAR held + at_rest ──────────────→ mic ON; latch floor over silent window
+     ── voice-onset (while POSE_EAR held) ──────→ MODE_DICTATION        [A.1: detect + LOG only]
+MODE_DICTATION ── POSE_EAR out of cone > EXIT_DWELL_MS  AND  no near-field voice
+                  for VAD_VOICE_HOLD_MS ─────────→ IDLE + mic OFF
+               (pose out of cone but still speaking → HOLD, lean tolerance)
 ```
 - Add `MODE_DICTATION` to the `GestureMode` enum (joining `MODE_IDLE` / `MODE_GESTURE_AMBIENT`).
-- Two-factor (pose AND voice) → low false-positive. Logs `DICTATION entry: ear-pose + voice` and
-  `DICTATION exit: pose dropped`. No audio stream, no HID (sub-project B). Pre-roll buffering for B
-  is noted, not built.
+- Two-factor (pose AND voice) → low false-positive. The HOLD keys on the gravity pose match alone
+  (not `at_rest` — speaking is motion); `at_rest` gates only the START edge (clean floor latch).
+  Exit requires pose-gone AND voice-stopped (voice-continuity hold above). Logs
+  `DICTATION entry: ear-pose + voice`, the lean-hold, and `DICTATION exit: pose dropped + voice stopped`.
+  No audio stream, no HID (sub-project B). Pre-roll buffering for B is noted, not built.
 - Negative checks (must NOT enter): silent hand-at-ear (pose, no voice); speech with hand down
   (no pose); arm raised through the pose without settling (`at_rest=0` excludes it).
 
