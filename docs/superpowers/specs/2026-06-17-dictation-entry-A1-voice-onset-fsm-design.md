@@ -34,7 +34,7 @@ the IMU pose gates *when* the mic runs; an in-window spectral voice check decide
 
 In-pose voice-vs-noise = **voiced-band spectral energy, adaptive latched-floor, M-of-N
 count-in-window onset** (the consecutive-dwell of the original design failed — speech `veM` is
-bursty; see §6), against a **latched ambient floor**, while the pose is held + `at_rest`. Reuses the
+bursty; see §6), against a **latched ambient floor**, while the ear pose is present. Reuses the
 CMSIS-DSP FFT already running for `bio_acoustic`. Rationale: pure RMS proven insufficient (§2); the
 300–3000 Hz voiced-band energy separates speech from ambient (~3–20× on the prototype mount); the
 pose-gate + M-of-N handle the rest.
@@ -70,19 +70,21 @@ this work (A.1 touches `gesture_poses` + `gesture_mode` anyway):
   `Mode entry ABORT: unknown armed pose`. (Either skip feeding the tap counter when the armed pose is
   `POSE_EAR`, or make the commit switch's default a benign log — plan-level choice.)
 
-**POSE_EAR arm condition:** pose score above threshold AND `at_rest=1` AND held for a short dwell.
-The `at_rest` requirement is load-bearing — it excludes the raise-transition window where the
-mechanical transients live (§2).
+**POSE_EAR condition:** pose score above threshold — **gravity match alone, NO stillness/`at_rest`
+requirement.** A person cannot hold an arm dead-still at their ear, and the band may be in motion
+(walking / running / in a car), so gating on stillness is wrong (it caused intermittent multi-second
+start delays — 2026-06-17). The mic starts the instant the ear pose is present; the floor latches
+over the first ~500 ms of whatever ambient is there (motion-tolerant, since onset is relative to it).
 
-**Build-time HW verification (replaces the old AIR_MOUSE collision check):** confirm `POSE_EAR` arms
-*only* when settled in the ear posture — not during the raise, and not for a generic raised/forward
-arm. Log the EAR score while holding the ear pose vs other raised poses; if it false-arms, tighten
-the tolerance / add a `gx` floor.
+**Build-time HW verification:** confirm `POSE_EAR` matches across comfortable leans (the cone is
+widened, 2026-06-17) and that the mic starts promptly on raise (no stillness gate). A brief mic-on
+during a non-dictation raise (e.g. scratching) is harmless — entry still requires voice-onset, and
+the mic turns off when the pose leaves.
 
 ## 5. Mic power gate
 
-`POSE_EAR` armed (held + `at_rest`) → `mic_vad_start()`. Pose drops → `mic_vad_stop()`. The mic
-capture (PDM clock + DMIC acquisition) only runs while the ear pose is held — naturally duty-cycled.
+`POSE_EAR` present (gravity match, no stillness gate) → `mic_vad_start()`. Pose drops → `mic_vad_stop()`.
+The mic capture (PDM clock + DMIC acquisition) only runs while the ear pose is present — naturally duty-cycled.
 **Out of scope for v0:** toggling the P1.10 *regulator* (deeper analog power-off). `mic_vad_start/stop`
 already gates the expensive part (capture); the regulator toggle is a noted power-optimization follow-up.
 
@@ -99,7 +101,7 @@ already gates the expensive part (capture); the regulator toggle is a noted powe
   `frac` is still logged for diagnostics but is NOT the discriminator.
 - **Adaptive latched floor (universality):** ambient level varies hugely per environment (fan / silent
   AC / traffic / outdoor — user requirement). So do NOT use a fixed absolute threshold. When POSE_EAR
-  first becomes held + `at_rest`, sample `veM` over a short silent window (`VAD_FLOOR_SAMPLE_MS` ≈
+  first matches (mic start), sample `veM` over a short window (`VAD_FLOOR_SAMPLE_MS` ≈
   500 ms) and freeze it as `veM_floor`. The threshold is `max(VAD_VEM_ABS_MIN, VAD_K × veM_floor)` —
   the ratio term re-adapts to wherever the user is, each pose entry. Do NOT update the floor live while
   a candidate voice segment is active (avoids floor-creep).
@@ -126,20 +128,21 @@ already gates the expensive part (capture); the regulator toggle is a noted powe
 ## 7. The FSM (gesture_mode)
 
 ```
-IDLE ── POSE_EAR held + at_rest ──────────────→ mic ON; latch floor over silent window
-     ── voice-onset (while POSE_EAR held) ──────→ MODE_DICTATION        [A.1: detect + LOG only]
+IDLE ── POSE_EAR present (gravity match, NO stillness) → mic ON; latch floor over first window
+     ── voice-onset (while POSE_EAR present) ──────────→ MODE_DICTATION   [A.1: detect + LOG only]
 MODE_DICTATION ── POSE_EAR out of cone > EXIT_DWELL_MS  AND  no near-field voice
-                  for VAD_VOICE_HOLD_MS ─────────→ IDLE + mic OFF
+                  for VAD_VOICE_HOLD_MS ──────────────→ IDLE + mic OFF
                (pose out of cone but still speaking → HOLD, lean tolerance)
 ```
 - Add `MODE_DICTATION` to the `GestureMode` enum (joining `MODE_IDLE` / `MODE_GESTURE_AMBIENT`).
-- Two-factor (pose AND voice) → low false-positive. The HOLD keys on the gravity pose match alone
-  (not `at_rest` — speaking is motion); `at_rest` gates only the START edge (clean floor latch).
+- Two-factor (pose AND voice) → low false-positive. **No stillness anywhere** — start and hold both
+  key on the gravity pose match alone (people can't hold still at the ear, and the band may be moving).
   Exit requires pose-gone AND voice-stopped (voice-continuity hold above). Logs
-  `DICTATION entry: ear-pose + voice`, the lean-hold, and `DICTATION exit: pose dropped + voice stopped`.
-  No audio stream, no HID (sub-project B). Pre-roll buffering for B is noted, not built.
+  `POSE_EAR present -> mic ON`, `DICTATION entry: ear-pose + voice`, the lean-hold, and
+  `DICTATION exit: pose dropped + voice stopped`. No audio stream, no HID (sub-project B).
 - Negative checks (must NOT enter): silent hand-at-ear (pose, no voice); speech with hand down
-  (no pose); arm raised through the pose without settling (`at_rest=0` excludes it).
+  (no pose). A raise that passes *through* the ear orientation briefly turns the mic on but does
+  NOT enter (no voice-onset) and turns off when the pose leaves — harmless, not a false entry.
 
 ## 8. Components / files
 
