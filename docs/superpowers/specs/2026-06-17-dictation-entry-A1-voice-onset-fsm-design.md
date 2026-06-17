@@ -1,0 +1,166 @@
+# Dictation Entry A.1 — POSE_EAR + Voiced-Onset Entry FSM — Design Spec
+
+**Date:** 2026-06-17
+**Status:** design for review
+**Branch:** feature/gesture-foundation
+**Sub-project:** A.1 of the dictation umbrella (`docs/superpowers/specs/2026-06-07-gesture-triggered-dictation-design.md`).
+**Predecessor:** A.0 (`docs/superpowers/specs/2026-06-17-dictation-entry-firmware-design.md`),
+BUILT + FLASHED + MEASURED — gate PASSED. This spec builds the entry FSM on A.0's `mic_vad` module.
+
+---
+
+## 1. Scope
+
+Decide *"the user wants to dictate"* and expose it as a mode — **detect + log only**.
+Two-factor entry: **POSE_EAR held (IMU) AND voiced-onset (mic)**. No audio streaming, no HID,
+no Mac app (those are sub-projects B–E). The architecture is Apple Watch "Raise to Speak":
+the IMU pose gates *when* the mic runs; an in-window spectral voice check decides onset.
+
+## 2. What A.0 settled (the empirical basis)
+
+- **Mic works at the ear:** speak-at-ear RMS syllable peaks 1000–2700 (sustained 600–1900);
+  speak-hand-down ~300–370 (≈4–5× ear advantage, the near-field win); still-ambient (fan) ~90–200
+  (≈10× speech margin).
+- **Pure RMS energy is NOT a sufficient discriminator:** mechanical handling transients while
+  *moving* the arm hit 1000–2400 — overlapping speech energy. (Matches the research: no modern
+  product uses bare energy VAD; it false-fires on keystrokes/footsteps/motion.)
+- **Live ambient floor creeps up mid-speech** (EMA went 100→1000+), so `ratio` self-erodes the
+  longer you talk → the floor must be **latched**, not live.
+- **POSE_EAR canonical (20 s `v`-trace, rock-steady):** gravity ≈ `(8.2, −4.6, 2.6)` m/s²,
+  `vert ≈ 32–33°` from vertical, `pitch ≈ −57`, `roll ≈ −60`, `at_rest=1`. Dominant `gx ≈ 8.2`
+  separates it from `AIR_MOUSE` (`gx ≈ 5–6`).
+
+## 3. Discriminator decision (locked)
+
+In-pose voice-vs-noise = **voiced-band spectral energy + sustained dwell**, against a **latched
+ambient floor**, while the pose is held + `at_rest`. Reuses the CMSIS-DSP FFT already running for
+`bio_acoustic`. Rationale: pure RMS proven insufficient (§2); a 300–3000 Hz voiced-band ratio
+rejects broadband/mechanical energy that RMS cannot; the pose-gate + dwell handle the rest.
+**Tier-2 escalation (NOT built in v0, documented for later):** Picovoice **Cobra** neural VAD —
+the only production neural VAD confirmed on nRF52840 (same chip, 98.9% TPR @ 5% FPR), closed-source
+/ beta. Adopt only if field noise (TV, café, nearby speech — untested in A.0) erodes the spectral
+margin. Silero/TEN have no Cortex-M4 port; RNNoise is CPU-marginal at 64 MHz.
+
+## 4. POSE_EAR + pose-model cleanup
+
+The current pose enum is vestigial from the air-mouse extraction and must be reconciled as part of
+this work (A.1 touches `gesture_poses` + `gesture_mode` anyway):
+- **Remove `POSE_AIR_MOUSE`.** Despite the name it is just a broad "raised-arm hemisphere" cone and
+  is the *only* pose that currently arms — a leftover from the extracted feature. Generic "raised"
+  is already represented by the orientation classifier (`WRIST_UP_RAISED`); it does not need an
+  armed pose. Removing it also stops the broad cone from arming during the ear-pose *raise*.
+- **`POSE_DICTATION` → `POSE_EAR`.** Rename the existing (currently DISABLED, tolerance 2.0) entry,
+  give it the measured canonical from §2 (`(8.2, −4.6, 2.6)`, normalized; tight tolerance), and
+  re-enable it. Pose = posture; `MODE_DICTATION` = the mode it enters. The old DICTATION was disabled
+  because the *volar-to-mouth* posture was gravity-identical to an air-mouse raise (2026-06-11); the
+  **ear posture is genuinely separable** (`gx≈8.2` vs raise `gx≈5–6`), which is why a real tight EAR
+  pose works where the old one didn't.
+- **`POSE_SURFACE`** stays dormant scaffolding (canonical kept, not armed) — unchanged.
+- **Keep the tap machinery; only unbind its purpose.** The multi-tap (single/double/triple) counter,
+  cadence logic, and `multi_tap_commit_handler` are **kept intact in the code** as ready, working
+  scaffolding — a purpose will be assigned later, after the ear/dictation work settles (user
+  decision). The ONLY tap-related change here is removing the dead `POSE_AIR_MOUSE` pose and its
+  `case` in the commit switch (it references a removed enum). Do NOT delete the counter/cadence/handler.
+- **Net result: only `POSE_EAR` arms; the tap-commit path is inactive at runtime but fully present.**
+  `POSE_EAR` is voice-gated (not tap-bound). Chip taps are still detected + logged at the hardware
+  level. To keep the retained handler clean while no pose is tap-bound: a stray double-tap while
+  `POSE_EAR` is armed must log a graceful "no tap-bound mode" line, NOT the alarming
+  `Mode entry ABORT: unknown armed pose`. (Either skip feeding the tap counter when the armed pose is
+  `POSE_EAR`, or make the commit switch's default a benign log — plan-level choice.)
+
+**POSE_EAR arm condition:** pose score above threshold AND `at_rest=1` AND held for a short dwell.
+The `at_rest` requirement is load-bearing — it excludes the raise-transition window where the
+mechanical transients live (§2).
+
+**Build-time HW verification (replaces the old AIR_MOUSE collision check):** confirm `POSE_EAR` arms
+*only* when settled in the ear posture — not during the raise, and not for a generic raised/forward
+arm. Log the EAR score while holding the ear pose vs other raised poses; if it false-arms, tighten
+the tolerance / add a `gx` floor.
+
+## 5. Mic power gate
+
+`POSE_EAR` armed (held + `at_rest`) → `mic_vad_start()`. Pose drops → `mic_vad_stop()`. The mic
+capture (PDM clock + DMIC acquisition) only runs while the ear pose is held — naturally duty-cycled.
+**Out of scope for v0:** toggling the P1.10 *regulator* (deeper analog power-off). `mic_vad_start/stop`
+already gates the expensive part (capture); the regulator toggle is a noted power-optimization follow-up.
+
+## 6. VAD inside the window (mic_vad extension)
+
+- **Spectral feature:** per ~20 ms PCM block, Hann-window + zero-pad the 320 samples to a 512-pt
+  real FFT (CMSIS `arm_rfft`); sum bin energy in **300–3000 Hz** (the voiced band) → `voiced_energy`.
+  Bin width 16000/512 ≈ 31.25 Hz, so the band ≈ bins 10–96.
+- **Latched floor:** when POSE_EAR first becomes held + `at_rest`, sample `voiced_energy` over a
+  short silent window (~300–500 ms) and freeze it as `voiced_floor`. Do NOT update it live while a
+  candidate voice segment is active.
+- **Onset rule:** `voiced_energy ≥ max(ABS_MIN, K × voiced_floor)` sustained for `ONSET_DWELL_MS`
+  (~150 ms, i.e. consecutive blocks) → voice-onset. The dwell rejects single-block mechanical pops.
+- **Interface:** add `bool mic_vad_voice_onset(void)` (latches true on a sustained onset, cleared by
+  the FSM on consume/exit). Keep `mic_vad_block_rms`. Extend the `[MIC]` log to print `voiced_energy`,
+  `voiced_floor`, and the ratio (so step-1 measurement can set the thresholds — §9).
+- Thresholds `ABS_MIN`, `K`, `ONSET_DWELL_MS`, floor-sample window — all in `gesture_thresholds.h`,
+  seeded from the step-1 spectral measurement, tagged `[USER]`.
+
+## 7. The FSM (gesture_mode)
+
+```
+IDLE ── POSE_EAR held + at_rest ──────────────→ mic ON; latch voiced_floor over silent window
+     ── voice-onset (while POSE_EAR still held) ─→ MODE_DICTATION        [A.1: detect + LOG only]
+MODE_DICTATION ── POSE_EAR drops > EXIT_DWELL_MS ─→ IDLE + mic OFF
+```
+- Add `MODE_DICTATION` to the `GestureMode` enum (joining `MODE_IDLE` / `MODE_GESTURE_AMBIENT`).
+- Two-factor (pose AND voice) → low false-positive. Logs `DICTATION entry: ear-pose + voice` and
+  `DICTATION exit: pose dropped`. No audio stream, no HID (sub-project B). Pre-roll buffering for B
+  is noted, not built.
+- Negative checks (must NOT enter): silent hand-at-ear (pose, no voice); speech with hand down
+  (no pose); arm raised through the pose without settling (`at_rest=0` excludes it).
+
+## 8. Components / files
+
+- `src/gesture_poses.{h,cpp}` — remove `POSE_AIR_MOUSE`; rename `POSE_DICTATION` → `POSE_EAR` with
+  the measured canonical + re-enabled tolerance; `POSE_SURFACE` unchanged (dormant).
+- `src/mic_vad.{h,cpp}` — FFT voiced-band energy, latched floor, `mic_vad_voice_onset()`, extended
+  `[MIC]` spectral log. (`mic_vad_rms.cpp` pure helper unchanged.)
+- `src/gesture_mode.{cpp,h}` — remove the `POSE_AIR_MOUSE` arming + its commit-switch `case` only;
+  KEEP the multi-tap counter / cadence / `multi_tap_commit_handler` intact (unbound scaffolding) with
+  a benign default log. Add `MODE_DICTATION`; `POSE_EAR` gating of `mic_vad`, entry on onset, exit on
+  pose drop (detect + log).
+- `src/gesture_thresholds.h` — POSE_EAR canonical + VAD thresholds/dwells (`[USER]`/`[HOUSING]`).
+- `src/main.cpp` — no new wiring beyond the mode log; serial `m` probe stays (used for step-1 measurement).
+
+## 9. Build order (measure → gate, mirroring A.0)
+
+1. **Extend `mic_vad` to compute + LOG voiced-band energy** (FFT + 300–3000 Hz sum) and re-run the
+   A.0 three captures → get the spectral separability numbers (speak-at-ear vs still-ambient vs
+   hand-down vs mechanical-transient). Set `ABS_MIN`/`K`/`ONSET_DWELL_MS` from this.
+2. **Pose-model cleanup + `POSE_EAR`** (§4): remove `POSE_AIR_MOUSE`, rename `POSE_DICTATION` →
+   `POSE_EAR` with the measured canonical + re-enable; confirm on HW that `POSE_EAR` arms only when
+   settled in the ear posture (not during the raise, not for a generic raised arm). Keep the tap
+   counter/cadence/commit handler intact but unbound (raw chip taps still log).
+3. **Wire the FSM:** pose-gate the mic, latch the floor, sustained-onset → `MODE_DICTATION`
+   (detect + log), exit on pose drop. Thresholds from step 1.
+
+## 10. Testing / verification
+
+- Host: the FFT voiced-band helper factored pure (like `mic_vad_block_rms`) gets a small host test
+  (known tone in-band → high energy; out-of-band tone / DC → low). Pose canonical scoring is the
+  existing path (no new host test).
+- HW (hardware-in-the-loop, per CLAUDE.md): build clean; `POSE_EAR` arms only in the ear pose
+  (and not in AIR_MOUSE); speaking while held logs `DICTATION entry`; dropping the pose logs exit;
+  the three negative checks (§7) do NOT trigger.
+
+## 11. Risks / open
+
+- **Field noise untested** — A.0's ambient was only a fan. Loud real-world noise will compress the
+  margin; spectral+dwell is the v0 bet, Cobra (§3) the documented Tier-2.
+- **POSE_EAR false-arming on a generic raised arm** — the ear cone must be tight enough that
+  raising the arm (forward, or in transit to the ear) does not arm it; §4 HW verification gates this.
+  (The old broad `AIR_MOUSE` cone is removed precisely to avoid this.)
+- **Latched-floor staleness** — if ambient changes while the pose is held a long time, the frozen
+  floor drifts. v0 accepts this (pose holds are short); a re-latch-on-long-silence is a noted refinement.
+- **Co-existence with a future KWS / §6.5** (umbrella N3) — both use the PDM mic; mutual exclusion at
+  the FSM level when that ships. Out of scope here.
+
+## 12. Out of scope (this sub-project)
+
+Audio streaming (PDM→Opus→GATT), HID, Mac app, STT, backend (sub-projects B–E). The P1.10 regulator
+power-gate, KWS, and Cobra integration are all deferred (noted above).
