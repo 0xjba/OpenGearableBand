@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use checkbox (`- [ ]`). Firmware is hardware-in-the-loop: code "verify" = clean `./build.sh` + host test; thresholds come from the Task 2 HW measurement; final behavior is the Task 6 HW verification (user). Spec: `docs/superpowers/specs/2026-06-17-dictation-entry-A1-voice-onset-fsm-design.md`. Build/flash + file map: `CLAUDE.md`. Scope discipline: build EXACTLY the spec — detect + log only, no audio stream, no HID, no regulator power-gate, no KWS/Cobra. Do not delete the tap counter/cadence/commit machinery.
 
-**Goal:** Enter `MODE_DICTATION` (detect + log only) when `POSE_EAR` is held + still AND a voiced-onset is detected by a spectral (voiced-band energy + sustained dwell, latched-floor) check on the wrist PDM mic — and reconcile the vestigial pose model left by the air-mouse extraction.
+**Goal:** Enter `MODE_DICTATION` (detect + log only) when `POSE_EAR` is held + still AND a voiced-onset is detected by a spectral (voiced-band energy, adaptive latched-floor, M-of-N count-in-window) check on the wrist PDM mic — and reconcile the vestigial pose model left by the air-mouse extraction.
 
 **Architecture:** Apple-Watch "Raise to Speak" pattern. The IMU pose (`POSE_EAR`) gates *when* the mic runs; an in-window voiced-band spectral check (FFT on the existing `mic_vad` capture, reusing CMSIS-DSP) decides voice-onset against an ambient floor latched during the held-silent window; two-factor (pose AND voice) enters the mode.
 

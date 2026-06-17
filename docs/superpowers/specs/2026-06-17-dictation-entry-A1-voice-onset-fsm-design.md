@@ -32,10 +32,12 @@ the IMU pose gates *when* the mic runs; an in-window spectral voice check decide
 
 ## 3. Discriminator decision (locked)
 
-In-pose voice-vs-noise = **voiced-band spectral energy + sustained dwell**, against a **latched
-ambient floor**, while the pose is held + `at_rest`. Reuses the CMSIS-DSP FFT already running for
-`bio_acoustic`. Rationale: pure RMS proven insufficient (§2); a 300–3000 Hz voiced-band ratio
-rejects broadband/mechanical energy that RMS cannot; the pose-gate + dwell handle the rest.
+In-pose voice-vs-noise = **voiced-band spectral energy, adaptive latched-floor, M-of-N
+count-in-window onset** (the consecutive-dwell of the original design failed — speech `veM` is
+bursty; see §6), against a **latched ambient floor**, while the pose is held + `at_rest`. Reuses the
+CMSIS-DSP FFT already running for `bio_acoustic`. Rationale: pure RMS proven insufficient (§2); the
+300–3000 Hz voiced-band energy separates speech from ambient (~3–20× on the prototype mount); the
+pose-gate + M-of-N handle the rest.
 **Tier-2 escalation (NOT built in v0, documented for later):** Picovoice **Cobra** neural VAD —
 the only production neural VAD confirmed on nRF52840 (same chip, 98.9% TPR @ 5% FPR), closed-source
 / beta. Adopt only if field noise (TV, café, nearby speech — untested in A.0) erodes the spectral
