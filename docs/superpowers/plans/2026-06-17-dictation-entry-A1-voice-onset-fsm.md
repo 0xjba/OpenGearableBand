@@ -313,16 +313,20 @@ git commit -m "$(printf 'refactor(pose): remove vestigial POSE_AIR_MOUSE, add me
 
 - [ ] **Step 1: Add VAD thresholds to `gesture_thresholds.h`**
 
-Use the numbers chosen in Task 2 (the values below are the starting points from A.0's data; replace
-with Task 2's measured values before committing):
+Provisional values from the Task 2 skin-mount measurement (2026-06-17). All work in `veM` units
+(voiced energy ÷ 1e6, matching the `[MIC]` log). Ambient `veM` measured ≤ ~1030; speech syllable
+peaks 3000–21000.
 ```c
-/* --- Voice-onset VAD (dictation A.1) [USER] ----------------------------- */
-/* Voiced-band (300-3000 Hz) energy onset, against a floor latched during the
- * held-silent ear-pose window. Set from the Task 2 spectral measurement. */
-#define VAD_VOICED_ABS_MIN      20000.0f  /* absolute voiced-energy onset floor */
-#define VAD_VOICED_RATIO_K      4.0f      /* x over the latched ambient floor */
-#define VAD_ONSET_DWELL_MS      150       /* sustained above-threshold to fire */
-#define VAD_FLOOR_SAMPLE_MS     400       /* silent window to latch the floor */
+/* --- Voice-onset VAD (dictation A.1) [HOUSING] -------------------------------
+ * Mount-dependent (prototype skin-mount); EXPECTED TO MOVE when the housing is
+ * built -- re-tune then. Discriminator (from T2): absolute voiced energy veM,
+ * against a floor latched per pose-entry (adaptive across environments). Onset
+ * is M-of-N (speech veM is bursty, so a consecutive-block dwell fails). */
+#define VAD_VEM_ABS_MIN      1200.0f  /* veM quiet-room backstop threshold */
+#define VAD_K                8.0f     /* x over the latched ambient floor (adaptive) */
+#define VAD_ONSET_HITS       3        /* hot blocks needed... */
+#define VAD_ONSET_WINDOW_MS  700      /* ...within this window -> onset */
+#define VAD_FLOOR_SAMPLE_MS  500      /* silent window to latch the ambient floor */
 ```
 
 - [ ] **Step 2: Declare the onset query in `src/mic_vad.h`**
@@ -336,20 +340,23 @@ bool mic_vad_voice_onset(void);
 
 - [ ] **Step 3: Implement the latched-floor + onset state machine in `src/mic_vad.cpp`**
 
-Add the threshold include is already there (`gesture_thresholds.h`)? `mic_vad.cpp` does NOT include
-it yet — add near the top:
+`mic_vad.cpp` does NOT include the thresholds yet — add near the top includes:
 ```cpp
 #include "gesture_thresholds.h"
 ```
 Add state + the onset flag near `static atomic_t mic_running`:
 ```cpp
-static atomic_t mic_onset = ATOMIC_INIT(0);   /* latched voiced-onset */
+static atomic_t mic_onset = ATOMIC_INIT(0);   /* latched voiced-onset, read-and-clear */
 
-/* Floor-latch state, owned by the mic thread. */
-static bool   mic_floor_latched;
-static float  mic_latched_floor;
+/* Floor-latch + M-of-N onset state, owned by the single mic thread. */
+static bool    mic_floor_latched;
+static float   mic_floor_vem;          /* frozen ambient floor (veM units) */
+static float   mic_floor_sum;          /* accumulator during the latch window */
+static int     mic_floor_n;
 static int64_t mic_listen_start_ms;
-static int    mic_onset_run;                  /* consecutive above-thresh blocks */
+static int64_t mic_hot_ts[VAD_ONSET_HITS];   /* ring of recent hot-block times */
+static int     mic_hot_idx;
+static int     mic_hot_count;
 ```
 In `mic_vad_start()` reset the session:
 ```cpp
@@ -357,9 +364,12 @@ void mic_vad_start(void)
 {
     atomic_set(&mic_onset, 0);
     mic_floor_latched = false;
-    mic_latched_floor = 0.0f;
-    mic_onset_run = 0;
+    mic_floor_vem = 0.0f;
+    mic_floor_sum = 0.0f;
+    mic_floor_n   = 0;
     mic_listen_start_ms = k_uptime_get();
+    mic_hot_idx   = 0;
+    mic_hot_count = 0;
     atomic_set(&mic_running, 1);
 }
 ```
@@ -370,40 +380,49 @@ bool mic_vad_voice_onset(void)
     return atomic_set(&mic_onset, 0) != 0;   /* read-and-clear */
 }
 ```
-In `mic_thread()`, after `float ve = mic_voiced_energy(pcm, nsamp);` and the slab free, REPLACE the
-measurement-only EMA/log block from Task 1 Step 7 with the latch + onset logic (keep the `[MIC]` log
-for visibility):
+In `mic_thread()`, REPLACE the current `veM`/`frac` compute-and-log block (added in Task 1's
+instrument fix) — i.e. from `int veM ...` (or `float veM ...`) down through the `LOG_INF("[MIC] ...")`
+— with the latch + M-of-N onset logic (keep the `[MIC]` log, extended with floor/latched):
 ```cpp
+            float veM = ve / 1.0e6f;                       /* voiced energy, millions */
+            int   frac = (te > 1.0f) ? (int)(1000.0f * ve / te) : 0;  /* diagnostic only */
             int64_t now = k_uptime_get();
-            int blocks_dwell = (VAD_ONSET_DWELL_MS + 19) / 20;   /* ~20 ms/block */
 
             if (!mic_floor_latched) {
-                /* Accumulate the ambient floor over the silent window, then freeze. */
-                mic_latched_floor = (mic_latched_floor == 0.0f)
-                                  ? ve : (0.7f * mic_latched_floor + 0.3f * ve);
+                /* Mean ambient veM over the silent window, then freeze it. */
+                mic_floor_sum += veM;
+                mic_floor_n++;
                 if ((now - mic_listen_start_ms) >= VAD_FLOOR_SAMPLE_MS) {
+                    mic_floor_vem = (mic_floor_n > 0) ? (mic_floor_sum / mic_floor_n) : veM;
                     mic_floor_latched = true;
-                    LOG_INF("[MIC] floor latched=%d", (int)mic_latched_floor);
+                    LOG_INF("[MIC] floor latched veM=%d", (int)mic_floor_vem);
                 }
             } else {
-                bool above = (ve >= VAD_VOICED_ABS_MIN) &&
-                             (ve >= VAD_VOICED_RATIO_K * mic_latched_floor);
-                mic_onset_run = above ? (mic_onset_run + 1) : 0;
-                if (mic_onset_run >= blocks_dwell) {
-                    atomic_set(&mic_onset, 1);
-                    mic_onset_run = 0;           /* avoid re-firing every block */
+                float thresh = VAD_K * mic_floor_vem;
+                if (thresh < VAD_VEM_ABS_MIN) thresh = VAD_VEM_ABS_MIN;  /* quiet-room backstop */
+                if (veM >= thresh) {                       /* "hot" block */
+                    mic_hot_ts[mic_hot_idx] = now;
+                    mic_hot_idx = (mic_hot_idx + 1) % VAD_ONSET_HITS;
+                    if (mic_hot_count < VAD_ONSET_HITS) mic_hot_count++;
+                    /* After advancing, mic_hot_ts[mic_hot_idx] is the oldest of the
+                     * last VAD_ONSET_HITS hot blocks. >= HITS hot within the window
+                     * (gaps allowed -- speech veM is bursty) => onset. */
+                    if (mic_hot_count == VAD_ONSET_HITS &&
+                        (now - mic_hot_ts[mic_hot_idx]) <= VAD_ONSET_WINDOW_MS) {
+                        atomic_set(&mic_onset, 1);
+                        mic_hot_count = 0;                 /* re-arm; don't spam */
+                    }
                 }
             }
 
-            if ((++log_ctr % 5) == 0) {
-                LOG_INF("[MIC] voiced=%d floor=%d latched=%d run=%d",
-                        (int)ve, (int)mic_latched_floor,
-                        (int)mic_floor_latched, mic_onset_run);
+            if ((++log_ctr % 5) == 0) {   /* ~10 Hz */
+                LOG_INF("[MIC] rms=%d veM=%d frac=%d floor=%d lat=%d",
+                        (int)rms, (int)veM, frac, (int)mic_floor_vem,
+                        (int)mic_floor_latched);
             }
 ```
-Remove the now-unused `floor_rms` / `voiced_floor` measurement accumulators and the `rms` call if no
-longer referenced (keep `mic_vad_block_rms` in the module — it is still part of the public API + host
-test). If `rms` becomes unused, drop the local to avoid a `-Werror=unused-variable`.
+Keep `mic_vad_block_rms`/`rms` (still public API + host test, and `rms` is still logged). Do not
+re-introduce the removed `floor_rms`/`voiced_floor` accumulators.
 
 - [ ] **Step 4: Build firmware**
 
