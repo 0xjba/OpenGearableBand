@@ -1,13 +1,16 @@
 /*
- * mic_vad -- PDM-mic feasibility probe (dictation entry A.0).
+ * mic_vad -- PDM-mic capture + voice features (dictation entry A.0 + A.1).
  *
  * Captures 16 kHz mono audio from the onboard MSM261D3526H1CPM via Zephyr's
- * DMIC API on its own thread and logs short-term RMS energy ([MIC]) so the
- * wrist-mic voice-at-ear-vs-ambient separability can be measured before any
- * VAD/FSM is built.  Isolated like bio_acoustic: no dependency into the
- * gesture FSM.  Plan: docs/superpowers/plans/2026-06-17-dictation-entry-A0-
- * mic-feasibility.md.  The pure RMS helper lives in mic_vad_rms.cpp (host-
- * tested); this TU is Zephyr-only.
+ * DMIC API on its own thread.  A.0 logs short-term RMS energy ([MIC]); A.1
+ * adds a voiced-band (300-3000 Hz) spectral-energy feature (CMSIS rFFT) to the
+ * same [MIC] line so the speech-vs-ambient separability can be measured, ahead
+ * of the latched-floor voice-onset detector.  Isolated like bio_acoustic: no
+ * dependency into the gesture FSM.  Plans:
+ * docs/superpowers/plans/2026-06-17-dictation-entry-A0-mic-feasibility.md and
+ * .../2026-06-17-dictation-entry-A1-voice-onset-fsm.md.  The pure helpers
+ * (mic_vad_block_rms, mic_vad_band_sum) live in mic_vad_rms.cpp (host-tested);
+ * this TU is Zephyr-only.
  */
 #include "mic_vad.h"
 
@@ -15,6 +18,8 @@
 #include <zephyr/audio/dmic.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/atomic.h>
+#include <math.h>
+#include <arm_math.h>
 
 LOG_MODULE_REGISTER(mic_vad, LOG_LEVEL_INF);
 
@@ -24,6 +29,42 @@ LOG_MODULE_REGISTER(mic_vad, LOG_LEVEL_INF);
 #define MIC_BLOCK_SAMPLES  (MIC_PCM_RATE_HZ * 20 / 1000)   /* 320 */
 #define MIC_BLOCK_BYTES    (MIC_BLOCK_SAMPLES * 2)          /* 640 */
 #define MIC_SLAB_BLOCKS    4
+
+/* Voiced-band spectral feature. 512-pt real FFT over the 320-sample block
+ * (Hann-windowed, zero-padded). Bin width = 16000/512 = 31.25 Hz.
+ * Voiced band 300-3000 Hz => bins 10..96 (300/31.25=9.6->10, 3000/31.25=96). */
+#define MIC_FFT_N        512
+#define MIC_VOICED_LO    10
+#define MIC_VOICED_HI    96
+
+static arm_rfft_fast_instance_f32 mic_fft;
+static float mic_hann[MIC_BLOCK_SAMPLES];       /* 320-pt Hann window */
+static float mic_fft_in[MIC_FFT_N];             /* windowed + zero-padded */
+static float mic_fft_out[MIC_FFT_N];            /* packed real FFT output */
+static float mic_bin_e[MIC_FFT_N / 2];          /* per-bin energy (re^2+im^2) */
+static bool  mic_fft_ready;                     /* set by a successful FFT init */
+
+/* Voiced-band energy of one int16 block: Hann-window, zero-pad to 512, rFFT,
+ * sum |X|^2 over bins MIC_VOICED_LO..MIC_VOICED_HI. */
+static float mic_voiced_energy(const int16_t *s, size_t n)
+{
+    if (!mic_fft_ready) return 0.0f;   /* init failed; don't read a bad instance */
+    size_t m = (n < MIC_BLOCK_SAMPLES) ? n : MIC_BLOCK_SAMPLES;
+    for (size_t i = 0; i < m; i++)         mic_fft_in[i] = (float)s[i] * mic_hann[i];
+    for (size_t i = m; i < MIC_FFT_N; i++) mic_fft_in[i] = 0.0f;
+
+    arm_rfft_fast_f32(&mic_fft, mic_fft_in, mic_fft_out, 0 /* forward */);
+
+    /* Packed format: out[0]=DC real, out[1]=Nyquist real, then re,im pairs.
+     * Same convention as bio_acoustic.cpp (verified against CMSIS source). */
+    mic_bin_e[0] = mic_fft_out[0] * mic_fft_out[0];
+    for (int k = 1; k < MIC_FFT_N / 2; k++) {
+        float re = mic_fft_out[2 * k];
+        float im = mic_fft_out[2 * k + 1];
+        mic_bin_e[k] = re * re + im * im;
+    }
+    return mic_vad_band_sum(mic_bin_e, MIC_FFT_N / 2, MIC_VOICED_LO, MIC_VOICED_HI);
+}
 
 K_MEM_SLAB_DEFINE(mic_slab, MIC_BLOCK_BYTES, MIC_SLAB_BLOCKS, 4);
 
@@ -78,6 +119,7 @@ static void mic_thread(void *, void *, void *)
     }
 
     float floor_rms = 0.0f;        /* slow ambient-floor estimate */
+    float voiced_floor = 0.0f;
     int   log_ctr = 0;
 
     for (;;) {
@@ -93,17 +135,21 @@ static void mic_thread(void *, void *, void *)
             int rc = dmic_read(mic_dev, 0, &buf, &size, 1000);
             if (rc < 0) { LOG_ERR("[MIC] read err %d", rc); break; }
 
-            float rms = mic_vad_block_rms((const int16_t *)buf, size / 2);
+            const int16_t *pcm = (const int16_t *)buf;
+            size_t nsamp = size / 2;
+            float rms = mic_vad_block_rms(pcm, nsamp);
+            float ve  = mic_voiced_energy(pcm, nsamp);
             k_mem_slab_free(&mic_slab, buf);   /* return the block */
 
-            /* Slow floor tracker (ambient). */
-            floor_rms = (floor_rms == 0.0f) ? rms : (0.98f * floor_rms + 0.02f * rms);
-            float ratio = (floor_rms > 1.0f) ? (rms / floor_rms) : 0.0f;
+            /* Measurement floors (live EMA -- a later task replaces with a latch). */
+            floor_rms    = (floor_rms == 0.0f)    ? rms : (0.98f * floor_rms + 0.02f * rms);
+            voiced_floor = (voiced_floor == 0.0f) ? ve  : (0.98f * voiced_floor + 0.02f * ve);
+            float vratio = (voiced_floor > 1.0f) ? (ve / voiced_floor) : 0.0f;
 
             if ((++log_ctr % 5) == 0) {   /* ~10 Hz */
-                LOG_INF("[MIC] rms=%d floor=%d ratio=%d.%02d",
-                        (int)rms, (int)floor_rms,
-                        (int)ratio, (int)((ratio - (int)ratio) * 100));
+                LOG_INF("[MIC] rms=%d voiced=%d vfloor=%d vratio=%d.%02d",
+                        (int)rms, (int)ve, (int)voiced_floor,
+                        (int)vratio, (int)((vratio - (int)vratio) * 100));
             }
         }
         dmic_trigger(mic_dev, DMIC_TRIGGER_STOP);
@@ -118,6 +164,15 @@ void mic_vad_init(void)
     /* mic_dev is resolved at compile time (see its definition).  This call just
      * reports readiness at boot; the probe stays idle until mic_vad_start(). */
     LOG_INF("[MIC] init (pdm0 %s)", device_is_ready(mic_dev) ? "ready" : "NOT READY");
+    arm_status fft_st = arm_rfft_fast_init_f32(&mic_fft, MIC_FFT_N);
+    mic_fft_ready = (fft_st == ARM_MATH_SUCCESS);
+    if (!mic_fft_ready) {
+        LOG_ERR("[MIC] arm_rfft_fast_init_f32 failed (%d) -- voiced energy disabled",
+                (int)fft_st);
+    }
+    for (int i = 0; i < (int)MIC_BLOCK_SAMPLES; i++) {
+        mic_hann[i] = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * i / (MIC_BLOCK_SAMPLES - 1)));
+    }
 }
 
 void mic_vad_start(void) { atomic_set(&mic_running, 1); }

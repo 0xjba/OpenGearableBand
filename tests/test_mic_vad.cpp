@@ -21,6 +21,14 @@ int main(void) {
     for (int i = 0; i < 100; i++) sq[i] = (i % 2) ? 10000 : -10000;
     CHECK(fabsf(mic_vad_block_rms(sq, 100) - 10000.0f) < 1e-3f);
 
+    /* Band-sum: sum of bins [lo,hi] inclusive, clamped to [0,n). */
+    float e[8] = {0,1,2,3,4,5,6,7};
+    CHECK(mic_vad_band_sum(e, 8, 2, 4) == 9.0f);      /* 2+3+4 */
+    CHECK(mic_vad_band_sum(e, 8, 0, 100) == 28.0f);   /* hi clamped to 7 */
+    CHECK(mic_vad_band_sum(e, 8, 5, 1) == 0.0f);      /* lo>hi -> 0 */
+    CHECK(mic_vad_band_sum(e, 0, 0, 3) == 0.0f);      /* empty */
+    CHECK(mic_vad_band_sum(e, 8, -2, 3) == 6.0f);     /* lo clamped to 0: 0+1+2+3 */
+
     printf(failures ? "FAILURES: %d\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }

@@ -8,15 +8,20 @@
 extern "C" {
 #endif
 
-/* A.0: PDM mic feasibility probe. mic_vad_init() at boot; start/stop toggled
- * from the serial console. While started, the capture thread logs per-block
- * RMS energy as [MIC]. (A.1 will add voice-onset + the pose-gated power enable.) */
+/* PDM mic capture. mic_vad_init() at boot; start/stop toggled from the serial
+ * console (A.0) or the POSE_EAR gate (A.1). While started, the capture thread
+ * logs per-block RMS + voiced-band (300-3000 Hz) energy as [MIC]. (A.1 adds the
+ * latched-floor voice-onset detector on top of this.) */
 void  mic_vad_init(void);
 void  mic_vad_start(void);
 void  mic_vad_stop(void);
 
 /* Pure: RMS of a 16-bit PCM block. Exposed for host unit test. */
 float mic_vad_block_rms(const int16_t *samples, size_t n);
+
+/* Pure: sum of energy bins e[lo..hi] inclusive, indices clamped to [0,n).
+ * Returns 0 if lo>hi or n==0. Exposed for host unit test. */
+float mic_vad_band_sum(const float *e, size_t n, int lo, int hi);
 
 #ifdef __cplusplus
 }
