@@ -362,6 +362,7 @@ In `mic_vad_start()` reset the session:
 ```cpp
 void mic_vad_start(void)
 {
+    if (atomic_get(&mic_running)) return;   /* idempotent: no re-init under the running thread */
     atomic_set(&mic_onset, 0);
     mic_floor_latched = false;
     mic_floor_vem = 0.0f;
@@ -488,14 +489,18 @@ static void ear_gate_update(pose_id_t best)
     orientation_get(&ori);
     int64_t now = k_uptime_get();
 
-    bool ear_now = (best == POSE_EAR) && ori.at_rest;
-    if (ear_now) ear_last_match_ms = now;
+    /* HOLD keys on the gravity pose alone (NOT at_rest): speaking is motion, so
+     * at_rest flickers false while talking -- gating the hold on it would drop the
+     * mic mid-speech. Exit = pose dropping (gravity leaves the cone), per spec §7.
+     * at_rest is required only on the START edge (clean floor latch, spec §6). */
+    bool ear_pose = (best == POSE_EAR);
+    if (ear_pose) ear_last_match_ms = now;
 
     if (!ear_mic_on) {
-        if (ear_now) {
+        if (ear_pose && ori.at_rest) {
             ear_mic_on = true;
             mic_vad_start();          /* begins the floor-latch window */
-            LOG_INF("POSE_EAR held -> mic ON (listening)");
+            LOG_INF("POSE_EAR held + still -> mic ON (listening)");
         }
         return;
     }
