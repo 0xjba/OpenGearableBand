@@ -593,6 +593,10 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // Pose-observability trace -- hold a pose, logs gravity/shadow/
             // pitch/roll to measure the roll-observability cone.
             pending_cmd = 'v';
+        } else if (c == 'd' || c == 'D') {
+            // Phase-2 rest->ear rotation trace -- hold arm at rest, press, then
+            // raise to ear & hold; logs the delta-quaternion (angle+axis).
+            pending_cmd = 'd';
         } else if (c == 'u' || c == 'U') {
             // Clear ALL stored BLE bonds.  A UF2 reflash does not erase the
             // settings partition, so a stale bond survives and a host that
@@ -637,6 +641,7 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'q'=PPG quality probe (20s perfusion-index capture for wear position)");
     LOG_INF("  'z'=gyro bias trace (hold still 60s -> bias/noise per axis)");
     LOG_INF("  'v'=pose trace (hold a pose 30s -> gravity/shadow/pitch/roll)");
+    LOG_INF("  'd'=rest->ear rotation trace (hold still, press, raise & hold; per posture)");
     LOG_INF("  'u'=clear ALL BLE bonds (then Forget on host + re-pair)");
     LOG_INF("  'm'=toggle PDM mic bench probe ([MIC] rms/veM/frac log; off for gate test)");
 
@@ -761,6 +766,12 @@ void reset_thread_entry(void *, void *, void *) {
             // Pose-observability trace: ~30 s at 100 Hz, logged from the acq
             // pipeline (runs in IDLE).  Hold the pose still.
             gesture_mode_pose_trace_start(3000);
+        } else if (cmd == 'd') {
+            pending_cmd = 0;
+            // Phase-2 rest->ear rotation trace: snapshots rest NOW (hold arm
+            // still when you press), then logs rest->now delta-quaternion for
+            // ~20 s.  Raise to ear & hold; repeat per posture (sit/lean/back/side).
+            gesture_mode_rest_delta_trace_start(2000);
         } else if (cmd == 'z') {
             pending_cmd = 0;
             // Stationary gyro-bias trace.  Accumulation happens in the
