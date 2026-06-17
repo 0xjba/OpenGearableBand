@@ -173,13 +173,6 @@ bool gesture_mode_recent_activity(void);
  * current mount; assumes nothing from prior sessions. */
 void gesture_mode_pose_trace_start(uint32_t n_samples);
 
-/* Phase-2 feasibility trace: snapshots the current orientation quaternion as a
- * REST reference (call with the arm held still), then logs the relative rotation
- * rest->now (angle + axis) at ~5 Hz for n_samples. Used to measure whether the
- * "bring hand to ear" rotation clusters across body postures (sit/lean/back/side)
- * before building a posture-independent delta-quaternion raise gate. */
-void gesture_mode_rest_delta_trace_start(uint32_t n_samples);
-
 /*
  * Read the current mode.  Thread-safe (uses atomic_t internally).
  * Cheap; safe to call from any thread including ISRs.

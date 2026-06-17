@@ -495,62 +495,6 @@ static void pose_trace_tick(void)
             (double)ori.pitch_deg, (double)ori.roll_deg, (int)ori.at_rest);
 }
 
-/* --- Phase-2 feasibility: rest->now rotation (delta-quaternion) trace ------
- * Snapshots the orientation quaternion as a REST reference (call with the arm
- * held still), then logs the relative rotation rest->now as axis-angle. The
- * relative rotation of "bring hand to ear" should be ~posture-independent
- * (sit/lean/back/side) even though absolute gravity is not -- this trace lets us
- * MEASURE whether it actually clusters before building a delta-quaternion gate.
- * Reuses orientation_get()'s quaternion; yaw drift over a short raise is small
- * and not on the elevation/pronation axes that the gesture uses. */
-static float    q_rest[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-static uint32_t rest_delta_remaining = 0;
-static uint32_t rest_delta_div = 0;
-
-void gesture_mode_rest_delta_trace_start(uint32_t n_samples)
-{
-    orientation_state_t ori;
-    orientation_get(&ori);
-    q_rest[0] = ori.qw; q_rest[1] = ori.qx;
-    q_rest[2] = ori.qy; q_rest[3] = ori.qz;
-    rest_delta_remaining = n_samples;
-    rest_delta_div = 0;
-    LOG_INF("REST-DELTA: rest captured -- now raise to your ear & HOLD; logging "
-            "rest->now rotation ~%u s (angle + axis). Repeat per posture.",
-            n_samples / 100u);
-}
-
-static void rest_delta_trace_tick(void)
-{
-    if (rest_delta_remaining == 0) return;
-    rest_delta_remaining--;
-    if (++rest_delta_div < 20) return;   /* ~5 Hz at 100 Hz acq */
-    rest_delta_div = 0;
-
-    orientation_state_t ori;
-    orientation_get(&ori);
-
-    /* Q_delta = conj(q_rest) * q_now  (relative rotation, rest -> now). */
-    float rw = q_rest[0], rx = q_rest[1], ry = q_rest[2], rz = q_rest[3];
-    float w = ori.qw, x = ori.qx, y = ori.qy, z = ori.qz;
-    float dw = rw*w + rx*x + ry*y + rz*z;
-    float dx = rw*x - rx*w - ry*z + rz*y;
-    float dy = rw*y + rx*z - ry*w - rz*x;
-    float dz = rw*z - rx*y + ry*x - rz*w;
-
-    /* Shorter-arc: keep dw >= 0 so angle is in [0,180]. */
-    if (dw < 0.0f) { dw = -dw; dx = -dx; dy = -dy; dz = -dz; }
-    if (dw > 1.0f) dw = 1.0f;
-    float angle_deg = 2.0f * acosf(dw) * RAD_TO_DEG;
-    float s = sqrtf(1.0f - dw * dw);
-    float axx = 0.0f, axy = 0.0f, axz = 0.0f;
-    if (s > 1e-4f) { axx = dx / s; axy = dy / s; axz = dz / s; }
-
-    LOG_INF("REST-DELTA angle=%.0f axis=(%.2f,%.2f,%.2f) at_rest=%d",
-            (double)angle_deg, (double)axx, (double)axy, (double)axz,
-            (int)ori.at_rest);
-}
-
 void gesture_mode_update_accel(float ax, float ay, float az)
 {
     /* Stash raw accel for the orientation filter (fused with the gyro
@@ -575,8 +519,6 @@ void gesture_mode_update_accel(float ax, float ay, float az)
 
     /* Observability-cone measurement trace (no-op unless armed via 'v'). */
     pose_trace_tick();
-    /* Phase-2 rest->now rotation trace (no-op unless armed via 'd'). */
-    rest_delta_trace_tick();
 
     /* Reclassify orientation based on filtered gravity. */
     WristOrientation new_classification = _classify_orientation(
