@@ -46,16 +46,24 @@
  *  housing, and users pose differently; re-measure all of these.
  */
 
-/* POSE_EAR [USER][HOUSING]: phone-call/raise-to-ear pose. Measured 2026-06-17
- * (20 s held trace, g=(8.2,-4.6,2.6) m/s^2; normalized below). Dominant gx
- * separates it from a generic raise. TOL is PROVISIONAL -- tighten/loosen in the
- * HW verification step so it arms ONLY when settled at the ear, not mid-raise. */
-/* Unit vector = (8.2,-4.6,2.6)/9.755; 4-dp so |canonical|~1.0 (pose_score
- * assumes a unit canonical). */
+/* POSE_EAR [USER][HOUSING]: phone-call/raise-to-ear pose. Canonical centre =
+ * (8.2,-4.6,2.6)/9.755, confirmed by the centroid of the 2026-06-17 HW arm
+ * samples (~(0.858,-0.442,0.264) -- essentially identical, so the CENTRE is
+ * right; only the WIDTH was wrong). 4-dp so |canonical|~1.0 (pose_score assumes
+ * a unit canonical). */
 #define POSE_EAR_GX             0.8406f
 #define POSE_EAR_GY             (-0.4716f)
 #define POSE_EAR_GZ             0.2665f
-#define POSE_EAR_TOL            0.906f   /* cos(25 deg); PROVISIONAL, verify on HW */
+/* Phase-1 posture-robustness (2026-06-17): WIDENED from 0.906 (cos25) so body
+ * lean (left/right/fwd/back) doesn't drop the pose. NOTE the effective ARM cone
+ * is where pose_score hits POSE_MATCH_THRESH(0.5): cos = 0.5 + 0.5*TOL. With
+ * TOL=0.64 -> arms within ~35 deg of centre (score-0 boundary ~50 deg), vs the
+ * old ~18 deg that the leans kept escaping. This is deliberately permissive: the
+ * pose is now a coarse raise PRE-GATE and the near-field voice (mic_vad) carries
+ * precision (gravity can't be posture-invariant; mic SPL can -- see research /
+ * Apple Raise-to-Speak). The real posture-robust gate is Phase 2 (delta-
+ * quaternion raise detector, reuses orientation_get()'s quaternion). PROVISIONAL. */
+#define POSE_EAR_TOL            0.64f
 
 /* SURFACE = wrist flat on desk, volar up.  Z-dominant, slight +X lean.
  * Tighter cone (tol 0.94 ≈ ±20°) to reduce lap false positives. */
