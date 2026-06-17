@@ -500,6 +500,7 @@ static void ear_gate_update(pose_id_t best)
         if (ear_pose && ori.at_rest) {
             ear_mic_on = true;
             mic_vad_start();          /* begins the floor-latch window */
+            (void)mic_vad_voice_onset();  /* discard any stale onset (e.g. left by an 'm' probe) */
             LOG_INF("POSE_EAR held + still -> mic ON (listening)");
         }
         return;

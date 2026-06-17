@@ -230,6 +230,10 @@ static void ear_gate_update(pose_id_t best)
         if (ear_pose && ori.at_rest) {    /* at_rest only here: clean floor latch */
             ear_mic_on = true;
             mic_vad_start();              /* begins the floor-latch window */
+            /* Discard any onset already latched before WE took ownership (e.g. a
+             * stale onset from a bench 'm' probe that left the mic running -- our
+             * mic_vad_start() is then a no-op and would NOT have cleared it). */
+            (void)mic_vad_voice_onset();
             LOG_INF("POSE_EAR held + still -> mic ON (listening)");
         }
         return;

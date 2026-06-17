@@ -601,9 +601,10 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // 'u', also Forget the device on the host, then re-pair.
             pending_cmd = 'u';
         } else if (c == 'm' || c == 'M') {
-            // PDM mic feasibility probe toggle.  Starts/stops the mic_vad
-            // capture thread; while running, logs [MIC] rms/floor/ratio at
-            // ~10 Hz so you can see the noise floor and voice-onset response.
+            // PDM mic bench probe toggle.  Starts/stops the mic_vad capture
+            // thread; while running, logs [MIC] rms/veM/frac/floor/lat at ~10 Hz.
+            // NOTE: the POSE_EAR gate also drives the mic automatically -- toggle
+            // this OFF before testing the gate so the two owners don't interleave.
             pending_cmd = 'm';
         }
         // Other chars are intentionally ignored -- silently dropping
@@ -638,7 +639,7 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'z'=gyro bias trace (hold still 60s -> bias/noise per axis)");
     LOG_INF("  'v'=pose trace (hold a pose 30s -> gravity/shadow/pitch/roll)");
     LOG_INF("  'u'=clear ALL BLE bonds (then Forget on host + re-pair)");
-    LOG_INF("  'm'=toggle PDM mic feasibility probe ([MIC] rms log)");
+    LOG_INF("  'm'=toggle PDM mic bench probe ([MIC] rms/veM/frac log; off for gate test)");
 
     while (1) {
         uint8_t cmd = pending_cmd;
