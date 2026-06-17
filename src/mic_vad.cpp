@@ -86,6 +86,7 @@ K_MEM_SLAB_DEFINE(mic_slab, MIC_BLOCK_BYTES, MIC_SLAB_BLOCKS, 4);
 static const struct device *mic_dev = DEVICE_DT_GET(DT_NODELABEL(pdm0));
 static atomic_t mic_running = ATOMIC_INIT(0);
 static atomic_t mic_onset = ATOMIC_INIT(0);   /* latched voiced-onset, read-and-clear */
+static atomic_t mic_voice_active = ATOMIC_INIT(0); /* near-field voice within VAD_VOICE_HOLD_MS */
 
 /* Floor-latch + M-of-N onset state, owned by the single mic thread. */
 static bool    mic_floor_latched;
@@ -96,6 +97,7 @@ static int64_t mic_listen_start_ms;
 static int64_t mic_hot_ts[VAD_ONSET_HITS];   /* ring of recent hot-block times */
 static int     mic_hot_idx;
 static int     mic_hot_count;
+static int64_t mic_last_hot_ms;              /* last hot block (voice-continuity hold) */
 
 static struct dmic_cfg make_cfg(struct pcm_stream_cfg *stream)
 {
@@ -180,6 +182,7 @@ static void mic_thread(void *, void *, void *)
                 float thresh = VAD_K * mic_floor_vem;
                 if (thresh < VAD_VEM_ABS_MIN) thresh = VAD_VEM_ABS_MIN;  /* quiet-room backstop */
                 if (veM >= thresh) {                       /* "hot" block */
+                    mic_last_hot_ms = now;                 /* for voice-continuity hold */
                     mic_hot_ts[mic_hot_idx] = now;
                     mic_hot_idx = (mic_hot_idx + 1) % VAD_ONSET_HITS;
                     if (mic_hot_count < VAD_ONSET_HITS) mic_hot_count++;
@@ -192,6 +195,14 @@ static void mic_thread(void *, void *, void *)
                         mic_hot_count = 0;                 /* re-arm; don't spam */
                     }
                 }
+                /* Voice-continuity: "still speaking at the near-field level" =
+                 * a hot block within VAD_VOICE_HOLD_MS. The gate uses this to hold
+                 * a session through a comfortable lean (pose out of the cone).
+                 * Self-limiting: lowering the arm makes voice far-field/quiet ->
+                 * not hot -> releases. Published as an atomic for the acq thread. */
+                bool voice_recent = (mic_last_hot_ms != 0) &&
+                                    ((now - mic_last_hot_ms) <= VAD_VOICE_HOLD_MS);
+                atomic_set(&mic_voice_active, voice_recent ? 1 : 0);
             }
 
             if ((++log_ctr % 5) == 0) {   /* ~10 Hz */
@@ -236,6 +247,8 @@ void mic_vad_start(void)
      * bench 'm' command) could both start. */
     if (atomic_get(&mic_running)) return;
     atomic_set(&mic_onset, 0);
+    atomic_set(&mic_voice_active, 0);
+    mic_last_hot_ms = 0;
     mic_floor_latched = false;
     mic_floor_vem = 0.0f;
     mic_floor_sum = 0.0f;
@@ -253,4 +266,9 @@ void mic_vad_stop(void)  { atomic_set(&mic_running, 0); }
 bool mic_vad_voice_onset(void)
 {
     return atomic_set(&mic_onset, 0) != 0;   /* read-and-clear */
+}
+
+bool mic_vad_voice_active(void)
+{
+    return atomic_get(&mic_voice_active) != 0;   /* non-clearing: ongoing state */
 }

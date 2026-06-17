@@ -221,6 +221,11 @@
 #define VAD_ONSET_HITS       3        /* hot blocks needed... */
 #define VAD_ONSET_WINDOW_MS  700      /* ...within this window -> onset */
 #define VAD_FLOOR_SAMPLE_MS  500      /* silent window to latch the ambient floor */
+/* Voice-continuity hold: a session held by ongoing near-field voice survives a
+ * lean (pose out of the cone) until both the pose is gone AND no hot block has
+ * occurred for this long. Covers natural speech gaps (breaths/sentences).
+ * Self-limiting: arm-down -> far-field/quiet voice -> not hot -> releases. */
+#define VAD_VOICE_HOLD_MS    1500
 
 /*
  * ============================================================================

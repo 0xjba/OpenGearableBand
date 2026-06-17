@@ -23,6 +23,11 @@ void  mic_vad_stop(void);
  * Reading it CLEARS the latch (one-shot per session). */
 bool mic_vad_voice_onset(void);
 
+/* True while near-field voice is ongoing -- a hot block occurred within
+ * VAD_VOICE_HOLD_MS. Non-clearing (reflects current state). Used to hold a
+ * session through a lean (pose out of cone) while the user keeps speaking. */
+bool mic_vad_voice_active(void);
+
 /* Pure: RMS of a 16-bit PCM block. Exposed for host unit test. */
 float mic_vad_block_rms(const int16_t *samples, size_t n);
 
