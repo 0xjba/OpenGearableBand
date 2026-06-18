@@ -14,3 +14,12 @@ build_*/
 *~
 .vscode/
 .idea/
+
+# Dictation audio test-receiver artifacts (tools/audio_rx.py output + local liblc3 build)
+*.lc3
+*.wav
+tools/lib/
+
+# Python bytecode cache (tools/audio_rx.py)
+__pycache__/
+*.pyc

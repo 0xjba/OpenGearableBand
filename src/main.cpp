@@ -20,6 +20,7 @@
 #include "gesture_mode.h"
 #include "orientation.h"
 #include "mic_vad.h"
+#include "audio_stream.h"
 #include <zephyr/settings/settings.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -1395,6 +1396,12 @@ int main(void) {
     // PDM mic feasibility probe (Task A).  Initialises the PDM device
     // and the capture thread (idle until 'm' serial command starts it).
     mic_vad_init();
+
+    // Dictation audio stream (sub-project B): init the LC3 encoder so the
+    // mic capture thread can encode+stream blocks while MODE_DICTATION is
+    // active and a host is subscribed.  The BLE audio GATT service auto-
+    // registers itself (BT_GATT_SERVICE_DEFINE in ble_audio.cpp).
+    audio_stream_init();
 
     // From this point on, the power state machine thread (started
     // automatically by K_THREAD_DEFINE) drives all sensor power and

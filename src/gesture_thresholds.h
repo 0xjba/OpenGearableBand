@@ -183,14 +183,23 @@
 /* --- Voice-onset VAD (dictation A.1) [HOUSING] -------------------------------
  * Mount-dependent (prototype skin-mount); EXPECTED TO MOVE when the housing is
  * built -- re-tune then. Discriminator (from HW measurement): absolute voiced
- * energy veM, against a floor latched per pose-entry (adaptive across
- * environments). Onset is M-of-N (speech veM is bursty, so a consecutive-block
- * dwell fails). */
+ * energy veM, against a CONTINUOUSLY-ADAPTIVE noise floor (industry-standard
+ * fast-attack-down / slow-release-up tracker, seeded by a min over a short
+ * warm-up). Onset is M-of-N (speech veM is bursty, so a consecutive-block dwell
+ * fails). */
 #define VAD_VEM_ABS_MIN      1200.0f  /* veM quiet-room backstop threshold */
-#define VAD_K                8.0f     /* x over the latched ambient floor (adaptive) */
+#define VAD_K                8.0f     /* x over the adaptive ambient floor */
 #define VAD_ONSET_HITS       3        /* hot blocks needed... */
 #define VAD_ONSET_WINDOW_MS  700      /* ...within this window -> onset */
-#define VAD_FLOOR_SAMPLE_MS  500      /* silent window to latch the ambient floor */
+#define VAD_FLOOR_SAMPLE_MS  500      /* warm-up window: seed the floor with the
+                                       * MIN veM over it (a transient burst at raise
+                                       * can't raise a min), then adapt continuously. */
+/* Adaptive floor release rate [STRUCTURAL]: per-block (20 ms) coefficient by which
+ * the floor rises toward a sustained louder level. Attack (down) is instant -- the
+ * floor snaps to the quiet valleys between syllables; release (up) is slow so
+ * speech peaks barely move it. 0.02 => ~1 s rise time constant. This is what makes
+ * a bad initial estimate self-heal within a breath and tracks a changing room. */
+#define VAD_FLOOR_UP_ALPHA   0.02f
 /* Voice-continuity hold: a session held by ongoing near-field voice survives a
  * lean (pose out of the cone) until both the pose is gone AND no hot block has
  * occurred for this long. Covers natural speech gaps (breaths/sentences).

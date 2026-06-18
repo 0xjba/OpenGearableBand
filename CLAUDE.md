@@ -55,11 +55,25 @@ known gotchas). Keep it current when these stable facts change.
   `MODE_IDLE` + `MODE_DICTATION`.
 - `src/mic_vad.{h,cpp}` + `src/mic_vad_rms.cpp` — PDM mic (16 kHz mono, DMIC) on
   its own capture thread; per-block voiced-band (300–3000 Hz) spectral energy via
-  CMSIS rFFT (`veM`); adaptive **latched-floor + M-of-N voice-onset**
-  (`mic_vad_voice_onset`, read-and-clear) + voice-continuity (`mic_vad_voice_active`);
-  `[MIC]` serial log. Pure helpers (`mic_vad_block_rms`, `mic_vad_band_sum`) in
-  `mic_vad_rms.cpp` are host-tested. Isolated — no dependency into the FSM; the FSM
-  gates it on `POSE_EAR`.
+  CMSIS rFFT (`veM`); **continuously-adaptive noise floor** (min-seeded over a
+  short warm-up, then instant-down / slow-up tracker — robust to a non-silent
+  raise; 2026-06-18) + **M-of-N voice-onset** (`mic_vad_voice_onset`, read-and-clear)
+  + voice-continuity (`mic_vad_voice_active`); `[MIC]` serial log. Pure helpers
+  (`mic_vad_block_rms`, `mic_vad_band_sum`) in `mic_vad_rms.cpp` are host-tested.
+  Isolated — no dependency into the FSM; the FSM gates it on `POSE_EAR`. The capture
+  loop also hands each block to `audio_stream_feed()` for the dictation stream.
+- **Dictation audio stream (sub-project B, 2026-06-18)** — streams `MODE_DICTATION`
+  mic audio over BLE as LC3, off the capture thread:
+  - `src/lc3_codec.{c,h}` — LC3 encoder wrapper (Google liblc3, `CONFIG_LIBLC3`);
+    16 kHz / 10 ms / 32 kbps → 40 B/frame; one 20 ms block → 80 B.
+  - `src/audio_stream.{h,cpp}` — bridge: capture thread copies the PCM block into a
+    `k_msgq`; a dedicated **audio thread** (prio 7) drains it, LC3-encodes, notifies.
+    Gate = `MODE_DICTATION && ble_audio_subscribed()`. Requests a fast BLE conn
+    interval on stream start. (Producer/consumer split is load-bearing — inline
+    encode+notify starved the PDM slab; see the B spec.)
+  - `src/ble_audio.{h,cpp}` — minimal custom 128-bit GATT service, one NOTIFY char,
+    own connection tracking + conn-param control. No control/status char.
+  - Borrowed from the prior `oneDiary` project; host test receiver `tools/audio_rx.py`.
 - `src/orientation.{h,cpp}` — Mahony complementary filter → pitch/roll
   (gravity-locked, drift-free), yaw (gyro-only, drifts), `at_rest` (ZUPT),
   gyro-bias (ZARU). Shared IMU foundation for pose detection. (Auto yaw re-zero on
@@ -74,10 +88,13 @@ known gotchas). Keep it current when these stable facts change.
 
 ## Threading
 acq thread (100 Hz IMU → `gesture_mode_update_accel/gyro`) · power thread (state
-machine + chip-tap servicing) · DSP thread (HR) · `mic_vad` capture thread (PDM
-16 kHz DMIC + FFT; runs only while `POSE_EAR` gates it on). Cross-thread state
-uses `atomic_t` (e.g. `mic_onset`, `mic_voice_active`) or a documented benign
-race (e.g. reading `gx_filt` for a threshold).
+machine + chip-tap servicing) · DSP thread (HR) · `mic_vad` capture thread (prio 6;
+PDM 16 kHz DMIC + FFT; runs only while `POSE_EAR` gates it on) · **audio thread**
+(prio 7, below capture so it can't starve the PDM slab; drains the PCM `k_msgq` →
+LC3 encode → BLE notify during `MODE_DICTATION`). Cross-thread state uses `atomic_t`
+(e.g. `mic_onset`, `mic_voice_active`) or a documented benign race (e.g. reading
+`gx_filt` for a threshold). Measured concurrent load (audio + HR + IMU) ≈ 30% CPU,
+~70% idle (2026-06-18).
 
 ## Serial console (single letters)
 `r` reboot · `b` UF2 bootloader · `g` dump gravity · `t` sim double-tap

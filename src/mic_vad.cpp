@@ -14,6 +14,7 @@
  */
 #include "mic_vad.h"
 #include "gesture_thresholds.h"
+#include "audio_stream.h"   /* dictation LC3->BLE bridge (sub-project B) */
 
 #include <zephyr/kernel.h>
 #include <zephyr/audio/dmic.h>
@@ -91,9 +92,8 @@ static atomic_t mic_idle = ATOMIC_INIT(0);    /* no voice for VAD_SESSION_SILENC
 
 /* Floor-latch + M-of-N onset state, owned by the single mic thread. */
 static bool    mic_floor_latched;
-static float   mic_floor_vem;          /* frozen ambient floor (veM units) */
-static float   mic_floor_sum;          /* accumulator during the latch window */
-static int     mic_floor_n;
+static float   mic_floor_vem;          /* live adaptive ambient floor (veM units) */
+static float   mic_floor_min;          /* min veM seen during the warm-up window */
 static int64_t mic_listen_start_ms;
 static int64_t mic_hot_ts[VAD_ONSET_HITS];   /* ring of recent hot-block times */
 static int     mic_hot_idx;
@@ -160,6 +160,10 @@ static void mic_thread(void *, void *, void *)
             float rms = mic_vad_block_rms(pcm, nsamp);
             float ve, te;
             mic_spectral(pcm, nsamp, &ve, &te);
+            /* Dictation audio stream (sub-project B): hand the raw block to the
+             * LC3->BLE bridge BEFORE freeing the slab. No-op unless
+             * MODE_DICTATION + a host is subscribed (audio_stream_active). */
+            audio_stream_feed(pcm, nsamp);
             k_mem_slab_free(&mic_slab, buf);   /* return the block */
 
             float veM = ve / 1.0e6f;                       /* voiced energy, millions */
@@ -167,19 +171,26 @@ static void mic_thread(void *, void *, void *)
             int64_t now = k_uptime_get();
 
             if (!mic_floor_latched) {
-                /* Mean ambient veM over the silent window, then freeze it.
-                 * Assumption: the user is silent during this window (POSE_EAR
-                 * requires at_rest + a hold before speaking); speaking now
-                 * inflates the floor and lowers sensitivity for the session. */
-                mic_floor_sum += veM;
-                mic_floor_n++;
+                /* Warm-up: seed the floor with the MIN veM over the window. Unlike
+                 * a mean, a min is immune to a transient burst -- so even if the
+                 * user is already talking (or there's a noise) at raise, the
+                 * quietest inter-syllable block sets a sane ambient seed. */
+                if (veM < mic_floor_min) mic_floor_min = veM;
                 if ((now - mic_listen_start_ms) >= VAD_FLOOR_SAMPLE_MS) {
-                    /* mic_floor_n >= 1 here (incremented above); guard is defensive. */
-                    mic_floor_vem = (mic_floor_n > 0) ? (mic_floor_sum / mic_floor_n) : veM;
+                    mic_floor_vem = mic_floor_min;
                     mic_floor_latched = true;
-                    LOG_INF("[MIC] floor latched (veM=%d) -- READY, listening for voice", (int)mic_floor_vem);
+                    LOG_INF("[MIC] floor seeded (veM=%d) -- READY, adaptive", (int)mic_floor_vem);
                 }
             } else {
+                /* Continuously adaptive noise floor (industry-standard tracker):
+                 * instant attack DOWN to the quiet valleys, slow release UP. Speech
+                 * peaks barely move it (slow up); inter-syllable gaps pull it to
+                 * ambient (instant down). Runs every block BEFORE the onset test, so
+                 * a bad seed self-heals within a breath and a changing room is
+                 * tracked. The VAD_VEM_ABS_MIN clamp below backstops a too-low floor. */
+                if (veM < mic_floor_vem) mic_floor_vem = veM;
+                else mic_floor_vem += (veM - mic_floor_vem) * VAD_FLOOR_UP_ALPHA;
+
                 float thresh = VAD_K * mic_floor_vem;
                 if (thresh < VAD_VEM_ABS_MIN) thresh = VAD_VEM_ABS_MIN;  /* quiet-room backstop */
                 if (veM >= thresh) {                       /* "hot" block */
@@ -214,7 +225,9 @@ static void mic_thread(void *, void *, void *)
                            ((now - ref) >= VAD_SESSION_SILENCE_MS) ? 1 : 0);
             }
 
-            if ((++log_ctr % 5) == 0) {   /* ~10 Hz */
+            if ((++log_ctr % 25) == 0) {   /* ~2 Hz (was 10 Hz -- flooded the log
+                                            * buffer and dropped thread-analyzer
+                                            * lines during the CPU bring-up) */
                 LOG_INF("[MIC] rms=%d veM=%d frac=%d floor=%d lat=%d",
                         (int)rms, (int)veM, frac, (int)mic_floor_vem,
                         (int)mic_floor_latched);
@@ -225,6 +238,11 @@ static void mic_thread(void *, void *, void *)
     }
 }
 
+/* Stack stays 2048: this thread does capture + CMSIS FFT VAD only. The dictation
+ * audio LC3 encode runs on a SEPARATE audio thread (audio_stream.cpp) fed by a
+ * msgq, so the slab buffer is freed the instant audio_stream_feed() copies it out
+ * -- keeping the PDM DMA drain immune to encode/BLE latency (2026-06-18 research
+ * finding; was the cause of the -12 slab-starvation dropouts). */
 K_THREAD_DEFINE(mic_thread_id, 2048, mic_thread, NULL, NULL, NULL, 6, 0, 0);
 
 void mic_vad_init(void)
@@ -261,8 +279,7 @@ void mic_vad_start(void)
     mic_last_hot_ms = 0;
     mic_floor_latched = false;
     mic_floor_vem = 0.0f;
-    mic_floor_sum = 0.0f;
-    mic_floor_n   = 0;
+    mic_floor_min = 1.0e30f;   /* seeded down to the window min during warm-up */
     /* Set before the thread wakes + the driver starts (~50 ms poll + trigger
      * latency later), so the effective floor window is slightly < SAMPLE_MS. */
     mic_listen_start_ms = k_uptime_get();

@@ -13,4 +13,7 @@ target_sources(app PRIVATE
     src/orientation.cpp
     src/mic_vad.cpp
     src/mic_vad_rms.cpp
+    src/lc3_codec.c
+    src/ble_audio.cpp
+    src/audio_stream.cpp
 )
