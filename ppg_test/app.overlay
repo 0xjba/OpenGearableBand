@@ -1,0 +1,32 @@
+/* MAX30105 PPG on I2C1 (D4=SDA/P0.04, D5=SCL/P0.05), addr 0x57.
+ * Same bus/address as the real firmware -- only this test lights the GREEN LED. */
+&pinctrl {
+	i2c1_default: i2c1_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>,
+				<NRF_PSEL(TWIM_SCL, 0, 5)>;
+			bias-pull-up;
+		};
+	};
+	i2c1_sleep: i2c1_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 4)>,
+				<NRF_PSEL(TWIM_SCL, 0, 5)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2c1 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c1_default>;
+	pinctrl-1 = <&i2c1_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_FAST>;
+
+	max30101: max30101@57 {
+		compatible = "maxim,max30101";
+		reg = <0x57>;
+	};
+};
