@@ -21,6 +21,8 @@
 #include "orientation.h"
 #include "mic_vad.h"
 #include "audio_stream.h"
+#include "audio_out.h"
+#include "sd_card.h"
 #include <zephyr/settings/settings.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -521,6 +523,13 @@ static const struct device *console_uart =
 // because a stray "old" value just delays the action by one poll cycle.
 static volatile uint8_t pending_cmd = 0;
 
+/* [UNIT] speaker bench test-tone ('p' command) -- retune per amp/speaker housing */
+static const uint32_t SPK_TEST_RATE_HZ = 16000;   /* must match audio_out session rate */
+static const float    SPK_TEST_FREQ_HZ = 440.0f;  /* A4 bench tone */
+static const int16_t  SPK_TEST_AMPL    = 8000;    /* ~-12 dBFS, avoid amp clip */
+static const int      SPK_TEST_CHUNK   = 160;     /* 10 ms @ 16 kHz */
+static const int      SPK_TEST_CHUNKS  = 100;     /* ~1 s total */
+
 // PPG quality probe request.  Set by the 'q' console command, consumed
 // by the power state thread (so all MAX/acq/power manipulation stays on
 // one thread).  See run_ppg_probe().
@@ -606,6 +615,16 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // NOTE: the POSE_EAR gate also drives the mic automatically -- toggle
             // this OFF before testing the gate so the two owners don't interleave.
             pending_cmd = 'm';
+        } else if (c == 'p' || c == 'P') {
+            // Speaker test tone: play a 440 Hz tone through audio_out (I2S amp).
+            pending_cmd = 'p';
+        } else if (c == 'w' || c == 'W') {
+            // TEST-ONLY: play /SD:/music.wav from the microSD card through
+            // audio_out (real-audio speaker test).
+            pending_cmd = 'w';
+        } else if (c >= '0' && c <= '9') {
+            // Speaker volume: '0'..'9' -> 0%..90% (boot default 100%).
+            pending_cmd = c;
         }
         // Other chars are intentionally ignored -- silently dropping
         // newlines / CR / unknown chars keeps the listener unbothered
@@ -640,6 +659,9 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'v'=pose trace (hold a pose 30s -> gravity/shadow/pitch/roll)");
     LOG_INF("  'u'=clear ALL BLE bonds (then Forget on host + re-pair)");
     LOG_INF("  'm'=toggle PDM mic bench probe ([MIC] rms/veM/frac log; off for gate test)");
+    LOG_INF("  'p'=play 440 Hz test tone through the speaker");
+    LOG_INF("  'w'=play music.wav from SD (test)");
+    LOG_INF("  '0'-'9'=speaker volume 0-90%% (boot default 100%%)");
 
     while (1) {
         uint8_t cmd = pending_cmd;
@@ -775,12 +797,44 @@ void reset_thread_entry(void *, void *, void *) {
             mic_on = !mic_on;
             if (mic_on) mic_vad_start(); else mic_vad_stop();
             LOG_INF("Mic probe %s", mic_on ? "ON ([MIC] rms logging)" : "OFF");
+        } else if (cmd == 'p') {
+            pending_cmd = 0;
+            LOG_INF("playing 440 Hz test tone via audio_out");
+            const float two_pi = 6.2831853f;
+            const float inc = two_pi * SPK_TEST_FREQ_HZ / (float)SPK_TEST_RATE_HZ;
+            float phase = 0.0f;
+            audio_out_start(SPK_TEST_RATE_HZ);
+            for (int chunk = 0; chunk < SPK_TEST_CHUNKS; chunk++) {  /* ~1 s, blocks the console */
+                int16_t buf[SPK_TEST_CHUNK];
+                for (int i = 0; i < SPK_TEST_CHUNK; i++) {
+                    buf[i] = (int16_t)(sinf(phase) * SPK_TEST_AMPL);
+                    phase += inc;
+                    if (phase >= two_pi) {
+                        phase -= two_pi;
+                    }
+                }
+                audio_out_write(buf, SPK_TEST_CHUNK);
+                k_msleep((SPK_TEST_CHUNK * 1000) / SPK_TEST_RATE_HZ);  /* pace ~realtime */
+            }
+            k_msleep(100);
+            audio_out_stop();
+        } else if (cmd == 'w') {
+            pending_cmd = 0;
+            LOG_INF("playing /SD:/music.wav through audio_out");
+            sd_card_play_wav_test("/SD:/music.wav");
+        } else if (cmd >= '0' && cmd <= '9') {
+            pending_cmd = 0;
+            uint8_t pct = (uint8_t)(cmd - '0') * 10;   // '0'..'9' -> 0..90%
+            audio_out_set_volume(pct);
+            LOG_INF("speaker volume = %u%%", pct);
         }
         k_sleep(K_MSEC(50));
     }
 }
 
-K_THREAD_DEFINE(reset_thread_id, 1024, reset_thread_entry, NULL, NULL, NULL, 10, 0, 0);
+// Stack bumped 1024 -> 4096: the 'w' console command runs the FAT stack
+// (fs_mount/fs_open/fs_read) inline on this thread, which needs the headroom.
+K_THREAD_DEFINE(reset_thread_id, 4096, reset_thread_entry, NULL, NULL, NULL, 10, 0, 0);
 
 // ============================================================================
 //  Power state machine (steps 6 + 7)
@@ -1402,6 +1456,17 @@ int main(void) {
     // active and a host is subscribed.  The BLE audio GATT service auto-
     // registers itself (BT_GATT_SERVICE_DEFINE in ble_audio.cpp).
     audio_stream_init();
+
+    // Downlink speaker output (audio_out): bind I2S + amp GPIO so callers can
+    // play audio via audio_out_write().  Test it now with the 'p' console tone.
+    if (audio_out_init() != 0) {
+        LOG_WRN("audio_out_init failed; speaker disabled");
+    }
+
+    // microSD (SPI + FAT).  Non-fatal: just logs if no card is present.  The
+    // primary future role is WRITING/recording; today the only read path is the
+    // 'w' console command's TEST-ONLY WAV playback through audio_out.
+    sd_card_init();
 
     // From this point on, the power state machine thread (started
     // automatically by K_THREAD_DEFINE) drives all sensor power and

@@ -16,4 +16,6 @@ target_sources(app PRIVATE
     src/lc3_codec.c
     src/ble_audio.cpp
     src/audio_stream.cpp
+    src/audio_out.cpp
+    src/sd_card.cpp
 )

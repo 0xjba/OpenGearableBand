@@ -23,3 +23,7 @@ tools/lib/
 # Python bytecode cache (tools/audio_rx.py)
 __pycache__/
 *.pyc
+
+# Test source audio + generated PCM header (regenerable via spkr_test/tools/)
+*.mp3
+spkr_test/src/clip_pcm.h

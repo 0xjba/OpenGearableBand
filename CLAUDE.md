@@ -102,6 +102,11 @@ LC3 encode → BLE notify during `MODE_DICTATION`). Cross-thread state uses `ato
 `q` PPG probe · `z` gyro-bias trace · `v` pose trace · `u` clear BLE bonds ·
 `m` PDM mic bench probe (`[MIC]` rms/veM/frac log; toggle OFF for the auto gate).
 
+**STANDING RULE:** every firmware AND throwaway test app must include the `r`
+(reboot, `sys_reboot` COLD) and `b` (UF2 bootloader via `NRF_POWER->GPREGRET=0x57`
++ reboot) console commands by default. Needs `CONFIG_REBOOT=y` +
+`CONFIG_UART_INTERRUPT_DRIVEN=y` + a `uart_rx_cb` on `DT_CHOSEN(zephyr_console)`.
+
 ## Gotchas (do not relearn these every session)
 - **Chip taps are serviced in ALL power states** (`service_chip_int1` from every
   state loop, not IDLE-only) — so pose/tap/dictation keep working during the
