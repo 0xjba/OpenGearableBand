@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-17
 **Status:** approved (scope confirmed); spec for the implementer
-**Branch:** feature/gesture-foundation
+**Branch:** beta
 
 ---
 

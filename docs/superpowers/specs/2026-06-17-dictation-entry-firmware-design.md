@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-17
 **Status:** design for review
-**Branch:** feature/gesture-foundation
+**Branch:** beta
 **Umbrella:** `docs/superpowers/specs/2026-06-07-gesture-triggered-dictation-design.md`
 (the full dictation product: A firmware entry · B BLE audio · C Mac app · D STT · E backend).
 This spec is **Sub-project A only**: the firmware voice-gated entry. B–E follow.

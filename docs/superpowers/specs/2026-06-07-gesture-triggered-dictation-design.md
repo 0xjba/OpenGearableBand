@@ -466,7 +466,7 @@ pose. No always-on listening, no continuous streaming.
   the same PDM mic; mutual exclusion required at the FSM level (cannot both be
   active). Coexistence will be implemented when item 6 ships.
 - Cursor-mode cooldown bug (project memory 2026-06-07): the cooldown-keeps-acq-alive
-  pattern shipped on `feature/gesture-foundation` is reused for `MODE_DICTATION`
+  pattern shipped on `beta` is reused for `MODE_DICTATION`
   cooldown — same problem, same fix, no new design.
 - Hardware wear position (memory): volar-side wrist mount means raising the wrist to
   the face puts the band toward the user's mouth — favorable PDM SNR. The wrist-at-face

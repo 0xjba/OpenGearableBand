@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-17
 **Status:** design for review
-**Branch:** feature/gesture-foundation
+**Branch:** beta
 **Sub-project:** A.1 of the dictation umbrella (`docs/superpowers/specs/2026-06-07-gesture-triggered-dictation-design.md`).
 **Predecessor:** A.0 (`docs/superpowers/specs/2026-06-17-dictation-entry-firmware-design.md`),
 BUILT + FLASHED + MEASURED — gate PASSED. This spec builds the entry FSM on A.0's `mic_vad` module.

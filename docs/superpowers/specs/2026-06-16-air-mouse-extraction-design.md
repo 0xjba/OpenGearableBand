@@ -2,13 +2,13 @@
 
 **Date:** 2026-06-16
 **Status:** approved-in-principle (user requested true extraction); spec for review
-**Branch:** feature/gesture-foundation (extract here; air-mouse preserved on feature/air-mouse @ 09b9eac)
+**Branch:** beta (extract here; air-mouse preserved on feature/air-mouse @ 09b9eac)
 
 ---
 
 ## 1. Goal
 
-Remove the air-mouse cursor feature from `feature/gesture-foundation`, leaving a
+Remove the air-mouse cursor feature from `beta`, leaving a
 clean, buildable **gesture + HR foundation** that future modes (dictation, etc.)
 hang off. Air-mouse is fully preserved on `feature/air-mouse`; this is a one-way
 removal on the foundation line. The foundation must still **boot and run**: IDLE +

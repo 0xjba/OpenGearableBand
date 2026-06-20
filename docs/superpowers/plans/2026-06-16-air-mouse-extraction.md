@@ -2,7 +2,7 @@
 
 > **For agentic workers:** execute as ONE atomic task — the tree will not build until ALL air-mouse is removed, so do every step, then build once at the end. Spec (the authoritative delete/strip/retain lists): `docs/superpowers/specs/2026-06-16-air-mouse-extraction-design.md`. Build: `./build.sh`. File map/commands: `CLAUDE.md`.
 
-**Goal:** Remove the air-mouse cursor feature from `feature/gesture-foundation`, leaving a clean, buildable gesture+HR foundation (IDLE + pose/tap/bio-acoustic + HR), with HR-independence retained. Air-mouse is preserved on `feature/air-mouse`.
+**Goal:** Remove the air-mouse cursor feature from `beta`, leaving a clean, buildable gesture+HR foundation (IDLE + pose/tap/bio-acoustic + HR), with HR-independence retained. Air-mouse is preserved on `feature/air-mouse`.
 
 **Architecture:** One-way removal. The foundation does NOT depend on cursor, so removal can't break foundation logic — the only risk is dangling references, caught by `./build.sh` + a `grep` sweep.
 

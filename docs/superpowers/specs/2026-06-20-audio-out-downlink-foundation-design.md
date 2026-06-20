@@ -1,7 +1,7 @@
 # Audio-Out (Speaker Downlink Foundation) — Design
 
 **Date:** 2026-06-20
-**Branch:** feature/gesture-foundation
+**Branch:** beta
 **Status:** Approved (design), pending implementation plan
 
 ## Goal

@@ -6,7 +6,7 @@ known gotchas). Keep it current when these stable facts change.
 
 > **Branch split (2026-06-16):** the **air-mouse cursor** feature was extracted
 > to branch **`feature/air-mouse`** (cursor_track / cursor_calib / cursor_pipeline
-> / ble_hid mouse + the AIR_MOUSE mode). **`feature/gesture-foundation`** (this
+> / ble_hid mouse + the AIR_MOUSE mode). **`beta`** (this
 > branch) is the clean **gesture-detection + HR foundation**: IMU orientation,
 > pose detection, the chip-tap / multi-tap counter, and the power/HR pipeline.
 > **Dictation entry (sub-project A.1) is built here**: raise-to-ear pose

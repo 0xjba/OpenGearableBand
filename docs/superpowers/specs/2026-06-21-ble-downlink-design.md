@@ -1,7 +1,7 @@
 # BLE Audio Downlink (phone → speaker) — Design
 
 **Date:** 2026-06-21
-**Branch:** feature/gesture-foundation
+**Branch:** beta
 **Status:** Approved (design), pending implementation plan
 **Builds on:** `audio_out` (speaker engine, committed af6d374), the uplink
 (`ble_audio`/`audio_stream`/`lc3_codec`, committed cd38b3f).

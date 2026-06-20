@@ -1,7 +1,7 @@
 # Downlink Clock Recovery (adaptive playout) — Design
 
 **Date:** 2026-06-22
-**Branch:** feature/gesture-foundation
+**Branch:** beta
 **Status:** Approved (design), pending implementation plan
 **Builds on:** the BLE audio downlink (`audio_downlink` / `ble_audio` / `audio_out`,
 committed `397bc49`).

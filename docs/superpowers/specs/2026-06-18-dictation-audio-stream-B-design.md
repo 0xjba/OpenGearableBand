@@ -1,7 +1,7 @@
 # Sub-project B — Dictation Audio Stream (BLE, LC3) — Design
 
 **Date:** 2026-06-18
-**Branch:** `feature/gesture-foundation`
+**Branch:** `beta`
 **Status:** Design — approved in brainstorm, pending spec review
 **Depends on:** A.1 (POSE_EAR + voice-onset → `MODE_DICTATION`, detect+log) — DONE.
 **Source of borrowed parts:** prior same-chipset project `oneDiary`
@@ -202,7 +202,7 @@ via `le_param_updated` (`conn params: interval=…`), the open item to verify on
 ## 8. BLE coexistence & `prj.conf` deltas
 
 ### Verified clean (data, 2026-06-18)
-`feature/gesture-foundation` has **no HID** anywhere: `prj.conf` BLE is only
+`beta` has **no HID** anywhere: `prj.conf` BLE is only
 `BT_HRS`, `BT_BAS`, `BT_SMP`, `BT_SIGNING`, `BT_SETTINGS`, `BT_MAX_PAIRED=4`. No
 `CONFIG_BT_HIDS`, no HID/mouse code in `src/` (the only "air-mouse/HID" hits are
 history comments). The HID-mouse GATT lives on `feature/air-mouse`. So our new
