@@ -32,10 +32,14 @@ static struct bt_uuid_128 ble_audio_dl_uuid = BT_UUID_INIT_128(
 /* Downlink control: 47A10004-9B70-4C2E-8A1D-2F6B9E4A77C1 */
 static struct bt_uuid_128 ble_audio_ctrl_uuid = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x47A10004, 0x9B70, 0x4C2E, 0x8A1D, 0x2F6B9E4A77C1));
+/* Downlink status (device -> host buffer feedback): 47A10005-9B70-4C2E-8A1D-2F6B9E4A77C1 */
+static struct bt_uuid_128 ble_audio_status_uuid = BT_UUID_INIT_128(
+	BT_UUID_128_ENCODE(0x47A10005, 0x9B70, 0x4C2E, 0x8A1D, 0x2F6B9E4A77C1));
 
 /* Connection / subscription state. Owned by this module (its own conn cbs). */
 static struct bt_conn *audio_conn;
 static bool   data_notifications_enabled;
+static bool   status_notifications_enabled;
 static uint16_t seq_num;
 static uint32_t drop_count;
 
@@ -47,6 +51,14 @@ static void data_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 	data_notifications_enabled = (value == BT_GATT_CCC_NOTIFY);
 	LOG_INF("audio notifications %s",
 		data_notifications_enabled ? "enabled" : "disabled");
+}
+
+static void status_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+	ARG_UNUSED(attr);
+	status_notifications_enabled = (value == BT_GATT_CCC_NOTIFY);
+	LOG_INF("downlink status notifications %s",
+		status_notifications_enabled ? "enabled" : "disabled");
 }
 
 static ssize_t dl_audio_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -95,6 +107,13 @@ BT_GATT_SERVICE_DEFINE(ble_audio_svc,
 	BT_GATT_CHARACTERISTIC(&ble_audio_ctrl_uuid.uuid,
 		BT_GATT_CHRC_WRITE,
 		BT_GATT_PERM_WRITE, NULL, dl_ctrl_write, NULL),
+	/* Downlink status: device->host buffer feedback. attrs[8]=decl, attrs[9]=value
+	 * (notify target), attrs[10]=CCC. */
+	BT_GATT_CHARACTERISTIC(&ble_audio_status_uuid.uuid,
+		BT_GATT_CHRC_NOTIFY,
+		BT_GATT_PERM_NONE, NULL, NULL, NULL),
+	BT_GATT_CCC(status_ccc_changed,
+		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
 );
 
 /* ---- Connection tracking (own callback set; coexists with main.cpp's) ---- */
@@ -123,6 +142,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 		audio_conn = NULL;
 	}
 	data_notifications_enabled = false;
+	status_notifications_enabled = false;
 }
 
 static void on_le_param_updated(struct bt_conn *conn, uint16_t interval,
@@ -148,6 +168,23 @@ BT_CONN_CB_DEFINE(ble_audio_conn_cb) = {
 bool ble_audio_subscribed(void)
 {
 	return (audio_conn != NULL) && data_notifications_enabled;
+}
+
+bool ble_audio_status_subscribed(void)
+{
+	return (audio_conn != NULL) && status_notifications_enabled;
+}
+
+int ble_audio_notify_status(const uint8_t *payload, uint16_t len)
+{
+	if (audio_conn == NULL || !status_notifications_enabled) {
+		return -ENOTCONN;
+	}
+	if (payload == NULL || len != BLE_AUDIO_STATUS_LEN) {
+		return -EINVAL;
+	}
+	/* attrs[9] = status characteristic value (see the service definition). */
+	return bt_gatt_notify(audio_conn, &ble_audio_svc.attrs[9], payload, len);
 }
 
 uint32_t ble_audio_drop_count(void)

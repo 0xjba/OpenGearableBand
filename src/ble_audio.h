@@ -1,27 +1,23 @@
 /*
- * ble_audio -- minimal custom GATT service that streams LC3 dictation audio
- * over BLE notifications.
+ * ble_audio -- custom GATT service for the BLE audio path (uplink LC3 dictation
+ * stream + downlink playback + buffer feedback).
  *
- * Scope (sub-project B): ONE notify characteristic, nothing else. No control
- * char, no status char, no host command protocol -- streaming is gesture-gated
- * (the device decides when it dictates; see audio_stream / MODE_DICTATION). The
- * host only subscribes.
+ * This module does NOT bootstrap Bluetooth: main.cpp owns bt_enable(), advertising
+ * (HRS+BAS), and its own connection callbacks. ble_audio adds its GATT service
+ * (auto-registered via BT_GATT_SERVICE_DEFINE) plus its own connection-tracking
+ * callbacks (BT_CONN_CB_DEFINE -- Zephyr invokes every registered set, so this
+ * coexists with main.cpp's).
  *
- * This module does NOT bootstrap Bluetooth: main.cpp already owns bt_enable(),
- * advertising (HRS+BAS), and its own connection callbacks. ble_audio only adds
- * its GATT service (auto-registered via BT_GATT_SERVICE_DEFINE) and its own
- * connection-tracking callbacks (BT_CONN_CB_DEFINE -- Zephyr invokes every
- * registered set, so this coexists with main.cpp's).
+ * Uplink wire format (notifications, gestureband-specific):
+ *   [seq: 2 bytes little-endian][payload: N bytes]   (B payload = one 80-byte LC3
+ *   block, so each notification is 82 bytes; the seq lets the receiver detect drops.)
  *
- * Wire format (gestureband-specific; intentionally NOT oneDiary-compatible):
- *   [seq: 2 bytes little-endian][payload: N bytes]
- * For B the payload is one 20 ms encoded block = 80 bytes (two 40-byte LC3
- * frames), so each notification is 82 bytes. The 2-byte sequence number lets the
- * test receiver detect dropped/reordered notifications.
- *
- * 128-bit UUIDs:
- *   Service:   47A10001-9B70-4C2E-8A1D-2F6B9E4A77C1
- *   Audio data 47A10002-9B70-4C2E-8A1D-2F6B9E4A77C1 (NOTIFY + CCC)
+ * 128-bit UUIDs (base ...-9B70-4C2E-8A1D-2F6B9E4A77C1):
+ *   Service:           47A10001
+ *   Uplink audio       47A10002  (NOTIFY + CCC)        device -> host LC3 stream
+ *   Downlink audio     47A10003  (WRITE / WRITE_NR)    host -> device LC3 stream
+ *   Downlink control   47A10004  (WRITE)               1-byte cmd; 0x01 = FLUSH
+ *   Downlink status    47A10005  (NOTIFY + CCC)        device -> host buffer feedback
  */
 
 #ifndef BLE_AUDIO_H
@@ -54,6 +50,20 @@ int ble_audio_notify(const uint8_t *payload, uint16_t len);
 /* Count of notifications dropped due to a full TX queue since boot. Read by the
  * bring-up instrumentation to size CONFIG_BT_L2CAP_TX_BUF_COUNT. */
 uint32_t ble_audio_drop_count(void);
+
+/* Downlink status report length: [ring_used u16 LE][ring_capacity u16 LE][flags u8].
+ * flags bit0=session active, bit1=overflowed-since-last, bit2=underran-since-last. */
+#define BLE_AUDIO_STATUS_LEN 5
+
+/* True when a central has subscribed (CCC) to the downlink status characteristic.
+ * The downlink reporter gates its notifications on this. */
+bool ble_audio_status_subscribed(void);
+
+/* Notify the downlink status characteristic. payload must be BLE_AUDIO_STATUS_LEN
+ * bytes. Non-blocking; returns 0 on success, -ENOTCONN if not subscribed, -EINVAL
+ * on a bad payload, other negative on error. Distinct from ble_audio_notify() (the
+ * uplink audio char). */
+int ble_audio_notify_status(const uint8_t *payload, uint16_t len);
 
 /* Request a connection interval suited to the current need:
  *   fast=true  -- short interval (~15-30 ms) so the host can sustain the ~50
