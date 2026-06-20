@@ -70,6 +70,43 @@ SEQ_HDR = 2
 BLOCK_MS = (FRAMES_PER_BLOCK * FRAME_SAMPLES * 1000) // SR_HZ  # 20 ms
 CTRL_FLUSH = 0x01             # BLE_AUDIO_CTRL_FLUSH
 
+AUDIO_STATUS_UUID = "47a10005-9b70-4c2e-8a1d-2f6b9e4a77c1"
+SETPOINT_MS = 120                       # target buffered audio (latency vs jitter)
+SETPOINT_BYTES = SETPOINT_MS * SR_HZ * 2 // 1000   # 120ms @ 16k mono 16-bit = 3840
+# Control-law gains (host clock recovery). Slow loop -> no oscillation; clamp must
+# EXCEED worst-case I2S drift (~0.8%), so +/-1.5%. See the design doc.
+CR_KP = 0.5            # proportional, on normalized error (used-setp)/capacity
+CR_KI = 0.02           # integral (slow)
+CR_CLAMP = 0.015       # +/-1.5% correction authority
+CR_INTEG_MAX = CR_CLAMP / CR_KI        # anti-windup: integral alone can't exceed clamp
+CR_FLAG_KICK = 0.10    # integral nudge on a hard over/underrun event
+# Status flags byte bits (mirror firmware ble_audio.h BLE_AUDIO_STATUS_FL_*).
+STATUS_FL_OVERFLOW = 0x02
+STATUS_FL_UNDERRUN = 0x04
+
+
+def clock_recovery_reset():
+    """Return a fresh controller integral (0.0). Call on barge-in flush / session
+    restart: `integ = clock_recovery_reset()`. Side-effect-free by design (the
+    integral is threaded through clock_recovery_step, not stored globally)."""
+    return 0.0
+
+
+def clock_recovery_step(integ, used, capacity, setpoint_bytes, ev_overflow, ev_underrun):
+    """Pure PI step. Returns (new_integ, pace_scale). pace_scale multiplies the
+    inter-block send interval: >1 = send slower (ring too full), <1 = faster.
+    The real app applies the same scale to its resample ratio instead."""
+    err = (used - setpoint_bytes) / float(capacity)     # >0 = too full -> slow down
+    integ += err
+    if ev_overflow:
+        integ += CR_FLAG_KICK       # too full -> bias slower
+    if ev_underrun:
+        integ -= CR_FLAG_KICK       # too empty -> bias faster
+    integ = max(-CR_INTEG_MAX, min(CR_INTEG_MAX, integ))   # anti-windup
+    corr = CR_KP * err + CR_KI * integ
+    corr = max(-CR_CLAMP, min(CR_CLAMP, corr))
+    return integ, 1.0 + corr
+
 
 class Lc3Encoder:
     """Minimal ctypes wrapper over liblc3's encoder (inverse of Lc3Decoder)."""
@@ -135,6 +172,9 @@ async def main():
     ap.add_argument("--address", default=None,
                     help="connect directly to this BLE address/UUID (skips the "
                          "name scan; use the address printed by the scan)")
+    ap.add_argument("--no-adaptive", action="store_true",
+                    help="disable clock-recovery (don't subscribe, fixed pacing) -- "
+                         "only to reproduce the drift baseline")
     args = ap.parse_args()
 
     enc = Lc3Encoder(args.lib)
@@ -251,10 +291,33 @@ async def main():
 
         print(f"Streaming {len(packets)} blocks to downlink ...")
 
+        # Clock-recovery state. adaptive ON by default; --no-adaptive => fixed pace.
+        adaptive = not args.no_adaptive
+        cr_integ = clock_recovery_reset()
+        pace_scale = 1.0
+
+        if adaptive:
+            def on_status(_char, data: bytearray):
+                nonlocal cr_integ, pace_scale
+                if len(data) != 5:
+                    return
+                used = data[0] | (data[1] << 8)
+                cap = data[2] | (data[3] << 8)
+                flags = data[4]
+                cr_integ, pace_scale = clock_recovery_step(
+                    cr_integ, used, cap or 1, SETPOINT_BYTES,
+                    1 if flags & STATUS_FL_OVERFLOW else 0,
+                    1 if flags & STATUS_FL_UNDERRUN else 0)
+            await client.start_notify(AUDIO_STATUS_UUID, on_status)
+            print("adaptive playout ON (subscribed to status 47A10005)")
+        else:
+            print("adaptive playout OFF (--no-adaptive baseline)")
+
         t0 = time.time()
         flush_at = args.flush_after if args.flush_after > 0 else None
         flushed = False
         sent = 0
+        planned_t = t0
 
         for pkt in packets:
             now = time.time()
@@ -266,12 +329,14 @@ async def main():
                 print(f"FLUSH sent at {now - t0:.2f}s (barge-in) -- stopping stream.")
                 flushed = True
                 break
-            # Write-Without-Response (unacked, high-throughput).
             await client.write_gatt_char(dl_char, pkt, response=False)
             sent += 1
-            # Pace to real time (~20 ms/block). Compensate for elapsed work.
-            target = t0 + sent * (BLOCK_MS / 1000.0)
-            delay = target - time.time()
+            # Pace to real time, scaled by the controller (>1 = slower). Running-sum
+            # accumulator: each block advances the planned clock by the CURRENT scale,
+            # so a scale change never retroactively reprices already-sent blocks. (Real
+            # Mac/phone apps should use this accumulator form, not target=t0+sent*block.)
+            planned_t += (BLOCK_MS / 1000.0) * pace_scale
+            delay = planned_t - time.time()
             if delay > 0:
                 await asyncio.sleep(delay)
 
