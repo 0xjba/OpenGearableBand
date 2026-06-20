@@ -51,7 +51,11 @@ static uint8_t  volume_pct = 75;
 /* --- DIAGNOSTIC: per-session glitch counters, logged at session end. --- */
 static uint32_t dbg_blocks;
 static uint32_t dbg_underruns;            /* ring held < a full block -> silence-padded */
+static uint32_t dbg_underruns_partial;    /* 0 < got < block: producer behind = AUDIBLE crackle
+                                           * (vs got==0 empties = gaps / the drain tail) */
 static uint32_t dbg_writeerr;
+static int64_t  dbg_play_start_ms;        /* uptime at first real block (effective-rate calc) */
+static uint32_t dbg_play_samples;         /* real mono samples clocked out (drift detector) */
 static atomic_t dbg_overflow = ATOMIC_INIT(0);
 
 static int i2s_setup(uint32_t rate)
@@ -131,7 +135,10 @@ static void feeder(void *a, void *b, void *c)
 		int primed = 0;
 		dbg_blocks = 0;
 		dbg_underruns = 0;
+		dbg_underruns_partial = 0;
 		dbg_writeerr = 0;
+		dbg_play_start_ms = 0;
+		dbg_play_samples = 0;
 		atomic_set(&dbg_overflow, 0);
 
 		while (atomic_get(&active)) {
@@ -145,6 +152,21 @@ static void feeder(void *a, void *b, void *c)
 			dbg_blocks++;
 			if (got < FRAMES_PER_BLOCK) {
 				dbg_underruns++;
+				/* 0 < got < block = ring not yet empty but producer is
+				 * behind -> this is the audible mid-stream crackle; got==0
+				 * is a full gap / the post-stream drain tail (inaudible). */
+				if (got > 0) {
+					dbg_underruns_partial++;
+				}
+			}
+			/* Effective I2S rate = real samples clocked / wall-clock. If it
+			 * reads > session_rate, the I2S clock runs fast and steadily drains
+			 * the jitter buffer (drift), vs burst jitter which wouldn't. */
+			if (got > 0) {
+				if (dbg_play_start_ms == 0) {
+					dbg_play_start_ms = k_uptime_get();
+				}
+				dbg_play_samples += got;
 			}
 
 			if (i2s_write(i2s_dev, block, I2S_BLOCK_BYTES) != 0) {
@@ -171,9 +193,23 @@ static void feeder(void *a, void *b, void *c)
 		 * the gate so the next audio_out_start() may arm. */
 		i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
 		amp_enable(false);
-		LOG_INF("audio_out session: %u blocks, %u underruns, %ld overflow, %u write-err",
-			dbg_blocks, dbg_underruns,
+		/* Two rates over the play span:
+		 *  - i2s_hz  = ALL samples clocked (real + silence pad) / time. Should
+		 *    read ~session_rate; a steady deviation = I2S clock drift.
+		 *  - audio_hz = REAL samples only / time. Below session_rate by the
+		 *    fraction of time spent silence-padding (the underrun cost). */
+		int64_t play_ms = dbg_play_start_ms ?
+			(k_uptime_get() - dbg_play_start_ms) : 0;
+		uint32_t i2s_hz = play_ms ?
+			(uint32_t)(((int64_t)dbg_blocks * FRAMES_PER_BLOCK * 1000) / play_ms) : 0;
+		uint32_t audio_hz = play_ms ?
+			(uint32_t)(((int64_t)dbg_play_samples * 1000) / play_ms) : 0;
+		LOG_INF("audio_out session: %u blocks, %u underruns (%u partial/audible), "
+			"%ld overflow, %u write-err",
+			dbg_blocks, dbg_underruns, dbg_underruns_partial,
 			(long)atomic_get(&dbg_overflow), dbg_writeerr);
+		LOG_INF("audio_out rate: req=%u Hz, i2s=%u Hz (drift check), audio=%u Hz "
+			"over %lld ms", session_rate, i2s_hz, audio_hz, (long long)play_ms);
 		k_sem_give(&idle_sem);
 	}
 }
@@ -218,6 +254,10 @@ int audio_out_start(uint32_t sample_rate)
 
 void audio_out_write(const int16_t *mono_pcm, size_t nsamp)
 {
+	/* active is read outside ring_mutex: a concurrent audio_out_flush() could
+	 * reset the ring just after this check, leaving a stale frame queued -- but
+	 * the next audio_out_start() resets the ring before playback, so no ghost
+	 * audio reaches the speaker. */
 	if (!atomic_get(&active) || mono_pcm == NULL || nsamp == 0) {
 		return;
 	}
@@ -236,6 +276,14 @@ void audio_out_write(const int16_t *mono_pcm, size_t nsamp)
 void audio_out_stop(void)
 {
 	atomic_set(&active, 0);   /* feeder stops I2S + mutes amp */
+}
+
+void audio_out_flush(void)
+{
+	k_mutex_lock(&ring_mutex, K_FOREVER);
+	ring_buf_reset(&pcm_ring);
+	k_mutex_unlock(&ring_mutex);
+	atomic_set(&active, 0);   /* feeder DROPs queued I2S + mutes amp */
 }
 
 size_t audio_out_ring_free(void)

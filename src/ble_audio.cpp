@@ -7,6 +7,7 @@
  */
 
 #include "ble_audio.h"
+#include "audio_downlink.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -25,6 +26,13 @@ static struct bt_uuid_128 svc_uuid = BT_UUID_INIT_128(
 static struct bt_uuid_128 data_char_uuid = BT_UUID_INIT_128(
 	BT_UUID_128_ENCODE(0x47A10002, 0x9B70, 0x4C2E, 0x8A1D, 0x2F6B9E4A77C1));
 
+/* Downlink audio (phone -> device): 47A10003-9B70-4C2E-8A1D-2F6B9E4A77C1 */
+static struct bt_uuid_128 ble_audio_dl_uuid = BT_UUID_INIT_128(
+	BT_UUID_128_ENCODE(0x47A10003, 0x9B70, 0x4C2E, 0x8A1D, 0x2F6B9E4A77C1));
+/* Downlink control: 47A10004-9B70-4C2E-8A1D-2F6B9E4A77C1 */
+static struct bt_uuid_128 ble_audio_ctrl_uuid = BT_UUID_INIT_128(
+	BT_UUID_128_ENCODE(0x47A10004, 0x9B70, 0x4C2E, 0x8A1D, 0x2F6B9E4A77C1));
+
 /* Connection / subscription state. Owned by this module (its own conn cbs). */
 static struct bt_conn *audio_conn;
 static bool   data_notifications_enabled;
@@ -41,6 +49,34 @@ static void data_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 		data_notifications_enabled ? "enabled" : "disabled");
 }
 
+static ssize_t dl_audio_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			      const void *buf, uint16_t len, uint16_t offset,
+			      uint8_t flags)
+{
+	ARG_UNUSED(conn); ARG_UNUSED(attr); ARG_UNUSED(flags);
+	if (offset != 0) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+	const uint8_t *p = (const uint8_t *)buf;
+	/* Wire format: [seq16 LE][LC3 frames]. Skip the seq, feed the LC3. */
+	if (len > BLE_AUDIO_SEQ_HDR_SIZE) {
+		audio_downlink_feed(p + BLE_AUDIO_SEQ_HDR_SIZE,
+				    len - BLE_AUDIO_SEQ_HDR_SIZE);
+	}
+	return len;
+}
+
+static ssize_t dl_ctrl_write(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			     const void *buf, uint16_t len, uint16_t offset,
+			     uint8_t flags)
+{
+	ARG_UNUSED(conn); ARG_UNUSED(attr); ARG_UNUSED(offset); ARG_UNUSED(flags);
+	if (len >= 1 && ((const uint8_t *)buf)[0] == BLE_AUDIO_CTRL_FLUSH) {
+		audio_downlink_flush();
+	}
+	return len;
+}
+
 /* attrs: [0]=service, [1]=char decl, [2]=char value, [3]=CCC.
  * Notifications target attrs[2]. */
 BT_GATT_SERVICE_DEFINE(ble_audio_svc,
@@ -51,6 +87,14 @@ BT_GATT_SERVICE_DEFINE(ble_audio_svc,
 			       NULL, NULL, NULL),
 	BT_GATT_CCC(data_ccc_changed,
 		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	/* Downlink audio: Write-Without-Response (unacked, high-throughput). */
+	BT_GATT_CHARACTERISTIC(&ble_audio_dl_uuid.uuid,
+		BT_GATT_CHRC_WRITE | BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+		BT_GATT_PERM_WRITE, NULL, dl_audio_write, NULL),
+	/* Downlink control (FLUSH/barge-in). */
+	BT_GATT_CHARACTERISTIC(&ble_audio_ctrl_uuid.uuid,
+		BT_GATT_CHRC_WRITE,
+		BT_GATT_PERM_WRITE, NULL, dl_ctrl_write, NULL),
 );
 
 /* ---- Connection tracking (own callback set; coexists with main.cpp's) ---- */
@@ -60,6 +104,7 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 	if (err) {
 		return; /* main.cpp logs the failure */
 	}
+	LOG_INF("connected");
 	if (audio_conn == NULL) {
 		audio_conn = bt_conn_ref(conn);
 	}
@@ -68,7 +113,11 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	ARG_UNUSED(reason);
+	ARG_UNUSED(conn);
+	/* Reason is the HCI disconnect code -- the key bring-up diagnostic for a
+	 * drop-right-after-connect (0x08 = supervision timeout, 0x13 = remote user
+	 * terminated, 0x3d = MIC failure, 0x22 = LL response timeout, etc.). */
+	LOG_INF("disconnected, reason 0x%02x", reason);
 	if (audio_conn) {
 		bt_conn_unref(audio_conn);
 		audio_conn = NULL;

@@ -33,6 +33,11 @@ void audio_out_write(const int16_t *mono_pcm, size_t nsamp);
 /* End the session: the feeder stops I2S and mutes the amp. */
 void audio_out_stop(void);
 
+/* Barge-in flush: clear the ring AND stop the session immediately (drops both
+ * the buffered ring audio and the queued I2S blocks -> instant silence). Use
+ * this for interruption; plain stop() leaves the ring to be reset on next start. */
+void audio_out_flush(void);
+
 /* Free space in the playback ring, in bytes. A producer uses this for
  * backpressure -- keep the ring FULL rather than feeding just-in-time, so the
  * feeder never underruns on scheduling jitter (the cause of playback cracking). */

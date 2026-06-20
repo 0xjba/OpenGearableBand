@@ -37,6 +37,9 @@ extern "C" {
 /* 2-byte sequence header prepended to every notification. */
 #define BLE_AUDIO_SEQ_HDR_SIZE 2
 
+/* Downlink control characteristic commands (1 byte). */
+#define BLE_AUDIO_CTRL_FLUSH 0x01   /* barge-in: stop + clear buffered audio */
+
 /* True when a central is connected AND has enabled notifications on the audio
  * data characteristic (CCC). audio_stream uses this as part of its gate. */
 bool ble_audio_subscribed(void);

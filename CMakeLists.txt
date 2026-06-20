@@ -17,5 +17,6 @@ target_sources(app PRIVATE
     src/ble_audio.cpp
     src/audio_stream.cpp
     src/audio_out.cpp
+    src/audio_downlink.cpp
     src/sd_card.cpp
 )

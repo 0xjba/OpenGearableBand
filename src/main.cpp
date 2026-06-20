@@ -22,6 +22,7 @@
 #include "mic_vad.h"
 #include "audio_stream.h"
 #include "audio_out.h"
+#include "audio_downlink.h"
 #include "sd_card.h"
 #include <zephyr/settings/settings.h>
 
@@ -1462,6 +1463,10 @@ int main(void) {
     if (audio_out_init() != 0) {
         LOG_WRN("audio_out_init failed; speaker disabled");
     }
+
+    // Downlink BLE audio bridge (phone -> LC3 -> audio_out): start the decode
+    // thread + register the feed/flush seam used by the ble_audio write callbacks.
+    audio_downlink_init();
 
     // microSD (SPI + FAT).  Non-fatal: just logs if no card is present.  The
     // primary future role is WRITING/recording; today the only read path is the

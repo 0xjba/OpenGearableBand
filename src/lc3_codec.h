@@ -54,6 +54,10 @@ int lc3_codec_encode_frame(const int16_t *pcm_in, uint8_t *out);
 int lc3_codec_encode_pcm_buffer(const int16_t *pcm_in,
 				uint8_t *out, uint16_t *out_len);
 
+/* Decode one 10 ms frame: 40-byte LC3 in -> 160 int16 PCM out (16 kHz).
+ * Returns 0 on success (incl. liblc3 PLC), negative errno on failure. */
+int lc3_codec_decode_frame(const uint8_t *in, int16_t *pcm_out);
+
 /* True once lc3_codec_init() has succeeded. */
 bool lc3_codec_is_ready(void);
 

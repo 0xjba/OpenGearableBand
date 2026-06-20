@@ -21,6 +21,10 @@ static lc3_encoder_mem_16k_t encoder_mem;
 static lc3_encoder_t encoder;
 static bool initialized;
 
+/* LC3 decoder static memory (16 kHz, 10 ms) -- mirrors the encoder. */
+static lc3_decoder_mem_16k_t lc3_decoder_mem;
+static lc3_decoder_t          lc3_decoder;
+
 int lc3_codec_init(void)
 {
 	/*
@@ -55,6 +59,14 @@ int lc3_codec_init(void)
 	LOG_INF("LC3 encoder: %d Hz, %d kbps, %d ms frames (%d samples -> %d bytes)",
 		LC3_SAMPLE_RATE_HZ, LC3_BITRATE_BPS / 1000,
 		LC3_FRAME_DURATION_US / 1000, LC3_FRAME_SAMPLES, frame_bytes);
+
+	lc3_decoder = lc3_setup_decoder(LC3_FRAME_DURATION_US,
+					LC3_SAMPLE_RATE_HZ, 0, &lc3_decoder_mem);
+	if (lc3_decoder == NULL) {
+		LOG_ERR("LC3 decoder setup failed");
+		return -EIO;
+	}
+	LOG_INF("LC3 decoder ready (16 kHz, 10 ms, 40 B/frame -> 160 samples)");
 
 	initialized = true;
 	return 0;
@@ -105,6 +117,17 @@ int lc3_codec_encode_pcm_buffer(const int16_t *pcm_in,
 
 	*out_len = LC3_ENCODED_PDM_BUF_SIZE; /* 80 bytes */
 	return 0;
+}
+
+int lc3_codec_decode_frame(const uint8_t *in, int16_t *pcm_out)
+{
+	if (lc3_decoder == NULL || in == NULL || pcm_out == NULL) {
+		return -EINVAL;
+	}
+	/* lc3_decode: 0 = ok, 1 = PLC applied (still valid PCM), <0 = error. */
+	int rc = lc3_decode(lc3_decoder, in, LC3_FRAME_BYTES,
+			    LC3_PCM_FORMAT_S16, pcm_out, 1);
+	return (rc < 0) ? -EIO : 0;
 }
 
 bool lc3_codec_is_ready(void)
