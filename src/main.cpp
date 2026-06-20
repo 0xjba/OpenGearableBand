@@ -804,7 +804,7 @@ void reset_thread_entry(void *, void *, void *) {
             const float two_pi = 6.2831853f;
             const float inc = two_pi * SPK_TEST_FREQ_HZ / (float)SPK_TEST_RATE_HZ;
             float phase = 0.0f;
-            audio_out_start(SPK_TEST_RATE_HZ);
+            audio_out_start(SPK_TEST_RATE_HZ, AUDIO_OUT_DEFAULT_PREBUF_MS);
             for (int chunk = 0; chunk < SPK_TEST_CHUNKS; chunk++) {  /* ~1 s, blocks the console */
                 int16_t buf[SPK_TEST_CHUNK];
                 for (int i = 0; i < SPK_TEST_CHUNK; i++) {

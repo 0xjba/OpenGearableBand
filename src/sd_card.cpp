@@ -154,7 +154,7 @@ int sd_card_play_wav_test(const char *path)
         return -EINVAL;
     }
 
-    rc = audio_out_start(w.rate);
+    rc = audio_out_start(w.rate, AUDIO_OUT_DEFAULT_PREBUF_MS);
     if (rc) {
         LOG_ERR("audio_out_start(%u) failed: %d", w.rate, rc);
         fs_close(&f);

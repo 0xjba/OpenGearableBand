@@ -17,6 +17,7 @@ LOG_MODULE_REGISTER(audio_downlink, LOG_LEVEL_INF);
 #define DL_MAX_PAYLOAD  240                         /* [STRUCTURAL] up to 6 x 40 B frames per write */
 #define DL_MSGQ_DEPTH   16                          /* [STRUCTURAL] downlink jitter queue */
 #define DL_THREAD_PRIO  7                           /* [STRUCTURAL] decode thread priority (uplink-audio tier) */
+#define DL_PREBUF_MS    120                         /* [STRUCTURAL] downlink jitter buffer = control setpoint */
 /* [STRUCTURAL] decode thread stack. liblc3's lc3_decode is stack-hungry (MDCT +
  * temp buffers); 2048 overflowed on the first frame -> MPU stack-guard fault ->
  * silent halt (CONFIG_RESET_ON_FATAL_ERROR off). Measured peak under load = 2784 B
@@ -55,7 +56,7 @@ static void dl_thread(void *a, void *b, void *c)
 		 * this frame's writes no-op-drop on audio_out's active check and the
 		 * next frame retries -- a ~20 ms gap at a rapid stop->start, benign. */
 		if (!audio_out_active()) {
-			audio_out_start(DL_RATE_HZ);
+			audio_out_start(DL_RATE_HZ, DL_PREBUF_MS);
 		}
 		if (!fast) {
 			ble_audio_set_fast_conn(true);   /* sustain ~50 writes/s */

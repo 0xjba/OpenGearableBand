@@ -25,7 +25,7 @@ LOG_MODULE_REGISTER(audio_out, LOG_LEVEL_INF);
 #define NUM_BLOCKS         4                            /* [STRUCTURAL] mem-slab depth */
 #define RING_BYTES         16384                        /* [STRUCTURAL] ~0.5 s @ 16 kHz mono jitter buffer */
 #define IDLE_STOP_MS       400                          /* [STRUCTURAL] silence before auto-stop */
-#define PREBUF_BYTES       (RING_BYTES / 2)             /* [STRUCTURAL] fill ring ~half before starting playback */
+#define PREBUF_FLOOR_BYTES (FRAMES_PER_BLOCK * 2)       /* [STRUCTURAL] min cushion: >=1 mono block */
 #define PREBUF_TRIES       60                           /* [STRUCTURAL] 60 x 5 ms = 300 ms cap (short clips) */
 #define FEEDER_STACK       2048
 #define FEEDER_PRIO        7                            /* same tier as the uplink audio thread */
@@ -41,6 +41,7 @@ static const struct device *i2s_dev;
 static const struct device *amp_gpio;
 static atomic_t active = ATOMIC_INIT(0);
 static uint32_t session_rate = 16000;
+static uint32_t session_prebuf_bytes = RING_BYTES / 2;   /* set per session by audio_out_start */
 static int16_t  mono_scratch[FRAMES_PER_BLOCK];
 /* [USER] playback volume 0-100%. Dev default 75%: on the bare XIAO 3V3 rail (no
  * bulk cap), full-volume peaks sag the rail and crackle; 75% is clean for dev.
@@ -125,7 +126,7 @@ static void feeder(void *a, void *b, void *c)
 		 * first block, no opening underrun. Bounded so a slow/short producer
 		 * can't hang the start. */
 		for (int i = 0; i < PREBUF_TRIES && atomic_get(&active); i++) {
-			if (ring_buf_space_get(&pcm_ring) <= (RING_BYTES - PREBUF_BYTES)) {
+			if (ring_buf_space_get(&pcm_ring) <= (RING_BYTES - session_prebuf_bytes)) {
 				break;
 			}
 			k_msleep(5);
@@ -237,7 +238,7 @@ int audio_out_init(void)
 	return 0;
 }
 
-int audio_out_start(uint32_t sample_rate)
+int audio_out_start(uint32_t sample_rate, uint32_t prebuf_ms)
 {
 	/* Gate: one session at a time, and a new session cannot arm until the
 	 * previous session's feeder cleanup has fully finished -- this closes the
@@ -247,6 +248,16 @@ int audio_out_start(uint32_t sample_rate)
 		return -EBUSY;
 	}
 	session_rate = sample_rate;
+
+	/* prebuf_ms -> bytes (mono 16-bit), clamped to [floor, ring - one block]. */
+	uint32_t pb = (uint32_t)(((uint64_t)prebuf_ms * sample_rate * 2) / 1000);
+	if (pb < PREBUF_FLOOR_BYTES) {
+		pb = PREBUF_FLOOR_BYTES;
+	}
+	if (pb > RING_BYTES - I2S_BLOCK_BYTES / 2) {
+		pb = RING_BYTES - I2S_BLOCK_BYTES / 2;
+	}
+	session_prebuf_bytes = pb;
 
 	k_mutex_lock(&ring_mutex, K_FOREVER);
 	ring_buf_reset(&pcm_ring);

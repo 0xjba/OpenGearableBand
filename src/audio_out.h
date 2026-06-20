@@ -22,9 +22,15 @@ extern "C" {
  * Returns 0 on success, -ENODEV if a device isn't ready. */
 int audio_out_init(void);
 
-/* Begin a playback session at sample_rate (Hz): enables the amp, configures and
- * starts I2S. Returns 0, or -EBUSY if a session is already active. */
-int audio_out_start(uint32_t sample_rate);
+/* [STRUCTURAL] default prebuffer (ms) for SD-file / tone-test playback -- generous
+ * jitter cushion when latency doesn't matter (the BLE downlink uses a smaller value). */
+#define AUDIO_OUT_DEFAULT_PREBUF_MS 256
+
+/* Begin a playback session. sample_rate in Hz. prebuf_ms = how much audio to
+ * buffer before playback starts (latency vs opening-underrun); the feeder yields
+ * until the ring holds ~that much, capped by an internal time budget. Returns 0,
+ * or -EBUSY if a session is already active. */
+int audio_out_start(uint32_t sample_rate, uint32_t prebuf_ms);
 
 /* Enqueue mono 16-bit PCM. Non-blocking; drops (logged) on ring overflow; no-op
  * if no session is active. This is the seam the BLE downlink feeds. */
