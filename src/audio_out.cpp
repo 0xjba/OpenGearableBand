@@ -263,6 +263,8 @@ int audio_out_start(uint32_t sample_rate, uint32_t prebuf_ms)
 	ring_buf_reset(&pcm_ring);
 	k_mutex_unlock(&ring_mutex);
 
+	atomic_clear(&event_flags);   /* fresh session: drop stale over/underflow events */
+
 	atomic_set(&active, 1);
 	k_sem_give(&run_sem);
 	return 0;

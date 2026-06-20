@@ -55,6 +55,11 @@ uint32_t ble_audio_drop_count(void);
  * flags bit0=session active, bit1=overflowed-since-last, bit2=underran-since-last. */
 #define BLE_AUDIO_STATUS_LEN 5
 
+/* Downlink status `flags` byte bit values (wire format). */
+#define BLE_AUDIO_STATUS_FL_ACTIVE   0x01   /* a playback session is active */
+#define BLE_AUDIO_STATUS_FL_OVERFLOW 0x02   /* ring overflowed since last report */
+#define BLE_AUDIO_STATUS_FL_UNDERRUN 0x04   /* ring underran since last report */
+
 /* True when a central has subscribed (CCC) to the downlink status characteristic.
  * The downlink reporter gates its notifications on this. */
 bool ble_audio_status_subscribed(void);

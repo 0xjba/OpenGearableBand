@@ -18,6 +18,7 @@ LOG_MODULE_REGISTER(audio_downlink, LOG_LEVEL_INF);
 #define DL_MSGQ_DEPTH   16                          /* [STRUCTURAL] downlink jitter queue */
 #define DL_THREAD_PRIO  7                           /* [STRUCTURAL] decode thread priority (uplink-audio tier) */
 #define DL_PREBUF_MS    120                         /* [STRUCTURAL] downlink jitter buffer = control setpoint */
+#define DL_STATUS_PERIOD_MS 100                     /* [STRUCTURAL] buffer-feedback cadence */
 /* [STRUCTURAL] decode thread stack. liblc3's lc3_decode is stack-hungry (MDCT +
  * temp buffers); 2048 overflowed on the first frame -> MPU stack-guard fault ->
  * silent halt (CONFIG_RESET_ON_FATAL_ERROR off). Measured peak under load = 2784 B
@@ -34,6 +35,47 @@ K_MSGQ_DEFINE(dl_msgq, sizeof(struct dl_item), DL_MSGQ_DEPTH, 4);
 
 static uint32_t dl_drops;
 static int16_t  dl_pcm[LC3_FRAME_SAMPLES];          /* 160 samples, decode scratch */
+
+/* Over/underflow events taken from audio_out but not yet delivered to the host.
+ * Accumulated across ticks so a failed/dropped status notify never loses an event
+ * (the host clock-recovery loop depends on seeing them). Cleared on a successful
+ * notify and at session end. */
+static uint8_t dl_pending_ev;
+
+/* forward decl required: K_WORK_DELAYABLE_DEFINE takes the function pointer. */
+static void dl_status_fn(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(dl_status_work, dl_status_fn);
+
+/* Periodic downlink buffer-feedback reporter. Runs only while a session plays
+ * (self-stops when audio_out goes idle); notifies only when the host is subscribed
+ * to the status char. Payload: [used u16 LE][capacity u16 LE][flags u8]. */
+static void dl_status_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	if (!audio_out_active()) {
+		dl_pending_ev = 0;        /* session ended: drop stale events, stop the chain */
+		return;
+	}
+	/* Drain audio_out's latch into our accumulator every tick (so it's captured even
+	 * when unsubscribed or when a notify fails); clear it only once delivered. */
+	dl_pending_ev |= audio_out_take_event_flags();
+	if (ble_audio_status_subscribed()) {
+		uint16_t used = (uint16_t)audio_out_ring_used();
+		uint16_t cap  = (uint16_t)audio_out_ring_capacity();
+		uint8_t  flags = (uint8_t)(BLE_AUDIO_STATUS_FL_ACTIVE |
+			((dl_pending_ev & AUDIO_OUT_EV_OVERFLOW) ? BLE_AUDIO_STATUS_FL_OVERFLOW : 0) |
+			((dl_pending_ev & AUDIO_OUT_EV_UNDERRUN) ? BLE_AUDIO_STATUS_FL_UNDERRUN : 0));
+		uint8_t pkt[BLE_AUDIO_STATUS_LEN] = {
+			(uint8_t)(used & 0xFF), (uint8_t)(used >> 8),
+			(uint8_t)(cap & 0xFF),  (uint8_t)(cap >> 8),
+			flags,
+		};
+		if (ble_audio_notify_status(pkt, sizeof(pkt)) == 0) {
+			dl_pending_ev = 0;    /* delivered -> clear; else keep for the next tick */
+		}
+	}
+	k_work_reschedule(&dl_status_work, K_MSEC(DL_STATUS_PERIOD_MS));
+}
 
 static void dl_thread(void *a, void *b, void *c)
 {
@@ -57,6 +99,7 @@ static void dl_thread(void *a, void *b, void *c)
 		 * next frame retries -- a ~20 ms gap at a rapid stop->start, benign. */
 		if (!audio_out_active()) {
 			audio_out_start(DL_RATE_HZ, DL_PREBUF_MS);
+			k_work_schedule(&dl_status_work, K_MSEC(DL_STATUS_PERIOD_MS));
 		}
 		if (!fast) {
 			ble_audio_set_fast_conn(true);   /* sustain ~50 writes/s */
