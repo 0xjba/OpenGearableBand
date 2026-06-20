@@ -58,6 +58,10 @@ static int64_t  dbg_play_start_ms;        /* uptime at first real block (effecti
 static uint32_t dbg_play_samples;         /* real mono samples clocked out (drift detector) */
 static atomic_t dbg_overflow = ATOMIC_INIT(0);
 
+/* Buffer-event latches for the downlink status reporter (read-and-clear). Set from
+ * the writer (overflow) and feeder (underrun) threads -> atomic. */
+static atomic_t event_flags = ATOMIC_INIT(0);
+
 static int i2s_setup(uint32_t rate)
 {
 	struct i2s_config cfg = {
@@ -151,6 +155,7 @@ static void feeder(void *a, void *b, void *c)
 			bool all_silence = (got == 0);
 			dbg_blocks++;
 			if (got < FRAMES_PER_BLOCK) {
+				atomic_or(&event_flags, AUDIO_OUT_EV_UNDERRUN);
 				dbg_underruns++;
 				/* 0 < got < block = ring not yet empty but producer is
 				 * behind -> this is the audible mid-stream crackle; got==0
@@ -268,6 +273,7 @@ void audio_out_write(const int16_t *mono_pcm, size_t nsamp)
 
 	if (put < nsamp * 2) {
 		atomic_inc(&dbg_overflow);
+		atomic_or(&event_flags, AUDIO_OUT_EV_OVERFLOW);
 		LOG_WRN("audio_out: ring overflow, dropped %u bytes",
 			(unsigned)(nsamp * 2 - put));
 	}
@@ -300,6 +306,16 @@ size_t audio_out_ring_used(void)
 	size_t used = ring_buf_size_get(&pcm_ring);
 	k_mutex_unlock(&ring_mutex);
 	return used;
+}
+
+size_t audio_out_ring_capacity(void)
+{
+	return RING_BYTES;
+}
+
+uint8_t audio_out_take_event_flags(void)
+{
+	return (uint8_t)atomic_clear(&event_flags);   /* returns prior value, zeroes it */
 }
 
 bool audio_out_active(void)

@@ -57,6 +57,18 @@ bool audio_out_active(void);
 void audio_out_set_volume(uint8_t percent);
 uint8_t audio_out_get_volume(void);
 
+/* Total capacity of the playback ring, in bytes (the high-water for ring_used).
+ * The downlink status reporter sends this so the host needs no hard-coded size. */
+size_t audio_out_ring_capacity(void);
+
+/* Buffer-event latch bits, set by audio_out and cleared on read. Lets the downlink
+ * status reporter hand the host a hard over/underflow signal, not just inference. */
+#define AUDIO_OUT_EV_OVERFLOW 0x01   /* a write was dropped (ring full) */
+#define AUDIO_OUT_EV_UNDERRUN 0x02   /* the feeder pulled < a full block (ring low) */
+
+/* Return the events latched since the last call, then clear them (read-and-clear). */
+uint8_t audio_out_take_event_flags(void);
+
 #ifdef __cplusplus
 }
 #endif
