@@ -17,7 +17,7 @@ LOG_MODULE_REGISTER(audio_downlink, LOG_LEVEL_INF);
 #define DL_MAX_PAYLOAD  240                         /* [STRUCTURAL] up to 6 x 40 B frames per write */
 #define DL_MSGQ_DEPTH   16                          /* [STRUCTURAL] downlink jitter queue */
 #define DL_THREAD_PRIO  7                           /* [STRUCTURAL] decode thread priority (uplink-audio tier) */
-#define DL_PREBUF_MS    120                         /* [STRUCTURAL] downlink jitter buffer = control setpoint */
+#define DL_PREBUF_MS    140                         /* [STRUCTURAL] downlink jitter buffer = host control setpoint (HW-tuned) */
 #define DL_STATUS_PERIOD_MS 100                     /* [STRUCTURAL] buffer-feedback cadence */
 /* [STRUCTURAL] decode thread stack. liblc3's lc3_decode is stack-hungry (MDCT +
  * temp buffers); 2048 overflowed on the first frame -> MPU stack-guard fault ->

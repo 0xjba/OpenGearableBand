@@ -71,8 +71,11 @@ BLOCK_MS = (FRAMES_PER_BLOCK * FRAME_SAMPLES * 1000) // SR_HZ  # 20 ms
 CTRL_FLUSH = 0x01             # BLE_AUDIO_CTRL_FLUSH
 
 AUDIO_STATUS_UUID = "47a10005-9b70-4c2e-8a1d-2f6b9e4a77c1"
-SETPOINT_MS = 120                       # target buffered audio (latency vs jitter)
-SETPOINT_BYTES = SETPOINT_MS * SR_HZ * 2 // 1000   # 120ms @ 16k mono 16-bit = 3840
+AUDIO_UPLINK_UUID = "47a10002-9b70-4c2e-8a1d-2f6b9e4a77c1"   # device->host mic notify
+SETPOINT_MS = 140                       # target buffered audio (latency vs jitter);
+                                        # HW-tuned 2026-06-21: 120 was jitter-marginal
+                                        # (occasional underrun), 160 robust -> 140 split
+SETPOINT_BYTES = SETPOINT_MS * SR_HZ * 2 // 1000   # 140ms @ 16k mono 16-bit = 4480
 # Control-law gains (host clock recovery). Slow loop -> no oscillation; clamp must
 # EXCEED worst-case I2S drift (~0.8%), so +/-1.5%. See the design doc.
 CR_KP = 0.5            # proportional, on normalized error (used-setp)/capacity
@@ -175,6 +178,13 @@ async def main():
     ap.add_argument("--no-adaptive", action="store_true",
                     help="disable clock-recovery (don't subscribe, fixed pacing) -- "
                          "only to reproduce the drift baseline")
+    ap.add_argument("--setpoint-ms", type=int, default=SETPOINT_MS,
+                    help=f"target buffered audio in ms (default {SETPOINT_MS}); higher "
+                         "= more jitter cushion (fewer underruns) but more latency")
+    ap.add_argument("--duplex", action="store_true",
+                    help="full-duplex smoke test: also subscribe to the uplink mic "
+                         "notify (47A10002) and count frames/drops while streaming down "
+                         "(raise band to ear + speak to trigger the uplink)")
     args = ap.parse_args()
 
     enc = Lc3Encoder(args.lib)
@@ -295,6 +305,7 @@ async def main():
         adaptive = not args.no_adaptive
         cr_integ = clock_recovery_reset()
         pace_scale = 1.0
+        setpoint_bytes = args.setpoint_ms * SR_HZ * 2 // 1000   # A/B knob
 
         if adaptive:
             def on_status(_char, data: bytearray):
@@ -305,13 +316,30 @@ async def main():
                 cap = data[2] | (data[3] << 8)
                 flags = data[4]
                 cr_integ, pace_scale = clock_recovery_step(
-                    cr_integ, used, cap or 1, SETPOINT_BYTES,
+                    cr_integ, used, cap or 1, setpoint_bytes,
                     1 if flags & STATUS_FL_OVERFLOW else 0,
                     1 if flags & STATUS_FL_UNDERRUN else 0)
             await client.start_notify(AUDIO_STATUS_UUID, on_status)
-            print("adaptive playout ON (subscribed to status 47A10005)")
+            print(f"adaptive playout ON (status 47A10005, setpoint={args.setpoint_ms}ms)")
         else:
             print("adaptive playout OFF (--no-adaptive baseline)")
+
+        # Full-duplex smoke test: subscribe to the uplink mic notify and count
+        # frames + sequence gaps WHILE we stream downlink, proving the band runs
+        # both directions on one connection. The uplink only flows in MODE_DICTATION
+        # (raise to ear + speak), so frames arrive once dictation is triggered.
+        uplink = {"count": 0, "drops": 0, "last_seq": None}
+        if args.duplex:
+            def on_uplink(_char, data: bytearray):
+                if len(data) < 2:
+                    return
+                seq = data[0] | (data[1] << 8)
+                if uplink["last_seq"] is not None:
+                    uplink["drops"] += (seq - (uplink["last_seq"] + 1)) & 0xFFFF
+                uplink["last_seq"] = seq
+                uplink["count"] += 1
+            await client.start_notify(AUDIO_UPLINK_UUID, on_uplink)
+            print("duplex ON (subscribed to uplink mic 47A10002 -- raise to ear + speak)")
 
         t0 = time.time()
         flush_at = args.flush_after if args.flush_after > 0 else None
@@ -344,6 +372,10 @@ async def main():
         print(f"\n--- done ---")
         print(f"sent {sent} blocks in {dur:.1f}s "
               f"({sent / dur:.1f} block/s)" if dur > 0 else f"sent {sent} blocks")
+        if args.duplex:
+            print(f"uplink (full-duplex): {uplink['count']} mic frames received, "
+                  f"{uplink['drops']} seq-gap drops "
+                  f"({'NO uplink -- did you raise to ear + speak?' if uplink['count'] == 0 else 'concurrent up+down OK'})")
 
 
 if __name__ == "__main__":

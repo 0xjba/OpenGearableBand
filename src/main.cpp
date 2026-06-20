@@ -1429,22 +1429,24 @@ int main(void) {
     // into IDLE on boot, which configures both).
     motion_wake_init();
 
-    // Enable the chip-embedded tap engine.  Tap stays on for the whole
-    // device lifetime -- it shares INT1 with sig-motion (routed via
-    // MD1_CFG vs INT1_CTRL respectively, no register conflict), and
-    // service_chip_int1() demuxes which event source fired; it is called
-    // from all power states (IDLE, SNAPSHOT, WORKOUT), not just run_idle().
-    //
-    // Initial TAP_THS = 0x08 (~500 mg at FS=±2g): a moderate threshold
-    // we'll tune empirically via calibration mode in a later stage.
-    // Don't fail boot on tap-enable error -- log and continue so we
-    // still get basic gesture / HR functionality even if the I2C
-    // sequence hits a transient error.
+    // Chip-embedded tap engine: DORMANT.  No current mode is tap-bound
+    // (the air-mouse cadenced-double-tap entry was extracted to
+    // feature/air-mouse; dictation enters via POSE_EAR + voice, not taps),
+    // so the tap engine is pure power waste -- it forces the accel to 833 Hz
+    // ODR and fires INT1 on every knock, waking the CPU for nothing.  We
+    // disable it (drops ODR back to 104 Hz, un-routes tap INT1, keeps
+    // sig-motion's INT1 path intact) to save that power.  ALL the tap code
+    // (engine enable/disable, the multi-tap counter + commit handler, the
+    // 't'/'y'/'c'/'+'/'-' console cmds) is retained but dormant -- a future
+    // tap-bound mode re-arms it by calling lsm6dsl_tap_engine_enable(0x08).
+    // The recent-gesture guard (gesture_mode_recent_activity) still works:
+    // it keys on the armed POSE, not just taps, so dictation's HR
+    // workout-suppression is unaffected.
     {
-        int err = lsm6dsl_tap_engine_enable(0x08);
+        int err = lsm6dsl_tap_engine_disable();
         if (err) {
-            LOG_ERR("LSM6DSL tap engine enable failed (%d) -- continuing "
-                    "without chip tap detection", err);
+            LOG_ERR("LSM6DSL tap engine disable failed (%d) -- continuing "
+                    "(tap detection may remain active)", err);
         }
     }
 
