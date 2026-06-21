@@ -148,6 +148,41 @@ class Lc3Encoder:
         return bytes(self._out)
 
 
+class Lc3Decoder:
+    """Minimal ctypes wrapper over liblc3's decoder (mirror of Lc3Encoder)."""
+
+    def __init__(self, lib_path):
+        self.ok = False
+        if not lib_path:
+            return
+        try:
+            lib = ctypes.CDLL(lib_path)
+            lib.lc3_decoder_size.restype = ctypes.c_uint
+            lib.lc3_decoder_size.argtypes = [ctypes.c_int, ctypes.c_int]
+            lib.lc3_setup_decoder.restype = ctypes.c_void_p
+            lib.lc3_setup_decoder.argtypes = [
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+            lib.lc3_decode.restype = ctypes.c_int
+            lib.lc3_decode.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+            size = lib.lc3_decoder_size(DT_US, SR_HZ)
+            self._mem = ctypes.create_string_buffer(size)
+            self._dec = lib.lc3_setup_decoder(DT_US, SR_HZ, 0, self._mem)
+            self._lib = lib
+            self._pcm = (ctypes.c_int16 * FRAME_SAMPLES)()
+            self.ok = self._dec is not None
+        except Exception as e:  # noqa: BLE001
+            print(f"[decode disabled] {e}")
+            self.ok = False
+
+    def decode_frame(self, frame40: bytes) -> bytes:
+        """40-byte LC3 frame -> 160 int16 samples (320 bytes)."""
+        buf = (ctypes.c_uint8 * len(frame40)).from_buffer_copy(frame40)
+        self._lib.lc3_decode(self._dec, buf, len(frame40), 0, self._pcm, 1)
+        return bytes(self._pcm)
+
+
 def read_wav_frames(path):
     """Yield 160-sample (320-byte) mono 16-bit PCM frames from a 16 kHz WAV."""
     with wave.open(path, "rb") as w:
@@ -185,6 +220,9 @@ async def main():
                     help="full-duplex smoke test: also subscribe to the uplink mic "
                          "notify (47A10002) and count frames/drops while streaming down "
                          "(raise band to ear + speak to trigger the uplink)")
+    ap.add_argument("--record", default=None,
+                    help="with --duplex: save <REC>_ref.wav (streamed source) + "
+                         "<REC>_mic.wav (decoded uplink mic w/ echo) for offline AEC")
     args = ap.parse_args()
 
     enc = Lc3Encoder(args.lib)
@@ -205,6 +243,9 @@ async def main():
         seq += 1
     print(f"{args.wav}: {len(frames)} frames -> {len(packets)} blocks "
           f"(~{len(packets) * BLOCK_MS / 1000:.1f}s @ {BLOCK_MS} ms/block)")
+
+    # For --record: the reference = the exact source PCM we will stream down.
+    ref_pcm = b"".join(frames) if args.record else b""
 
     dev = None
     if args.address:
@@ -329,6 +370,12 @@ async def main():
         # both directions on one connection. The uplink only flows in MODE_DICTATION
         # (raise to ear + speak), so frames arrive once dictation is triggered.
         uplink = {"count": 0, "drops": 0, "last_seq": None}
+        mic_pcm = bytearray()
+        dec = Lc3Decoder(args.lib) if args.record else None
+        if args.record and not args.duplex:
+            sys.exit("--record requires --duplex (the uplink mic comes from the duplex subscription).")
+        if args.record and not (dec and dec.ok):
+            sys.exit("--record needs --lib <liblc3> to decode the uplink mic.")
         if args.duplex:
             def on_uplink(_char, data: bytearray):
                 if len(data) < 2:
@@ -338,6 +385,10 @@ async def main():
                     uplink["drops"] += (seq - (uplink["last_seq"] + 1)) & 0xFFFF
                 uplink["last_seq"] = seq
                 uplink["count"] += 1
+                if dec:  # [seq16][80B LC3 = 2x40B] -> decode both frames
+                    payload = bytes(data[2:])
+                    for off in range(0, len(payload) - FRAME_BYTES + 1, FRAME_BYTES):
+                        mic_pcm.extend(dec.decode_frame(payload[off:off + FRAME_BYTES]))
             await client.start_notify(AUDIO_UPLINK_UUID, on_uplink)
             print("duplex ON (subscribed to uplink mic 47A10002 -- raise to ear + speak)")
 
@@ -376,6 +427,15 @@ async def main():
             print(f"uplink (full-duplex): {uplink['count']} mic frames received, "
                   f"{uplink['drops']} seq-gap drops "
                   f"({'NO uplink -- did you raise to ear + speak?' if uplink['count'] == 0 else 'concurrent up+down OK'})")
+            if args.record:
+                def _save_wav(path, pcm_bytes):
+                    with wave.open(path, "wb") as w:
+                        w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR_HZ)
+                        w.writeframes(pcm_bytes)
+                _save_wav(f"{args.record}_ref.wav", ref_pcm)
+                _save_wav(f"{args.record}_mic.wav", bytes(mic_pcm))
+                print(f"recorded: {args.record}_ref.wav ({len(ref_pcm)//320} frames), "
+                      f"{args.record}_mic.wav ({len(mic_pcm)//320} frames)")
 
 
 if __name__ == "__main__":
