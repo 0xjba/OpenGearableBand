@@ -30,6 +30,7 @@ import asyncio
 
 import numpy as np
 
+from voiceio import clock_recovery as cr
 from voiceio.aec import DtlnAec
 from voiceio.ble_link import BLOCK_SAMPLES, FRAME_BYTES, FRAME_SAMPLES, FRAMES_PER_BLOCK
 from voiceio.clocks import AEC_DRIFT_RATIO
@@ -39,7 +40,11 @@ from voiceio.vad import BargeInVad
 
 SR = 16000
 HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
-EST_EVERY_BLOCKS = 12         # refine the delay ~every 240 ms while the AI plays
+EST_EVERY_BLOCKS = 12         # refine the alignment ~every 240 ms while the AI plays
+# In-flight buffer between "sample transmitted" and "sample heard by the mic": the device
+# playout jitter buffer (~setpoint) plus whatever ble_link still has queued. Used to derive
+# the delay estimator's search center from the playout position.
+SETPOINT_SAMPLES = cr.SETPOINT_MS * SR // 1000
 
 
 def aligned_reference(played_ref, ref_base_mic, mic_count_start, n, ratio=AEC_DRIFT_RATIO):
@@ -72,29 +77,26 @@ def aligned_reference(played_ref, ref_base_mic, mic_count_start, n, ratio=AEC_DR
 class Orchestrator:
     """Full-duplex real-time voice loop over a BleLink + a VoiceBackend."""
 
-    def __init__(self, ble_link, backend, model_dir, lib_path="tools/lib/liblc3.dylib",
-                 init_delay_ms=None):
+    def __init__(self, ble_link, backend, model_dir, lib_path="tools/lib/liblc3.dylib"):
         """
         Args:
             ble_link: a connected BleLink (call .connect() first).
             backend: a VoiceBackend (EchoLoopbackBackend / GeminiLiveBackend).
             model_dir: DTLN model path prefix (e.g. ".../dtln_aec_512").
             lib_path: liblc3 shared lib.
-            init_delay_ms: OPTIONAL warm-start for the online delay estimator (e.g. a
-                measure_delay value) so the first response isn't un-cancelled while the
-                estimator acquires. None = pure online acquisition. NOTE: this is no longer
-                a hardcoded constant -- the loop delay is tracked live by DelayEstimator
-                (AEC3-style), so it self-calibrates per unit/session and carries to
-                production hardware unchanged.
+
+        The render->capture alignment is tracked live by DelayEstimator (AEC3-style) -- no
+        hardcoded delay -- so it self-calibrates per unit/session and carries to production
+        hardware unchanged.
         """
         self.ble = ble_link
         self.backend = backend
         self.codec = Lc3Codec(lib_path)
         self.aec = DtlnAec(model_dir)
-        self.vad = BargeInVad(sr=SR)
+        # frame_ms=20 so each 320-sample (20 ms) clean block == exactly one VAD frame
+        # (the 30 ms default silently processed 0 frames per block -> the VAD never fired).
+        self.vad = BargeInVad(sr=SR, frame_ms=20)
         self.delay_est = DelayEstimator()
-        if init_delay_ms is not None:
-            self.delay_est.warm_start(init_delay_ms)
 
         self._mic_q = asyncio.Queue()
         self._last_mic_ts = 0
@@ -143,16 +145,26 @@ class Orchestrator:
                 n = len(mic)
                 self._mic_rms = float(np.sqrt(np.mean(mic ** 2) + 1e-12))
                 ref = np.zeros(n, dtype=np.float32)
-                if self._playing and self._dl_origin_mic is not None:
+                if self._playing:
                     played = self.ble.played_reference()
                     self._push_mic_hist(mic_ts, mic)
-                    # Refine the loop delay online (~every 240 ms) -- no hardcoded constant.
+                    # Refine the alignment online (~every 240 ms) -- no hardcoded constant.
                     self._since_est += 1
                     if self._since_est >= EST_EVERY_BLOCKS and len(self._mic_hist) >= HIST_SAMPLES:
                         self._since_est = 0
+                        # Live search center from the playout position: the sample being
+                        # HEARD now is played_samples minus the in-flight buffer (device
+                        # jitter buffer + still-queued blocks). It is heard at the MOST
+                        # RECENT mic sample (window end, not start), so
+                        # center = mic_now - heard_idx/ratio (== an estimate of ref_base_mic).
+                        # Robust to which stream started first (unlike a once-captured origin).
+                        mic_now = self._mic_hist_start + len(self._mic_hist)
+                        in_flight = self.ble.downlink_pending() * BLOCK_SAMPLES + SETPOINT_SAMPLES
+                        heard_idx = max(0, self.ble.played_samples - in_flight)
+                        center = int(mic_now - heard_idx / AEC_DRIFT_RATIO)
                         self.delay_est.estimate(self._mic_hist, self._mic_hist_start,
-                                                played, self._dl_origin_mic)
-                    ref_base_mic = self.delay_est.current(self._dl_origin_mic)
+                                                played, center)
+                    ref_base_mic = self.delay_est.current()
                     if ref_base_mic is not None:
                         ref = aligned_reference(played, ref_base_mic, mic_ts, n)
                     # else: estimator not locked yet -> pass mic through (brief, first turn)
@@ -254,8 +266,11 @@ class Orchestrator:
         prev_up = 0
         while not self._stop.is_set():
             await asyncio.sleep(1.0)
-            d_ms = self.delay_est.loop_delay_ms
-            d_str = f"{d_ms:.0f}ms/conf{self.delay_est.confidence:.2f}" if d_ms is not None else "acquiring"
+            if self.delay_est.locked:
+                res = self.delay_est.residual_ms
+                d_str = f"locked(res{res:+.0f}ms,conf{self.delay_est.confidence:.2f})"
+            else:
+                d_str = f"acquiring(conf{self.delay_est.confidence:.2f})"
             up_rate = self._n_uplink - prev_up
             prev_up = self._n_uplink
             # mic_rms = raw mic level (is the band hearing anything?); clean_rms = what the
