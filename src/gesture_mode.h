@@ -173,6 +173,11 @@ bool gesture_mode_recent_activity(void);
  * current mount; assumes nothing from prior sessions. */
 void gesture_mode_pose_trace_start(uint32_t n_samples);
 
+/* Test hook ('j' console cmd): force the listen session (mic + DICTATION + uplink)
+ * ON regardless of pose/voice, so the mic streams through user silence. Used to
+ * capture a clean AI-alone residual-echo floor for the barge-in de-risk. */
+void gesture_mode_set_force_listen(bool on);
+
 /*
  * Read the current mode.  Thread-safe (uses atomic_t internally).
  * Cheap; safe to call from any thread including ISRs.

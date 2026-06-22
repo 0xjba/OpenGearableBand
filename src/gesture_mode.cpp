@@ -33,6 +33,11 @@ static atomic_t mode_atomic = ATOMIC_INIT(MODE_IDLE);
  * stays on while the ear pose is held (not a one-shot arm window). */
 static bool    ear_mic_on;
 static bool    ear_voice_holding;   /* pose out of cone, session held by ongoing voice */
+/* Test hook ('j' console cmd): force the listen session ON regardless of pose/voice
+ * so the uplink mic streams continuously THROUGH user silence -- needed to capture a
+ * clean "AI-alone" residual-echo floor for the barge-in de-risk. Benign cross-thread
+ * bool (set on console, read on acq thread): worst case one-sample latency. */
+static bool    force_listen;
 static bool    ear_idle_suppressed; /* idled out while posed; needs a re-raise to resume */
 static int64_t ear_last_match_ms;   /* last time best pose == POSE_EAR */
 
@@ -199,9 +204,33 @@ static void ear_session_end(const char *why)
     }
 }
 
+/* Set by the 'j' console command. Forces mic + DICTATION on (uplink streams via the
+ * existing audio_stream gate) and bypasses the pose/silence exits, for capturing a
+ * silent-AI echo floor. Plain bool set; ear_gate_update reads it on the acq thread. */
+void gesture_mode_set_force_listen(bool on)
+{
+    force_listen = on;
+}
+
 static void ear_gate_update(pose_id_t best)
 {
     int64_t now = k_uptime_get();
+
+    /* Forced capture: hold mic + DICTATION on regardless of pose/voice so the uplink
+     * streams through silence. When turned off, normal gating resumes (and the next
+     * silence timeout / pose-exit releases the session). */
+    if (force_listen) {
+        if (!ear_mic_on) {
+            ear_mic_on = true; ear_voice_holding = false;
+            mic_vad_start();
+            (void)mic_vad_voice_onset();   /* discard any pre-latched onset */
+        }
+        if ((GestureMode)atomic_get(&mode_atomic) != MODE_DICTATION) {
+            _transition_to(MODE_DICTATION);
+            LOG_INF("DICTATION entry: forced (mic-stream test)");
+        }
+        return;
+    }
 
     bool ear_pose = (best == POSE_EAR);   /* gravity match; motion-tolerant */
     if (ear_pose) ear_last_match_ms = now;

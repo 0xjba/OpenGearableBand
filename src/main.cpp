@@ -22,6 +22,7 @@
 #include "mic_vad.h"
 #include "audio_stream.h"
 #include "audio_out.h"
+#include "ble_audio.h"
 #include "audio_downlink.h"
 #include "sd_card.h"
 #include <zephyr/settings/settings.h>
@@ -623,6 +624,12 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // TEST-ONLY: play /SD:/music.wav from the microSD card through
             // audio_out (real-audio speaker test).
             pending_cmd = 'w';
+        } else if (c == 'k' || c == 'K') {
+            // Toggle the chip tap engine + tap-event logging (speaker-vs-tap test).
+            pending_cmd = 'k';
+        } else if (c == 'j' || c == 'J') {
+            // Force the mic uplink to stream through silence (AI-alone echo floor).
+            pending_cmd = 'j';
         } else if (c >= '0' && c <= '9') {
             // Speaker volume: '0'..'9' -> 0%..90% (boot default 100%).
             pending_cmd = c;
@@ -660,6 +667,8 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'v'=pose trace (hold a pose 30s -> gravity/shadow/pitch/roll)");
     LOG_INF("  'u'=clear ALL BLE bonds (then Forget on host + re-pair)");
     LOG_INF("  'm'=toggle PDM mic bench probe ([MIC] rms/veM/frac log; off for gate test)");
+    LOG_INF("  'k'=toggle chip tap engine + tap-event log (test speaker-vs-tap false trigger)");
+    LOG_INF("  'j'=force mic uplink stream through silence (capture AI-alone echo floor)");
     LOG_INF("  'p'=play 440 Hz test tone through the speaker");
     LOG_INF("  'w'=play music.wav from SD (test)");
     LOG_INF("  '0'-'9'=speaker volume 0-90%% (boot default 100%%)");
@@ -798,6 +807,37 @@ void reset_thread_entry(void *, void *, void *) {
             mic_on = !mic_on;
             if (mic_on) mic_vad_start(); else mic_vad_stop();
             LOG_INF("Mic probe %s", mic_on ? "ON ([MIC] rms logging)" : "OFF");
+        } else if (cmd == 'k') {
+            pending_cmd = 0;
+            // Toggle the LSM6DSL chip tap engine (dormant at boot). For the
+            // half-duplex tap-to-interrupt model we must confirm the speaker's
+            // own vibration does NOT false-fire a tap. Enabling also turns on
+            // tap-cal logging so every TAP_SRC event prints; use '+'/'-' to tune
+            // TAP_THS and play speaker audio while watching for false taps.
+            static bool tap_engine_on = false;
+            tap_engine_on = !tap_engine_on;
+            if (tap_engine_on) {
+                lsm6dsl_tap_engine_enable(current_tap_ths);
+                tap_calibration_mode = true;
+                LOG_INF("Tap engine ENABLED (TAP_THS=0x%02x ~%d mg) + tap log ON -- "
+                        "play speaker audio, watch for false '[CAL] tap event'; "
+                        "'+'/'-' to tune", current_tap_ths, current_tap_ths * 62);
+            } else {
+                lsm6dsl_tap_engine_disable();
+                tap_calibration_mode = false;
+                LOG_INF("Tap engine DISABLED (dormant)");
+            }
+        } else if (cmd == 'j') {
+            pending_cmd = 0;
+            // Force the mic uplink to stream regardless of pose/voice gating, so we
+            // can record a clean AI-alone (user-silent) residual-echo floor for the
+            // barge-in de-risk. Hold the band at your ear, 'j' ON, stay silent while
+            // the AI plays, then talk in bursts; 'j' OFF when done.
+            static bool force_listen = false;
+            force_listen = !force_listen;
+            gesture_mode_set_force_listen(force_listen);
+            LOG_INF("Force mic-stream %s (uplink holds through silence)",
+                    force_listen ? "ON" : "OFF");
         } else if (cmd == 'p') {
             pending_cmd = 0;
             LOG_INF("playing 440 Hz test tone via audio_out");
@@ -894,6 +934,10 @@ static const char *power_state_str(PowerState s) {
 // noticeable but not catastrophic.
 #define SNAPSHOT_INTERVAL_MS              (2 * 60 * 1000)  // TESTING: 2 min
 #define SNAPSHOT_FIRST_BOOT_MS            (30 * 1000)      // 30s for first IDLE after boot
+// When a snapshot tick lands during a voice session we defer it and re-arm this
+// short retry (instead of waiting a full SNAPSHOT_INTERVAL_MS), so HR runs
+// promptly once the conversation ends. [STRUCTURAL]
+#define SNAPSHOT_DEFER_RETRY_MS           (15 * 1000)
 // Snapshot duration budget at 22 s:
 //   * 7.7 s consumed by wear-state stabilization (3 windows x 2.56 s)
 //   * remaining 14.3 s yields ~5 WORN measurement windows (Kalman gets
@@ -933,6 +977,18 @@ static void snapshot_tick_handler(struct k_timer *) {
     k_sem_give(&snapshot_tick_sem);
 }
 K_TIMER_DEFINE(snapshot_tick, snapshot_tick_handler, NULL);
+
+// True while a real-time audio/voice session is in progress: the speaker is
+// playing a downlink stream, and/or a central is subscribed to the mic uplink
+// (a conversation is set up and stays "active" across AI-silence gaps). While
+// this holds we DEFER the HR pipeline -- a SNAPSHOT/WORKOUT wakes the MAX30102 +
+// 100 Hz acq thread, whose I2C + CPU bursts starve the audio feeder thread mid-
+// stream and cause speaker underruns (measured 2026-06-22: HR SNAPSHOT
+// concurrent with DICTATION -> ~50 playback underruns). HR runs once the
+// session ends -- "bare minimum on device during conversations".
+static inline bool voice_session_active(void) {
+    return audio_out_active() || ble_audio_subscribed();
+}
 
 // latest_window_seq and latest_motion_state are declared at file scope
 // above (near the other shared state) so dsp_thread_entry can publish
@@ -1109,8 +1165,8 @@ static bool service_chip_int1(bool handle_sigmotion) {
     }
 
     if (sigm_fired && handle_sigmotion) {
-        if (gesture_mode_recent_activity()) {
-            LOG_INF("Sig-motion suppressed -- recent gesture activity "
+        if (gesture_mode_recent_activity() || voice_session_active()) {
+            LOG_INF("Sig-motion suppressed -- recent gesture / voice session "
                     "(not a workout)");
         } else {
             k_sem_reset(&snapshot_tick_sem);   // ignore tick we didn't service
@@ -1172,6 +1228,14 @@ static void run_idle(void) {
     }
     if (events[0].state == K_POLL_STATE_SEM_AVAILABLE) {
         k_sem_take(&snapshot_tick_sem, K_NO_WAIT);
+        if (voice_session_active()) {
+            // Audio is live -- defer HR so the snapshot can't starve the
+            // speaker feeder. Re-arm a short retry; HR resumes post-session.
+            k_timer_start(&snapshot_tick, K_MSEC(SNAPSHOT_DEFER_RETRY_MS),
+                          K_MSEC(SNAPSHOT_INTERVAL_MS));
+            LOG_INF("SNAPSHOT deferred -- voice session active (HR after session)");
+            return;
+        }
         transition_to_snapshot();
         return;
     }
