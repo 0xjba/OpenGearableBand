@@ -11,14 +11,15 @@ Wires BleLink + a VoiceBackend + the Orchestrator into a runnable loop. Two back
   --backend gemini     Real conversation via Gemini Live (reads GEMINI_API_KEY from
                        .env). You talk -> mic -> AEC -> Gemini -> reply plays -> barge-in.
 
-The reference-alignment loop delay (--ref-delay-ms) is the one knob to tune on hardware:
-raise it until the AEC kills the echo (watch for residual speaker audio leaking into the
-mic / spurious barge-ins). See voiceio/orchestrator.py:aligned_reference.
+The render->capture loop delay is estimated ONLINE (voiceio/delay_estimator.py, AEC3-style)
+-- nothing acoustic is hardcoded, so it self-calibrates per unit/session. --init-delay-ms is
+an OPTIONAL warm-start (e.g. a measure_delay value) so the first response isn't un-cancelled
+while the estimator acquires; omit it for pure online acquisition.
 
 Usage:
   tools/dtln-venv/bin/python tools/voice_loop.py --backend loopback --say "Counting: one, two, three, four, five, six, seven, eight."
   tools/dtln-venv/bin/python tools/voice_loop.py --backend gemini
-  tools/dtln-venv/bin/python tools/voice_loop.py --backend loopback --canned reply.wav --ref-delay-ms 200
+  tools/dtln-venv/bin/python tools/voice_loop.py --backend loopback --canned reply.wav --init-delay-ms 200
 """
 import argparse
 import asyncio
@@ -64,8 +65,9 @@ async def main():
                     help="loopback: text to synthesize if --canned is not given")
     ap.add_argument("--model-dir", default=DEFAULT_MODEL, help="DTLN model path prefix")
     ap.add_argument("--lib", default=DEFAULT_LIB, help="liblc3 shared lib")
-    ap.add_argument("--ref-delay-ms", type=float, default=180.0,
-                    help="AEC reference loop delay (HW-tune; see orchestrator)")
+    ap.add_argument("--init-delay-ms", type=float, default=None,
+                    help="optional warm-start for the ONLINE delay estimator (e.g. a "
+                         "measure_delay value); omit for pure online acquisition")
     ap.add_argument("--address", default=None, help="connect directly to this BLE address")
     ap.add_argument("--seconds", type=float, default=0, help="auto-stop after N s (0 = Ctrl-C)")
     args = ap.parse_args()
@@ -90,7 +92,7 @@ async def main():
     ble = BleLink(address=args.address)
     await ble.connect()
     orch = Orchestrator(ble, backend, model_dir=args.model_dir, lib_path=args.lib,
-                        ref_delay_ms=args.ref_delay_ms)
+                        init_delay_ms=args.init_delay_ms)
 
     run_task = asyncio.create_task(orch.run())
     print("[voice_loop] running. Raise to ear + speak (force mic with serial 'j'). Ctrl-C to stop.")

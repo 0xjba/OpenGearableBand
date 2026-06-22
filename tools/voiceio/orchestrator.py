@@ -34,9 +34,12 @@ from voiceio.aec import DtlnAec
 from voiceio.ble_link import BLOCK_SAMPLES, FRAME_BYTES, FRAME_SAMPLES, FRAMES_PER_BLOCK
 from voiceio.clocks import AEC_DRIFT_RATIO
 from voiceio.codec import Lc3Codec
+from voiceio.delay_estimator import DelayEstimator
 from voiceio.vad import BargeInVad
 
 SR = 16000
+HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
+EST_EVERY_BLOCKS = 12         # refine the delay ~every 240 ms while the AI plays
 
 
 def aligned_reference(played_ref, ref_base_mic, mic_count_start, n, ratio=AEC_DRIFT_RATIO):
@@ -70,29 +73,37 @@ class Orchestrator:
     """Full-duplex real-time voice loop over a BleLink + a VoiceBackend."""
 
     def __init__(self, ble_link, backend, model_dir, lib_path="tools/lib/liblc3.dylib",
-                 ref_delay_ms=180.0):
+                 init_delay_ms=None):
         """
         Args:
             ble_link: a connected BleLink (call .connect() first).
             backend: a VoiceBackend (EchoLoopbackBackend / GeminiLiveBackend).
             model_dir: DTLN model path prefix (e.g. ".../dtln_aec_512").
             lib_path: liblc3 shared lib.
-            ref_delay_ms: end-to-end loop latency mic lags playout (prebuffer + acoustic
-                + capture/encode/uplink). [UNIT/STRUCTURAL: HW-tune so the AEC's residual
-                echo is minimized; ~setpoint(140) + acoustic/processing.]
+            init_delay_ms: OPTIONAL warm-start for the online delay estimator (e.g. a
+                measure_delay value) so the first response isn't un-cancelled while the
+                estimator acquires. None = pure online acquisition. NOTE: this is no longer
+                a hardcoded constant -- the loop delay is tracked live by DelayEstimator
+                (AEC3-style), so it self-calibrates per unit/session and carries to
+                production hardware unchanged.
         """
         self.ble = ble_link
         self.backend = backend
         self.codec = Lc3Codec(lib_path)
         self.aec = DtlnAec(model_dir)
         self.vad = BargeInVad(sr=SR)
-        self.ref_delay_samples = int(ref_delay_ms * SR / 1000.0)
+        self.delay_est = DelayEstimator()
+        if init_delay_ms is not None:
+            self.delay_est.warm_start(init_delay_ms)
 
         self._mic_q = asyncio.Queue()
         self._last_mic_ts = 0
-        self._dl_origin_mic = None     # mic ts32 when the first downlink block was sent
+        self._dl_origin_mic = None     # coarse seed: mic ts32 when this response started playing
         self._playing = False          # is the AI currently being streamed out?
         self._dl_residual = np.zeros(0, dtype=np.float32)  # sub-block carry for encoding
+        self._mic_hist = np.zeros(0, dtype=np.float32)     # recent mic for the delay estimator
+        self._mic_hist_start = 0       # abs mic index of _mic_hist[0]
+        self._since_est = 0
         self._stop = asyncio.Event()
 
     # --- uplink: light callback (decode + enqueue only) ---
@@ -115,18 +126,26 @@ class Orchestrator:
 
     async def _dsp_loop(self):
         loop = asyncio.get_running_loop()
-        ref_base_mic = 0
         while not self._stop.is_set():
             try:
                 mic_ts, mic = await asyncio.wait_for(self._mic_q.get(), timeout=0.2)
             except asyncio.TimeoutError:
                 continue
             n = len(mic)
+            ref = np.zeros(n, dtype=np.float32)
             if self._playing and self._dl_origin_mic is not None:
-                ref_base_mic = self._dl_origin_mic + self.ref_delay_samples
-                ref = aligned_reference(self.ble.played_reference(), ref_base_mic, mic_ts, n)
-            else:
-                ref = np.zeros(n, dtype=np.float32)
+                played = self.ble.played_reference()
+                self._push_mic_hist(mic_ts, mic)
+                # Refine the loop delay online (~every 240 ms) -- no hardcoded constant.
+                self._since_est += 1
+                if self._since_est >= EST_EVERY_BLOCKS and len(self._mic_hist) >= HIST_SAMPLES:
+                    self._since_est = 0
+                    self.delay_est.estimate(self._mic_hist, self._mic_hist_start,
+                                            played, self._dl_origin_mic)
+                ref_base_mic = self.delay_est.current(self._dl_origin_mic)
+                if ref_base_mic is not None:
+                    ref = aligned_reference(played, ref_base_mic, mic_ts, n)
+                # else: estimator hasn't locked yet -> pass mic through (brief, first turn only)
             # AEC is blocking -> run in a thread; sequential (await) preserves block order.
             clean = await loop.run_in_executor(None, self.aec.process, mic, ref)
             if len(clean) == 0:
@@ -138,12 +157,33 @@ class Orchestrator:
                     await self._barge_in()
             self.backend.feed_mic(clean)
 
+    def _push_mic_hist(self, mic_ts, mic):
+        """Append the latest mic block to the recent-history window the delay estimator
+        correlates against. Resets on a sequence discontinuity so absolute indexing stays
+        correct, and trims to HIST_SAMPLES."""
+        expected = self._mic_hist_start + len(self._mic_hist)
+        if len(self._mic_hist) == 0 or mic_ts != expected:
+            self._mic_hist = np.asarray(mic, dtype=np.float32)
+            self._mic_hist_start = mic_ts
+            return
+        self._mic_hist = np.concatenate([self._mic_hist, mic])
+        if len(self._mic_hist) > HIST_SAMPLES:
+            drop = len(self._mic_hist) - HIST_SAMPLES
+            self._mic_hist = self._mic_hist[drop:]
+            self._mic_hist_start += drop
+
+    def _reset_mic_hist(self):
+        self._mic_hist = np.zeros(0, dtype=np.float32)
+        self._mic_hist_start = 0
+        self._since_est = 0
+
     async def _barge_in(self):
         print("[orch] barge-in -> flush downlink + stop backend")
         await self.ble.flush()
         self.backend.barge_in()
         self._dl_residual = np.zeros(0, dtype=np.float32)
         self._playing = False
+        self._reset_mic_hist()
         self.vad.reset()
 
     # --- downlink producer: assemble 20 ms blocks from backend audio ---
@@ -157,9 +197,12 @@ class Orchestrator:
             while len(self._dl_residual) >= BLOCK_SAMPLES:
                 if self._dl_origin_mic is None:
                     # First block of a fresh response -> anchor the reference origin to
-                    # the mic timeline (the mic ts as this response starts playing).
+                    # the mic timeline (the mic ts as this response starts playing). The
+                    # delay estimator keeps its tracked loop delay across turns (same
+                    # hardware); only this per-turn seed changes.
                     self._dl_origin_mic = self._last_mic_ts
                     self._playing = True
+                    self._reset_mic_hist()
                 block = self._dl_residual[:BLOCK_SAMPLES]
                 self._dl_residual = self._dl_residual[BLOCK_SAMPLES:]
                 self._send_block(block)
