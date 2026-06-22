@@ -5,6 +5,9 @@ build_*/
 # macOS metadata
 .DS_Store
 
+# Secrets: Gemini (and any backend) API keys live here, never in git/transcript
+.env
+
 # Claude Code session state
 .claude/
 
