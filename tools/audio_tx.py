@@ -65,6 +65,10 @@ SR_HZ = 16000
 BITRATE_BPS = 32000
 FRAME_BYTES = 40
 FRAME_SAMPLES = 160
+# 2 frames/write = 80 B LC3 = 20 ms/write (~50 writes/s). NOTE: packing 6 frames/write
+# (17 writes/s) was tested 2026-06-22 and did NOT change the residual ~1.3% underrun
+# -> BLE write-rate is NOT the bottleneck. Kept at 2 for low latency (barge-in). The
+# device accepts up to 6 (audio_downlink.cpp DL_MAX_PAYLOAD=240) if we ever need it.
 FRAMES_PER_BLOCK = 2          # 80 B LC3 block = 20 ms
 SEQ_HDR = 2
 BLOCK_MS = (FRAMES_PER_BLOCK * FRAME_SAMPLES * 1000) // SR_HZ  # 20 ms
@@ -236,9 +240,10 @@ async def main():
     packets = []
     seq = 0
     for i in range(0, len(frames), FRAMES_PER_BLOCK):
-        block = enc.encode_frame(frames[i])
-        if i + 1 < len(frames):
-            block += enc.encode_frame(frames[i + 1])
+        # Encode ALL frames in this block (up to FRAMES_PER_BLOCK), not just 2 --
+        # the device decodes every 40 B frame in the packet (audio_downlink.cpp).
+        block = b"".join(enc.encode_frame(frames[j])
+                         for j in range(i, min(i + FRAMES_PER_BLOCK, len(frames))))
         packets.append(struct.pack("<H", seq & 0xFFFF) + block)
         seq += 1
     print(f"{args.wav}: {len(frames)} frames -> {len(packets)} blocks "
@@ -369,7 +374,7 @@ async def main():
         # frames + sequence gaps WHILE we stream downlink, proving the band runs
         # both directions on one connection. The uplink only flows in MODE_DICTATION
         # (raise to ear + speak), so frames arrive once dictation is triggered.
-        uplink = {"count": 0, "drops": 0, "last_seq": None}
+        uplink = {"count": 0, "drops": 0, "last_seq": None, "anchor_block": None, "ts": []}
         mic_pcm = bytearray()
         dec = Lc3Decoder(args.lib) if args.record else None
         if args.record and not args.duplex:
@@ -378,15 +383,22 @@ async def main():
             sys.exit("--record needs --lib <liblc3> to decode the uplink mic.")
         if args.duplex:
             def on_uplink(_char, data: bytearray):
-                if len(data) < 2:
+                if len(data) < 6:                          # [seq16][ts32] header = 6 B
                     return
-                seq = data[0] | (data[1] << 8)
+                if uplink["count"] == 0:
+                    # First mic frame -> the device just entered dictation, ~`sent` blocks
+                    # into the downlink. Remember it to align the reference to the mic
+                    # offline (the mic only streams once dictation triggers, seconds in).
+                    uplink["anchor_block"] = sent
+                seq, ts32 = struct.unpack_from("<HI", data, 0)   # [seq16 LE][ts32 LE]
                 if uplink["last_seq"] is not None:
                     uplink["drops"] += (seq - (uplink["last_seq"] + 1)) & 0xFFFF
                 uplink["last_seq"] = seq
                 uplink["count"] += 1
-                if dec:  # [seq16][80B LC3 = 2x40B] -> decode both frames
-                    payload = bytes(data[2:])
+                if args.record:
+                    uplink["ts"].append((ts32, time.monotonic()))   # for the ts sidecar
+                if dec:  # [seq16][ts32][80B LC3 = 2x40B] -> decode both frames
+                    payload = bytes(data[6:])
                     for off in range(0, len(payload) - FRAME_BYTES + 1, FRAME_BYTES):
                         mic_pcm.extend(dec.decode_frame(payload[off:off + FRAME_BYTES]))
             await client.start_notify(AUDIO_UPLINK_UUID, on_uplink)
@@ -428,14 +440,33 @@ async def main():
                   f"{uplink['drops']} seq-gap drops "
                   f"({'NO uplink -- did you raise to ear + speak?' if uplink['count'] == 0 else 'concurrent up+down OK'})")
             if args.record:
+                # Align the reference to the mic timeline. The mic only starts streaming
+                # once dictation triggers (~anchor_block blocks into the downlink), so trim
+                # the reference to start just before the device was playing at that moment:
+                # ref[0] then ~ the echo in mic[0], leaving only a small residual delay for
+                # AEC3's matched filter to lock onto (instead of a multi-second offset).
+                PREBUF_BLOCKS = (SETPOINT_MS + BLOCK_MS - 1) // BLOCK_MS  # downlink prebuffer (~7) [UNIT]
+                LEAD_BLOCKS = 10                                          # 200 ms safety lead [UNIT]
+                anchor = uplink["anchor_block"] or 0
+                start_block = max(0, anchor - PREBUF_BLOCKS - LEAD_BLOCKS)
+                ref_aligned = ref_pcm[start_block * FRAMES_PER_BLOCK * FRAME_SAMPLES * 2:]
                 def _save_wav(path, pcm_bytes):
                     with wave.open(path, "wb") as w:
                         w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR_HZ)
                         w.writeframes(pcm_bytes)
-                _save_wav(f"{args.record}_ref.wav", ref_pcm)
+                _save_wav(f"{args.record}_ref.wav", ref_aligned)
                 _save_wav(f"{args.record}_mic.wav", bytes(mic_pcm))
-                print(f"recorded: {args.record}_ref.wav ({len(ref_pcm)//320} frames), "
-                      f"{args.record}_mic.wav ({len(mic_pcm)//320} frames)")
+                # ts32 sidecar: one row per uplink frame for live drift estimation.
+                with open(f"{args.record}_ts.csv", "w") as f:
+                    f.write("frame_index,ts32,host_time\n")
+                    for i, (ts32, ht) in enumerate(uplink["ts"]):
+                        f.write(f"{i},{ts32},{ht:.6f}\n")
+                ts = uplink["ts"]
+                step = (ts[-1][0] - ts[0][0]) / max(1, len(ts) - 1) if len(ts) > 1 else 0
+                print(f"recorded: {args.record}_ref.wav ({len(ref_aligned)//320} frames, "
+                      f"trimmed to block {start_block}/{sent}, dictation anchor={anchor}), "
+                      f"{args.record}_mic.wav ({len(mic_pcm)//320} frames), "
+                      f"{args.record}_ts.csv ({len(ts)} rows, ts32 step≈{step:.0f}/frame, want 320)")
 
 
 if __name__ == "__main__":

@@ -217,16 +217,16 @@ int ble_audio_set_fast_conn(bool fast)
 	return err;
 }
 
-int ble_audio_notify(const uint8_t *payload, uint16_t len)
+int ble_audio_notify(uint32_t ts32, const uint8_t *payload, uint16_t len)
 {
 	if (audio_conn == NULL || !data_notifications_enabled) {
 		return -ENOTCONN;
 	}
 
-	/* [seq16 LE][payload]. Sized for the B payload (80-byte block) plus
+	/* [seq16 LE][ts32 LE][payload]. Sized for the B payload (80-byte block) plus
 	 * headroom; the static cap also documents the max packet we ever send. */
-	uint8_t pkt[BLE_AUDIO_SEQ_HDR_SIZE + 128];
-	uint16_t pkt_len = BLE_AUDIO_SEQ_HDR_SIZE + len;
+	uint8_t pkt[BLE_AUDIO_HDR_SIZE + 128];
+	uint16_t pkt_len = BLE_AUDIO_HDR_SIZE + len;
 
 	if (len == 0 || payload == NULL || pkt_len > sizeof(pkt)) {
 		return -EINVAL;
@@ -234,7 +234,11 @@ int ble_audio_notify(const uint8_t *payload, uint16_t len)
 
 	pkt[0] = seq_num & 0xFF;
 	pkt[1] = (seq_num >> 8) & 0xFF;
-	memcpy(&pkt[BLE_AUDIO_SEQ_HDR_SIZE], payload, len);
+	pkt[2] = ts32 & 0xFF;
+	pkt[3] = (ts32 >> 8) & 0xFF;
+	pkt[4] = (ts32 >> 16) & 0xFF;
+	pkt[5] = (ts32 >> 24) & 0xFF;
+	memcpy(&pkt[BLE_AUDIO_HDR_SIZE], payload, len);
 
 	int err = bt_gatt_notify(audio_conn, &ble_audio_svc.attrs[2], pkt, pkt_len);
 	if (err == -ENOMEM) {

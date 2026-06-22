@@ -88,6 +88,12 @@ static void audio_thread(void *, void *, void *)
 	int16_t pcm[AUDIO_STREAM_BLOCK_SAMPLES];
 	bool fast_conn = false;
 	uint32_t blk = 0;
+	/* Cumulative captured mic-sample count -> ts32 in each uplink frame, so the host
+	 * can estimate the device clock rate live for AEC drift compensation. Advances per
+	 * block dequeued (even if the BLE notify later drops), so a dropped frame leaves a
+	 * matching gap in ts32. Cumulative from boot; the host resets its estimator per
+	 * connection, so the absolute value (and the ~74 h uint32 wrap) is irrelevant. */
+	uint32_t mic_samples = 0;
 
 	for (;;) {
 		int rc = k_msgq_get(&audio_pcm_q, pcm, K_MSEC(AUDIO_STREAM_IDLE_MS));
@@ -99,6 +105,10 @@ static void audio_thread(void *, void *, void *)
 			}
 			continue;
 		}
+
+		/* ts32 for this frame = index of its first sample; advance per captured block. */
+		uint32_t ts32 = mic_samples;
+		mic_samples += AUDIO_STREAM_BLOCK_SAMPLES;
 
 		/* First block of a burst: ask for a short connection interval so the
 		 * host can sustain ~50 notif/s. (Whether iOS honours it is measured on
@@ -114,7 +124,7 @@ static void audio_thread(void *, void *, void *)
 		uint16_t enc_len = 0;
 		if (lc3_codec_encode_pcm_buffer(pcm, encoded, &enc_len) == 0) {
 			/* Drop-on-ENOMEM handled inside ble_audio_notify (never blocks). */
-			(void)ble_audio_notify(encoded, enc_len);
+			(void)ble_audio_notify(ts32, encoded, enc_len);
 		} else {
 			LOG_ERR("audio_stream: encode failed");
 		}
