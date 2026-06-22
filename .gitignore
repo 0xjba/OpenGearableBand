@@ -23,6 +23,14 @@ tools/lib/
 # Python bytecode cache (tools/audio_rx.py)
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Voice-I/O offline AEC tooling: cloned model repo + heavy venv + recording sidecars
+# (regenerable: git clone github.com/breizhn/DTLN-aec; python -m venv + pip install
+#  tensorflow soundfile webrtcvad soxr; audio_tx.py --record writes the *_ts.csv)
+tools/DTLN-aec/
+tools/dtln-venv/
+*_ts.csv
 
 # Test source audio + generated PCM header (regenerable via spkr_test/tools/)
 *.mp3
