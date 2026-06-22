@@ -49,12 +49,14 @@ class BargeInVad:
         self.floor = None  # Initialized on first frame.
         self.consec = 0  # Consecutive gated frames.
         self.armed_fired = False  # Has this onset been emitted?
+        self._carry = np.zeros(0, dtype=np.float32)  # sub-frame remainder between calls
 
     def reset(self) -> None:
         """Clear state (floor, re-arm flag, frame counter)."""
         self.floor = None
         self.consec = 0
         self.armed_fired = False
+        self._carry = np.zeros(0, dtype=np.float32)
 
     def process(self, audio: np.ndarray) -> list:
         """
@@ -66,9 +68,16 @@ class BargeInVad:
         Returns:
             List of float onset times (seconds from start of this audio segment).
         """
+        # Prepend any sub-frame remainder from the previous call so arbitrary chunk sizes
+        # (e.g. the orchestrator's 128/256/384-sample AEC outputs) are handled without
+        # dropping samples -- otherwise a chunk shorter than one frame yields zero frames
+        # and the detector never runs.
+        audio = np.concatenate([self._carry, np.asarray(audio, dtype=np.float32)])
+
         # Split into non-overlapping frames.
         frame_samples = int(self.sr * self.frame_ms / 1000.0)
         n_frames = len(audio) // frame_samples
+        self._carry = audio[n_frames * frame_samples:]  # keep the remainder for next call
         onsets = []
 
         # Conversion factor for dB to linear.

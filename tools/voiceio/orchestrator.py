@@ -93,9 +93,7 @@ class Orchestrator:
         self.backend = backend
         self.codec = Lc3Codec(lib_path)
         self.aec = DtlnAec(model_dir)
-        # frame_ms=20 so each 320-sample (20 ms) clean block == exactly one VAD frame
-        # (the 30 ms default silently processed 0 frames per block -> the VAD never fired).
-        self.vad = BargeInVad(sr=SR, frame_ms=20)
+        self.vad = BargeInVad(sr=SR)   # buffers internally, so AEC's 128/256-sample chunks are fine
         self.delay_est = DelayEstimator()
 
         self._mic_q = asyncio.Queue()
@@ -106,6 +104,8 @@ class Orchestrator:
         self._mic_hist = np.zeros(0, dtype=np.float32)     # recent mic for the delay estimator
         self._mic_hist_start = 0       # abs mic index of _mic_hist[0]
         self._since_est = 0
+        self._aec_mic = np.zeros(0, dtype=np.float32)      # carry to feed AEC in 128-multiples
+        self._aec_ref = np.zeros(0, dtype=np.float32)
         self._stop = asyncio.Event()
         # --- bring-up instrumentation (printed by _status_loop) ---
         self._n_uplink = 0             # mic frames received from the band
@@ -152,15 +152,15 @@ class Orchestrator:
                     self._since_est += 1
                     if self._since_est >= EST_EVERY_BLOCKS and len(self._mic_hist) >= HIST_SAMPLES:
                         self._since_est = 0
-                        # Live search center from the playout position: the sample being
-                        # HEARD now is played_samples minus the in-flight buffer (device
-                        # jitter buffer + still-queued blocks). It is heard at the MOST
-                        # RECENT mic sample (window end, not start), so
-                        # center = mic_now - heard_idx/ratio (== an estimate of ref_base_mic).
-                        # Robust to which stream started first (unlike a once-captured origin).
+                        # Live search center from the playout position. played_samples counts
+                        # only TRANSMITTED samples (ble_link increments it as it paces sends),
+                        # so the sample HEARD now is played_samples minus only the DEVICE
+                        # buffer (~setpoint) -- NOT the host send queue (downlink_pending),
+                        # which sits BEFORE transmission and would wrongly add seconds when a
+                        # backend bursts a whole reply in at once. Heard at the most recent mic
+                        # sample, so center = mic_now - heard_idx/ratio (~ ref_base_mic).
                         mic_now = self._mic_hist_start + len(self._mic_hist)
-                        in_flight = self.ble.downlink_pending() * BLOCK_SAMPLES + SETPOINT_SAMPLES
-                        heard_idx = max(0, self.ble.played_samples - in_flight)
+                        heard_idx = max(0, self.ble.played_samples - SETPOINT_SAMPLES)
                         center = int(mic_now - heard_idx / AEC_DRIFT_RATIO)
                         self.delay_est.estimate(self._mic_hist, self._mic_hist_start,
                                                 played, center)
@@ -168,8 +168,19 @@ class Orchestrator:
                     if ref_base_mic is not None:
                         ref = aligned_reference(played, ref_base_mic, mic_ts, n)
                     # else: estimator not locked yet -> pass mic through (brief, first turn)
+                # The DTLN AEC consumes whole 128-sample hops; a 320-sample block is NOT a
+                # multiple of 128, so feeding it directly would DROP 64 samples/block (20%
+                # audio loss). Accumulate mic+ref and feed the largest 128-multiple, carrying
+                # the remainder to the next block. mic and ref stay sample-aligned.
+                self._aec_mic = np.concatenate([self._aec_mic, mic])
+                self._aec_ref = np.concatenate([self._aec_ref, ref])
+                m = (len(self._aec_mic) // 128) * 128
+                if m == 0:
+                    continue
+                mic_chunk, self._aec_mic = self._aec_mic[:m], self._aec_mic[m:]
+                ref_chunk, self._aec_ref = self._aec_ref[:m], self._aec_ref[m:]
                 # AEC is blocking -> run in a thread; sequential (await) preserves order.
-                clean = await loop.run_in_executor(None, self.aec.process, mic, ref)
+                clean = await loop.run_in_executor(None, self.aec.process, mic_chunk, ref_chunk)
                 if len(clean) == 0:
                     continue
                 self._clean_rms = float(np.sqrt(np.mean(clean ** 2) + 1e-12))
@@ -202,6 +213,8 @@ class Orchestrator:
         self._mic_hist = np.zeros(0, dtype=np.float32)
         self._mic_hist_start = 0
         self._since_est = 0
+        self._aec_mic = np.zeros(0, dtype=np.float32)
+        self._aec_ref = np.zeros(0, dtype=np.float32)
 
     async def _barge_in(self):
         print("[orch] barge-in -> flush downlink + stop backend")

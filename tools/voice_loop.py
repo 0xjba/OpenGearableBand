@@ -60,7 +60,11 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=["loopback", "gemini"], default="loopback")
     ap.add_argument("--canned", help="loopback: WAV to play as the AI reply")
-    ap.add_argument("--say", default="Counting now: one, two, three, four, five, six, seven, eight, nine, ten.",
+    ap.add_argument("--say", default=(
+                        "Let me count slowly so you have time to interrupt me. "
+                        "One. Two. Three. Four. Five. Six. Seven. Eight. Nine. Ten. "
+                        "Eleven. Twelve. Thirteen. Fourteen. Fifteen. Sixteen. Seventeen. "
+                        "Eighteen. Nineteen. Twenty. That is the end of my counting."),
                     help="loopback: text to synthesize if --canned is not given")
     ap.add_argument("--model-dir", default=DEFAULT_MODEL, help="DTLN model path prefix")
     ap.add_argument("--lib", default=DEFAULT_LIB, help="liblc3 shared lib")
