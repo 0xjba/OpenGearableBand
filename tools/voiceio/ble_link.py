@@ -87,14 +87,32 @@ class BleLink:
         await self._client.__aenter__()
         if not self._client.is_connected:
             sys.exit("Device dropped right after connecting (link not held).")
-        self._dl_char = self._client.services.get_characteristic(DL_UUID)
-        self._ctrl_char = self._client.services.get_characteristic(CTRL_UUID)
+        # Service discovery can lag the connect (or land before GATT is resolved). Retry a
+        # few times, re-reading the collection each pass, before deciding it's missing.
+        for attempt in range(8):
+            await asyncio.sleep(0.6)
+            self._dl_char = self._client.services.get_characteristic(DL_UUID)
+            self._ctrl_char = self._client.services.get_characteristic(CTRL_UUID)
+            chars = list(self._client.services.characteristics.values())
+            if self._dl_char is not None and self._ctrl_char is not None:
+                break
+            print(f"[ble] discovery attempt {attempt + 1}/8: {len(chars)} chars, "
+                  f"downlink {'found' if self._dl_char else 'missing'} ...")
         if self._dl_char is None or self._ctrl_char is None:
-            sys.exit("Downlink chars not discovered -- toggle Mac Bluetooth (stale GATT) "
-                     "and clear bonds (serial 'u' then 'r').")
+            print("[ble] discovered characteristics:")
+            for ch in list(self._client.services.characteristics.values()):
+                print(f"      {ch.uuid}  ({','.join(ch.properties)})")
+            sys.exit(
+                "\n[ble] Downlink chars (47a10003/47a10004) NOT discovered -- macOS is serving\n"
+                "a STALE GATT cache. You do NOT need to toggle Mac Bluetooth:\n"
+                "  1. On the band's SERIAL console, press 'r' to REBOOT it (fresh GATT), then\n"
+                "     re-run this. If it still fails, press 'u' (clear bonds) then 'r'.\n"
+                "  2. Make sure no other app (nRF Connect, a prior voice_loop) holds the\n"
+                "     connection -- the firmware accepts ONE connection at a time.")
         # Escalating write probe (localizes an L2CAP size failure; settles DLE).
         await self._probe()
-        print(f"[ble] connected {dev.address}, MTU={self._client.mtu_size}")
+        print(f"[ble] connected {dev.address}, MTU={self._client.mtu_size}, "
+              f"{len(list(self._client.services.characteristics.values()))} chars")
 
     async def _find_device(self):
         if self.address:
