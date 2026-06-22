@@ -184,12 +184,19 @@ class Orchestrator:
                 if len(clean) == 0:
                     continue
                 self._clean_rms = float(np.sqrt(np.mean(clean ** 2) + 1e-12))
-                # Barge-in: only meaningful while the AI is talking.
-                if self._playing:
+                # Barge-in: only while the AI is talking AND the AEC is locked + cancelling.
+                # Before lock the reference is zeros, so `clean` still contains the full
+                # speaker echo -- running the VAD then fires on the AI's OWN voice (a false
+                # barge-in that kills playback in the first ~0.5 s, before the estimator can
+                # even acquire). Gating on `locked` closes that warmup window; the estimator
+                # gets its ~0.5 s of history while playback continues.
+                if self._playing and self.delay_est.locked:
                     onsets = self.vad.process(clean)
                     if onsets:
                         self._n_onsets += 1
                         await self._barge_in()
+                else:
+                    self.vad.reset()    # keep the floor fresh for when we do arm
                 self.backend.feed_mic(clean)
             except Exception:  # surface a crash instead of silently killing the task
                 print("[orch] DSP loop error:\n" + traceback.format_exc())
