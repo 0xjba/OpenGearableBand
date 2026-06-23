@@ -94,6 +94,8 @@ class GeminiLiveBackend(VoiceBackend):
         self._ready = threading.Event()        # session connected (or _err set)
         self._stop = threading.Event()
         self._err = None
+        self._n_turns = 0                      # completed model turns (diagnostic)
+        self._n_audio_recv = 0                 # audio chunks received (diagnostic)
 
         self._thread = threading.Thread(target=self._run, name="gemini-live", daemon=True)
         self._thread.start()
@@ -181,29 +183,53 @@ class GeminiLiveBackend(VoiceBackend):
 
     async def _sender(self, session):
         """Drain outbound mic PCM and stream it to the model."""
-        while True:
-            item = await self._aio_mic_q.get()
-            if item is _END_TURN:
-                await session.send_realtime_input(audio_stream_end=True)
-                continue
-            await session.send_realtime_input(
-                audio=self._types.Blob(data=item, mime_type=GEMINI_IN_MIME)
-            )
+        import traceback
+        try:
+            while True:
+                item = await self._aio_mic_q.get()
+                if item is _END_TURN:
+                    await session.send_realtime_input(audio_stream_end=True)
+                    continue
+                await session.send_realtime_input(
+                    audio=self._types.Blob(data=item, mime_type=GEMINI_IN_MIME)
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            print("[gemini] sender task died:\n" + traceback.format_exc())
 
     async def _receiver(self, session):
-        """Receive the model's audio, resample 24->16 kHz, queue it for playback.
+        """Receive the model's audio across MULTIPLE turns.
 
-        Audio arrives on the convenience attribute `response.data` (the SDK
-        aggregates the turn's inline PCM there); the model_turn.parts path was
-        empty in practice."""
-        async for response in session.receive():
-            sc = response.server_content
-            # Server-side turn interruption: flush, mirroring our local barge_in().
-            if sc is not None and getattr(sc, "interrupted", False):
-                self.barge_in()
-                continue
-            data = getattr(response, "data", None)
-            if data:
-                pcm = _pcm16le_to_f32(data)
-                pcm16k = resample(pcm, GEMINI_OUT_HZ, INTERNAL_HZ)
-                self._play_q.put(pcm16k)
+        CRITICAL: session.receive() is a PER-TURN generator -- the SDK breaks the
+        loop on turn_complete (verified in the SDK source). So a single `async for`
+        ends after the first reply and never sees turn 2. We must re-enter receive()
+        for each turn, hence the outer while loop. Audio arrives on the convenience
+        attribute response.data (the model_turn.parts path was empty in practice)."""
+        import traceback
+        try:
+            while not self._stop.is_set():
+                async for response in session.receive():
+                    sc = response.server_content
+                    # Server-side interruption: flush, mirroring our local barge_in().
+                    if sc is not None and getattr(sc, "interrupted", False):
+                        print("[gemini] <- interrupted")
+                        self.barge_in()
+                        continue
+                    data = getattr(response, "data", None)
+                    if data:
+                        self._n_audio_recv += 1
+                        pcm = _pcm16le_to_f32(data)
+                        pcm16k = resample(pcm, GEMINI_OUT_HZ, INTERNAL_HZ)
+                        self._play_q.put(pcm16k)
+                    if sc is not None and getattr(sc, "turn_complete", False):
+                        self._n_turns += 1
+                        print(f"[gemini] <- turn_complete (#{self._n_turns}, "
+                              f"{self._n_audio_recv} audio chunks total)")
+                # turn generator ended -> loop back into receive() for the next turn
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            print("[gemini] receiver task died:\n" + traceback.format_exc())
+        finally:
+            print("[gemini] receiver loop exited")
