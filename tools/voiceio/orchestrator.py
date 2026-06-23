@@ -262,6 +262,15 @@ class Orchestrator:
         self.backend.barge_in()
         self._dl_residual = np.zeros(0, dtype=np.float32)
         self._playing = False
+        # MUST also clear the per-turn origin: the downlink loop re-arms _playing only when
+        # _dl_origin_mic is None (a fresh response). Leaving it set kept _playing False on
+        # every reply AFTER the first barge-in -> no AEC -> the AI echoed back into the mic
+        # and Gemini interrupted itself repeatedly.
+        self._dl_origin_mic = None
+        # The flush empties the device playout buffer (a playout discontinuity) and the
+        # barge-in double-talk can corrupt the alignment, so re-acquire cleanly on the next
+        # reply instead of carrying a bad lock.
+        self.delay_est.reset()
         self._reset_mic_hist()
         self.vad.reset()
 
