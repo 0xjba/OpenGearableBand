@@ -56,6 +56,25 @@ def synth_16k(text):
     return load_16k_mono(aiff)
 
 
+def make_backend(args):
+    """Backend factory -- the single place that knows about concrete backends. To plug in
+    a new API: add a branch here returning your VoiceBackend subclass. Nothing else in the
+    app changes (the orchestrator + DSP core are backend-agnostic)."""
+    if args.backend == "gemini":
+        from dotenv import load_dotenv
+        from voiceio.gemini_backend import GeminiLiveBackend
+        load_dotenv()
+        if not os.environ.get("GEMINI_API_KEY"):
+            sys.exit("GEMINI_API_KEY not set (put it in a git-ignored .env).")
+        print("[backend] Gemini Live")
+        return GeminiLiveBackend(
+            system_instruction="You are a concise voice assistant. Keep replies short.")
+    # default: loopback (no API)
+    reply = load_16k_mono(args.canned) if args.canned else synth_16k(args.say)
+    print(f"[backend] loopback, AI reply = {len(reply)/SR:.1f}s canned audio")
+    return EchoLoopbackBackend(reply)
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", choices=["loopback", "gemini"], default="loopback")
@@ -72,23 +91,12 @@ async def main():
     ap.add_argument("--seconds", type=float, default=0, help="auto-stop after N s (0 = Ctrl-C)")
     args = ap.parse_args()
 
-    # --- backend ---
-    if args.backend == "gemini":
-        from dotenv import load_dotenv
-        from voiceio.gemini_backend import GeminiLiveBackend
-        load_dotenv()
-        if not os.environ.get("GEMINI_API_KEY"):
-            sys.exit("GEMINI_API_KEY not set (put it in a git-ignored .env).")
-        backend = GeminiLiveBackend(
-            system_instruction="You are a concise voice assistant. Keep replies short.")
-        backend.wait_ready(timeout=15.0)
-        print("[gemini] connected")
-    else:
-        reply = load_16k_mono(args.canned) if args.canned else synth_16k(args.say)
-        print(f"[loopback] AI reply = {len(reply)/SR:.1f}s canned audio")
-        backend = EchoLoopbackBackend(reply)
+    # The ONLY backend-aware code in the whole app: pick + construct a VoiceBackend.
+    # Everything below treats it through the uniform VoiceBackend contract.
+    backend = make_backend(args)
+    backend.wait_ready(timeout=15.0)
 
-    # --- BLE + orchestrator ---
+    # --- BLE + orchestrator (backend-agnostic) ---
     ble = BleLink(address=args.address)
     await ble.connect()
     orch = Orchestrator(ble, backend, model_dir=args.model_dir, lib_path=args.lib)
@@ -106,8 +114,7 @@ async def main():
         orch.stop()
         run_task.cancel()
         await asyncio.gather(run_task, return_exceptions=True)
-        if args.backend == "gemini":
-            backend.close()
+        backend.close()
         await ble.aclose()
         print("[voice_loop] stopped.")
 

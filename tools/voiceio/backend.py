@@ -1,26 +1,63 @@
-"""Pluggable AI-backend interface for the voice loop + a no-API test backend.
+"""Pluggable AI-backend contract for the voice loop + a no-API test backend.
 
-The orchestrator owns BLE/AEC/VAD; the backend is the 'brain': it receives the
-user's clean mic audio and produces audio to play on the speaker, and stops on
-barge-in. Gemini Live (or any STT->LLM->TTS) plugs in behind this same interface."""
+THE BOUNDARY (keep it clean): the core (orchestrator + ble_link + codec + aec + vad +
+delay_estimator) is backend-agnostic and knows NOTHING about any specific API. A "brain"
+plugs in behind this one interface: it receives the user's clean (echo-cancelled) mic
+audio and produces audio to play on the speaker, and stops on barge-in. Gemini Live is
+just the first impl (voiceio/gemini_backend.py); an STT->LLM->TTS stack, a different
+realtime API, or a local model all plug in the same way, with NO changes to the core.
+
+To add a new backend:
+  1. Subclass VoiceBackend; implement feed_mic / next_audio / barge_in (required).
+  2. Override any of wait_ready / end_turn / reset / close that apply (all default to
+     safe no-ops, so a simple backend needs only the three required methods).
+  3. Construct it in the entry point (tools/voice_loop.py) -- the ONLY place that names a
+     concrete backend. Nothing in voiceio/ (except this file's test backend) should.
+
+AUDIO CONTRACT: every audio array crossing this interface is 16 kHz mono float32 in
+[-1, 1]. Any rate conversion a backend needs (e.g. Gemini's 24 kHz output) happens INSIDE
+that backend, never in the core.
+"""
 import numpy as np
 
 
 class VoiceBackend:
-    """Interface. All audio is 16 kHz mono float32 in [-1, 1]."""
+    """The pluggable 'brain' contract. All audio is 16 kHz mono float32 in [-1, 1]."""
+
+    # --- required: every backend must implement these three ---
 
     def feed_mic(self, pcm):
         """Push a chunk of the user's clean (echo-cancelled) mic audio to the backend."""
         raise NotImplementedError
 
     def next_audio(self, max_samples):
-        """Return up to max_samples of AI audio to play now (a float32 array; empty array
+        """Return up to max_samples of AI audio to play now (float32 array; empty
         np.zeros(0, np.float32) if there's nothing to play yet)."""
         raise NotImplementedError
 
     def barge_in(self):
         """The user interrupted -- stop/flush the current output immediately."""
         raise NotImplementedError
+
+    # --- optional lifecycle: safe no-op defaults so the core treats all backends alike ---
+
+    def wait_ready(self, timeout=15.0):
+        """Block until the backend can accept audio (e.g. a network session connected).
+        Default: ready immediately. Raise on failure."""
+        return
+
+    def end_turn(self):
+        """Signal end-of-user-turn explicitly (push-to-talk). Backends with their own
+        server-side turn detection (VAD) can ignore this. Default: no-op."""
+        return
+
+    def reset(self):
+        """Clear per-session state. Default: no-op."""
+        return
+
+    def close(self):
+        """Release resources (network sessions, threads). Default: no-op."""
+        return
 
 
 class EchoLoopbackBackend(VoiceBackend):
