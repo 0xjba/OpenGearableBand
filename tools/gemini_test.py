@@ -79,7 +79,7 @@ def main():
     print("[gemini] connecting...")
     be = GeminiLiveBackend(
         system_instruction="You are a concise voice assistant. Keep replies short.")
-    be.wait_ready(timeout=15.0)
+    be.start_session(timeout=15.0)
     print("[gemini] connected.")
 
     # Stream the question as the user's mic audio, paced ~real-time, + trailing

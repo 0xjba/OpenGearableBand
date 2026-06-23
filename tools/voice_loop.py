@@ -92,9 +92,10 @@ async def main():
     args = ap.parse_args()
 
     # The ONLY backend-aware code in the whole app: pick + construct a VoiceBackend.
-    # Everything below treats it through the uniform VoiceBackend contract.
+    # Everything below treats it through the uniform VoiceBackend contract. The AI session
+    # is opened/closed PER CONVERSATION by the orchestrator (arm raised -> start, arm
+    # lowered -> end), so we do NOT connect here.
     backend = make_backend(args)
-    backend.wait_ready(timeout=15.0)
 
     # --- BLE + orchestrator (backend-agnostic) ---
     ble = BleLink(address=args.address)

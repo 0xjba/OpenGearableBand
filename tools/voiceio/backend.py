@@ -41,9 +41,23 @@ class VoiceBackend:
 
     # --- optional lifecycle: safe no-op defaults so the core treats all backends alike ---
 
-    def wait_ready(self, timeout=15.0):
-        """Block until the backend can accept audio (e.g. a network session connected).
+    def start_session(self, timeout=15.0):
+        """Begin a NEW conversation session (e.g. open the AI WebSocket) and block until
+        ready. Called by the orchestrator when the user starts a conversation (arm raised
+        -> uplink audio begins). A backend may be start/ended many times over its life.
         Default: ready immediately. Raise on failure."""
+        return
+
+    def end_session(self):
+        """End the current conversation session (e.g. close the AI WebSocket to stop
+        billing/listening). The backend must be reusable -- a later start_session() opens a
+        fresh one. Called when the user ends the conversation (arm lowered -> uplink stops).
+        Default: no-op."""
+        return
+
+    def wait_ready(self, timeout=15.0):
+        """Block until ready. Deprecated alias kept for callers; prefer start_session().
+        Default: ready immediately."""
         return
 
     def end_turn(self):
@@ -69,11 +83,14 @@ class EchoLoopbackBackend(VoiceBackend):
     def __init__(self, response_pcm):
         self._resp = np.asarray(response_pcm, dtype=np.float32)
         self._pos = 0
+        self._open = False   # only plays during an active session
 
     def feed_mic(self, pcm):
         pass  # test backend ignores the mic; its reply is canned
 
     def next_audio(self, max_samples):
+        if not self._open:
+            return np.zeros(0, np.float32)
         chunk = self._resp[self._pos:self._pos + max_samples]
         self._pos += len(chunk)
         return chunk.astype(np.float32)
@@ -83,3 +100,10 @@ class EchoLoopbackBackend(VoiceBackend):
 
     def reset(self):
         self._pos = 0
+
+    def start_session(self, timeout=15.0):
+        self._pos = 0        # replay the canned reply for each new session
+        self._open = True
+
+    def end_session(self):
+        self._open = False

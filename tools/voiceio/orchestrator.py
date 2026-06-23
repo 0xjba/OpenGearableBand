@@ -40,6 +40,7 @@ from voiceio.vad import BargeInVad
 
 SR = 16000
 CAL_SECONDS = 0.8             # length of the startup calibration chirp
+SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the conversation
 HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
 EST_EVERY_BLOCKS = 12         # refine the alignment ~every 240 ms while the AI plays
 # In-flight buffer between "sample transmitted" and "sample heard by the mic": the device
@@ -129,6 +130,11 @@ class Orchestrator:
         self.calibrate_on_start = calibrate_on_start
         self._cal_audio = np.zeros(0, dtype=np.float32)    # queued calibration samples to play
         self._calibrating = False                          # suppress barge-in during the chirp
+        # Conversation session lifecycle: a session = one raise-to-ear conversation. It opens
+        # when uplink audio starts (arm raised / mic forced) and closes when uplink goes silent
+        # for SESSION_END_S (arm lowered), which opens/closes the backend's AI socket so an idle
+        # band isn't holding one open (cost/battery/privacy).
+        self._session_active = False
         # --- bring-up instrumentation (printed by _status_loop) ---
         self._n_uplink = 0             # mic frames received from the band
         self._n_blocks_sent = 0        # downlink blocks transmitted
@@ -280,13 +286,17 @@ class Orchestrator:
         import traceback
         while not self._stop.is_set():
             try:
-                # Calibration chirp (if queued) plays first; otherwise the backend's audio.
+                # Calibration chirp (if queued) plays first; otherwise the backend's audio,
+                # but ONLY during an active conversation -- between sessions a backend may
+                # still hold a stale tail, and an idle band must play nothing.
                 if len(self._cal_audio) > 0:
                     take = min(BLOCK_SAMPLES, len(self._cal_audio))
                     got = self._cal_audio[:take]
                     self._cal_audio = self._cal_audio[take:]
-                else:
+                elif self._session_active:
                     got = self.backend.next_audio(BLOCK_SAMPLES)
+                else:
+                    got = np.zeros(0, dtype=np.float32)
                 if len(got):
                     self._dl_residual = np.concatenate([self._dl_residual, got])
                 # Emit as many whole 320-sample blocks as we have.
@@ -351,24 +361,18 @@ class Orchestrator:
                   f"barge_ins={self._n_onsets}")
 
     async def _calibrate(self):
-        """Acquire the echo alignment up front so barge-in is armed from the AI's first
-        reply -- no user-visible silence. Waits for the mic to activate; if the backend is
-        NOT already playing (the user-speaks-first case), plays a brief chirp and locks on
-        its echo. If something IS already playing (e.g. loopback), that audio locks it, so
-        the chirp is skipped."""
-        for _ in range(600):                       # wait up to 60 s for the mic to turn on
-            if self._n_uplink > 0 or self._stop.is_set():
-                break
-            await asyncio.sleep(0.1)
-        if self._stop.is_set() or self._n_uplink == 0:
+        """Acquire the echo alignment at session start so barge-in is armed from the AI's
+        first reply -- no user-visible silence. Called when the mic is already active (a
+        session just opened). If the backend is NOT already playing (user-speaks-first), play
+        a brief chirp and lock on its echo; if something IS already playing (loopback), that
+        audio locks it, so the chirp is skipped."""
+        if self._stop.is_set() or self._playing or self.delay_est.locked:
             return
-        if self._playing or self.delay_est.locked:
-            return                                  # backend audio will lock it; no chirp needed
         print("[cal] mic active, backend silent -> playing calibration chirp to lock alignment")
         self._calibrating = True
         self._cal_audio = make_cal_chirp()
         for _ in range(int((CAL_SECONDS + 2.5) / 0.05)):   # wait for lock (chirp + margin)
-            if self.delay_est.locked or self._stop.is_set():
+            if self.delay_est.locked or self._stop.is_set() or not self._session_active:
                 break
             await asyncio.sleep(0.05)
         if self.delay_est.locked:
@@ -378,26 +382,81 @@ class Orchestrator:
             print("[cal] not locked from chirp; will acquire online on the first reply")
         self._calibrating = False
 
+    # --- conversation session lifecycle (driven by uplink presence) ---
+
+    async def _session_loop(self):
+        """Open a session when uplink audio starts (arm raised / mic forced), close it when
+        uplink goes silent for SESSION_END_S (arm lowered). The firmware already gates the
+        uplink on POSE_EAR/MODE_DICTATION, so uplink presence == 'user is in a conversation'."""
+        loop = asyncio.get_running_loop()
+        prev_uplink = self._n_uplink
+        last_active = loop.time()
+        while not self._stop.is_set():
+            await asyncio.sleep(0.3)
+            now = loop.time()
+            active_now = self._n_uplink > prev_uplink     # frames arrived since last check
+            prev_uplink = self._n_uplink
+            if active_now:
+                last_active = now
+            if not self._session_active:
+                if active_now:
+                    await self._start_session()
+            elif now - last_active > SESSION_END_S:
+                await self._end_session()
+
+    async def _start_session(self):
+        print("[session] start -- uplink active (conversation begun)")
+        self._reset_session_state()
+        try:
+            self.backend.start_session()              # may block ~1 s opening the AI socket
+        except Exception as e:  # noqa: BLE001
+            print(f"[session] backend start failed: {e!r}")
+            return
+        self._session_active = True
+        if self.calibrate_on_start:
+            asyncio.create_task(self._calibrate())
+
+    async def _end_session(self):
+        print("[session] end -- uplink silent (arm lowered); closing AI session")
+        self._session_active = False
+        await self.ble.flush()
+        try:
+            self.backend.end_session()
+        except Exception as e:  # noqa: BLE001
+            print(f"[session] backend end error: {e!r}")
+        self._reset_session_state()
+
+    def _reset_session_state(self):
+        """Clear all per-conversation DSP/playout state (between conversations)."""
+        self._playing = False
+        self._dl_origin_mic = None
+        self._dl_residual = np.zeros(0, dtype=np.float32)
+        self._cal_audio = np.zeros(0, dtype=np.float32)
+        self._calibrating = False
+        self.aec.reset()
+        self.vad.reset()
+        self.delay_est.reset()
+        self._reset_mic_hist()
+
     # --- lifecycle ---
 
     async def run(self):
-        """Start streaming + the DSP/downlink tasks; runs until stop()."""
+        """Start streaming + the DSP/downlink/session tasks; runs until stop()."""
         self.aec.reset()
         self.vad.reset()
         await self.ble.start(self._on_uplink)
-        dsp = asyncio.create_task(self._dsp_loop())
-        dl = asyncio.create_task(self._downlink_loop())
-        stat = asyncio.create_task(self._status_loop())
-        cal = asyncio.create_task(self._calibrate()) if self.calibrate_on_start else None
+        tasks = [
+            asyncio.create_task(self._dsp_loop()),
+            asyncio.create_task(self._downlink_loop()),
+            asyncio.create_task(self._status_loop()),
+            asyncio.create_task(self._session_loop()),
+        ]
         try:
             await self._stop.wait()
         finally:
-            dsp.cancel()
-            dl.cancel()
-            stat.cancel()
-            if cal:
-                cal.cancel()
-            await asyncio.gather(dsp, dl, stat, *( [cal] if cal else [] ), return_exceptions=True)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def stop(self):
         self._stop.set()

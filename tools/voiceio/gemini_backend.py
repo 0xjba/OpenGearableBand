@@ -86,7 +86,13 @@ class GeminiLiveBackend(VoiceBackend):
         if system_instruction:
             self._config["system_instruction"] = system_instruction
 
-        # Cross-thread plumbing.
+        # Per-session plumbing -- (re)created by start_session(). The WebSocket is opened
+        # per CONVERSATION (arm raised -> start_session, arm lowered -> end_session), NOT in
+        # __init__, so an idle band isn't holding an open Gemini session (cost/battery/privacy).
+        self._thread = None
+        self._init_session_state()
+
+    def _init_session_state(self):
         self._play_q = queue.Queue()           # inbound 16 kHz float32 chunks to play
         self._play_buf = np.zeros(0, np.float32)  # leftover from a partial next_audio()
         self._loop = None                      # the bg event loop (set when ready)
@@ -96,9 +102,6 @@ class GeminiLiveBackend(VoiceBackend):
         self._err = None
         self._n_turns = 0                      # completed model turns (diagnostic)
         self._n_audio_recv = 0                 # audio chunks received (diagnostic)
-
-        self._thread = threading.Thread(target=self._run, name="gemini-live", daemon=True)
-        self._thread.start()
 
     # --- VoiceBackend interface (called from the orchestrator's audio thread) ---
 
@@ -151,12 +154,40 @@ class GeminiLiveBackend(VoiceBackend):
         if self._err is not None:
             raise self._err
 
-    def close(self):
-        """Stop the session and join the background thread."""
+    def start_session(self, timeout=15.0):
+        """Open a FRESH Gemini Live session (WebSocket) and block until ready. Reusable:
+        call again after end_session() for the next conversation."""
+        if self._thread is not None and self._thread.is_alive():
+            return                              # a session is already open
+        self._init_session_state()              # fresh queues/events/counters
+        self._thread = threading.Thread(target=self._run, name="gemini-live", daemon=True)
+        self._thread.start()
+        self.wait_ready(timeout)
+        print("[gemini] session opened")
+
+    def end_session(self):
+        """Close the current Gemini session (WebSocket) + join its thread. The object stays
+        reusable -- a later start_session() opens a new one. Invalidates the loop so feed_mic
+        / next_audio become no-ops until the next session."""
+        if self._thread is None:
+            return
         self._stop.set()
         if self._loop is not None:
-            self._loop.call_soon_threadsafe(lambda: None)  # wake the loop
+            self._loop.call_soon_threadsafe(lambda: None)  # wake the loop to see _stop
         self._thread.join(timeout=5.0)
+        self._thread = None
+        self._loop = None                       # feed_mic/next_audio guard on this -> no-op
+        self._play_buf = np.zeros(0, np.float32)  # drop any unplayed tail
+        while not self._play_q.empty():
+            try:
+                self._play_q.get_nowait()
+            except queue.Empty:
+                break
+        print("[gemini] session closed")
+
+    def close(self):
+        """Final teardown (app exit). Just ends the session."""
+        self.end_session()
 
     # --- background asyncio session ---
 
