@@ -39,12 +39,28 @@ from voiceio.delay_estimator import DelayEstimator
 from voiceio.vad import BargeInVad
 
 SR = 16000
+CAL_SECONDS = 0.8             # length of the startup calibration chirp
 HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
 EST_EVERY_BLOCKS = 12         # refine the alignment ~every 240 ms while the AI plays
 # In-flight buffer between "sample transmitted" and "sample heard by the mic": the device
 # playout jitter buffer (~setpoint) plus whatever ble_link still has queued. Used to derive
 # the delay estimator's search center from the playout position.
 SETPOINT_SAMPLES = cr.SETPOINT_MS * SR // 1000
+
+
+def make_cal_chirp(seconds=CAL_SECONDS, sr=SR):
+    """A short rising chirp (300->3000 Hz) used as a startup calibration earcon.
+
+    A chirp has a sharp autocorrelation peak (good for delay estimation) and reads as
+    a brief 'ready' swoop. The estimator locks on its echo so the alignment is acquired
+    BEFORE the AI's first reply -- the user never has to wait in silence. Fades in/out
+    to avoid clicks."""
+    n = int(seconds * sr)
+    t = np.arange(n, dtype=np.float64) / sr
+    f0, f1 = 300.0, 3000.0
+    chirp = 0.2 * np.sin(2 * np.pi * (f0 * t + (f1 - f0) / (2 * seconds) * t * t))
+    fade = np.clip(np.minimum(t / 0.05, (seconds - t) / 0.05), 0.0, 1.0)  # 50 ms fades
+    return (chirp * fade).astype(np.float32)
 
 
 def aligned_reference(played_ref, ref_base_mic, mic_count_start, n, ratio=AEC_DRIFT_RATIO):
@@ -77,7 +93,8 @@ def aligned_reference(played_ref, ref_base_mic, mic_count_start, n, ratio=AEC_DR
 class Orchestrator:
     """Full-duplex real-time voice loop over a BleLink + a VoiceBackend."""
 
-    def __init__(self, ble_link, backend, model_dir, lib_path="tools/lib/liblc3.dylib"):
+    def __init__(self, ble_link, backend, model_dir, lib_path="tools/lib/liblc3.dylib",
+                 calibrate_on_start=True):
         """
         Args:
             ble_link: a connected BleLink (call .connect() first).
@@ -107,6 +124,11 @@ class Orchestrator:
         self._aec_mic = np.zeros(0, dtype=np.float32)      # carry to feed AEC in 128-multiples
         self._aec_ref = np.zeros(0, dtype=np.float32)
         self._stop = asyncio.Event()
+        # Startup calibration: play a brief chirp the moment the mic activates (when the
+        # backend isn't already playing) so the alignment locks before the AI's first reply.
+        self.calibrate_on_start = calibrate_on_start
+        self._cal_audio = np.zeros(0, dtype=np.float32)    # queued calibration samples to play
+        self._calibrating = False                          # suppress barge-in during the chirp
         # --- bring-up instrumentation (printed by _status_loop) ---
         self._n_uplink = 0             # mic frames received from the band
         self._n_blocks_sent = 0        # downlink blocks transmitted
@@ -201,7 +223,7 @@ class Orchestrator:
                 # is zeros, so `clean` still carries the full echo -> the VAD would fire on the
                 # AI's OWN voice (a warmup false-barge that killed playback before the estimator
                 # could acquire). Gating on `locked` closes that ~0.5 s window.
-                if self.delay_est.locked:
+                if self.delay_est.locked and not self._calibrating:
                     onsets = self.vad.process(clean)
                     if onsets:
                         self._n_onsets += 1
@@ -249,7 +271,13 @@ class Orchestrator:
         import traceback
         while not self._stop.is_set():
             try:
-                got = self.backend.next_audio(BLOCK_SAMPLES)
+                # Calibration chirp (if queued) plays first; otherwise the backend's audio.
+                if len(self._cal_audio) > 0:
+                    take = min(BLOCK_SAMPLES, len(self._cal_audio))
+                    got = self._cal_audio[:take]
+                    self._cal_audio = self._cal_audio[take:]
+                else:
+                    got = self.backend.next_audio(BLOCK_SAMPLES)
                 if len(got):
                     self._dl_residual = np.concatenate([self._dl_residual, got])
                 # Emit as many whole 320-sample blocks as we have.
@@ -313,6 +341,34 @@ class Orchestrator:
                   f"vad_floor={self.vad.floor if self.vad.floor is not None else 0:.4f} "
                   f"barge_ins={self._n_onsets}")
 
+    async def _calibrate(self):
+        """Acquire the echo alignment up front so barge-in is armed from the AI's first
+        reply -- no user-visible silence. Waits for the mic to activate; if the backend is
+        NOT already playing (the user-speaks-first case), plays a brief chirp and locks on
+        its echo. If something IS already playing (e.g. loopback), that audio locks it, so
+        the chirp is skipped."""
+        for _ in range(600):                       # wait up to 60 s for the mic to turn on
+            if self._n_uplink > 0 or self._stop.is_set():
+                break
+            await asyncio.sleep(0.1)
+        if self._stop.is_set() or self._n_uplink == 0:
+            return
+        if self._playing or self.delay_est.locked:
+            return                                  # backend audio will lock it; no chirp needed
+        print("[cal] mic active, backend silent -> playing calibration chirp to lock alignment")
+        self._calibrating = True
+        self._cal_audio = make_cal_chirp()
+        for _ in range(int((CAL_SECONDS + 2.5) / 0.05)):   # wait for lock (chirp + margin)
+            if self.delay_est.locked or self._stop.is_set():
+                break
+            await asyncio.sleep(0.05)
+        if self.delay_est.locked:
+            print(f"[cal] locked (res {self.delay_est.residual_ms:+.0f} ms, "
+                  f"conf {self.delay_est.confidence:.2f}) -- barge-in armed for the first reply")
+        else:
+            print("[cal] not locked from chirp; will acquire online on the first reply")
+        self._calibrating = False
+
     # --- lifecycle ---
 
     async def run(self):
@@ -323,13 +379,16 @@ class Orchestrator:
         dsp = asyncio.create_task(self._dsp_loop())
         dl = asyncio.create_task(self._downlink_loop())
         stat = asyncio.create_task(self._status_loop())
+        cal = asyncio.create_task(self._calibrate()) if self.calibrate_on_start else None
         try:
             await self._stop.wait()
         finally:
             dsp.cancel()
             dl.cancel()
             stat.cancel()
-            await asyncio.gather(dsp, dl, stat, return_exceptions=True)
+            if cal:
+                cal.cancel()
+            await asyncio.gather(dsp, dl, stat, *( [cal] if cal else [] ), return_exceptions=True)
 
     def stop(self):
         self._stop.set()
