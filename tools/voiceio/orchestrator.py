@@ -144,34 +144,47 @@ class Orchestrator:
                     continue
                 n = len(mic)
                 self._mic_rms = float(np.sqrt(np.mean(mic ** 2) + 1e-12))
+
+                if not self._playing:
+                    # AI silent -> no echo to cancel. Pass the user's mic STRAIGHT to the
+                    # backend: running DTLN with a zero reference distorts clean speech (seen
+                    # as clean_rms > mic_rms in the play=0 stat lines), which would corrupt
+                    # the user's turn audio sent to the AI. Drop any AEC carry so the next
+                    # playing turn starts clean.
+                    self._clean_rms = self._mic_rms
+                    self._aec_mic = np.zeros(0, dtype=np.float32)
+                    self._aec_ref = np.zeros(0, dtype=np.float32)
+                    self.vad.reset()
+                    self.backend.feed_mic(mic)
+                    continue
+
+                # --- AI is playing: drift-aligned reference + DTLN echo cancellation ---
+                played = self.ble.played_reference()
+                self._push_mic_hist(mic_ts, mic)
+                # Refine the alignment online (~every 240 ms) -- no hardcoded constant.
+                self._since_est += 1
+                if self._since_est >= EST_EVERY_BLOCKS and len(self._mic_hist) >= HIST_SAMPLES:
+                    self._since_est = 0
+                    # Live search center from the playout position. played_samples counts only
+                    # TRANSMITTED samples (ble_link increments it as it paces sends), so the
+                    # sample HEARD now is played_samples minus only the DEVICE buffer
+                    # (~setpoint) -- NOT the host send queue (downlink_pending), which sits
+                    # BEFORE transmission and would wrongly add seconds when a backend bursts a
+                    # whole reply in. Heard at the most recent mic sample: center =
+                    # mic_now - heard_idx/ratio (~ ref_base_mic).
+                    mic_now = self._mic_hist_start + len(self._mic_hist)
+                    heard_idx = max(0, self.ble.played_samples - SETPOINT_SAMPLES)
+                    center = int(mic_now - heard_idx / AEC_DRIFT_RATIO)
+                    self.delay_est.estimate(self._mic_hist, self._mic_hist_start, played, center)
                 ref = np.zeros(n, dtype=np.float32)
-                if self._playing:
-                    played = self.ble.played_reference()
-                    self._push_mic_hist(mic_ts, mic)
-                    # Refine the alignment online (~every 240 ms) -- no hardcoded constant.
-                    self._since_est += 1
-                    if self._since_est >= EST_EVERY_BLOCKS and len(self._mic_hist) >= HIST_SAMPLES:
-                        self._since_est = 0
-                        # Live search center from the playout position. played_samples counts
-                        # only TRANSMITTED samples (ble_link increments it as it paces sends),
-                        # so the sample HEARD now is played_samples minus only the DEVICE
-                        # buffer (~setpoint) -- NOT the host send queue (downlink_pending),
-                        # which sits BEFORE transmission and would wrongly add seconds when a
-                        # backend bursts a whole reply in at once. Heard at the most recent mic
-                        # sample, so center = mic_now - heard_idx/ratio (~ ref_base_mic).
-                        mic_now = self._mic_hist_start + len(self._mic_hist)
-                        heard_idx = max(0, self.ble.played_samples - SETPOINT_SAMPLES)
-                        center = int(mic_now - heard_idx / AEC_DRIFT_RATIO)
-                        self.delay_est.estimate(self._mic_hist, self._mic_hist_start,
-                                                played, center)
-                    ref_base_mic = self.delay_est.current()
-                    if ref_base_mic is not None:
-                        ref = aligned_reference(played, ref_base_mic, mic_ts, n)
-                    # else: estimator not locked yet -> pass mic through (brief, first turn)
-                # The DTLN AEC consumes whole 128-sample hops; a 320-sample block is NOT a
-                # multiple of 128, so feeding it directly would DROP 64 samples/block (20%
-                # audio loss). Accumulate mic+ref and feed the largest 128-multiple, carrying
-                # the remainder to the next block. mic and ref stay sample-aligned.
+                ref_base_mic = self.delay_est.current()
+                if ref_base_mic is not None:
+                    ref = aligned_reference(played, ref_base_mic, mic_ts, n)
+                # else: estimator not locked yet -> pass mic through (brief, first turn)
+
+                # DTLN consumes whole 128-sample hops; a 320-sample block is NOT a multiple of
+                # 128, so feeding it directly would DROP 64 samples/block (20% loss). Accumulate
+                # mic+ref and feed the largest 128-multiple, carrying the remainder. Aligned.
                 self._aec_mic = np.concatenate([self._aec_mic, mic])
                 self._aec_ref = np.concatenate([self._aec_ref, ref])
                 m = (len(self._aec_mic) // 128) * 128
@@ -184,19 +197,17 @@ class Orchestrator:
                 if len(clean) == 0:
                     continue
                 self._clean_rms = float(np.sqrt(np.mean(clean ** 2) + 1e-12))
-                # Barge-in: only while the AI is talking AND the AEC is locked + cancelling.
-                # Before lock the reference is zeros, so `clean` still contains the full
-                # speaker echo -- running the VAD then fires on the AI's OWN voice (a false
-                # barge-in that kills playback in the first ~0.5 s, before the estimator can
-                # even acquire). Gating on `locked` closes that warmup window; the estimator
-                # gets its ~0.5 s of history while playback continues.
-                if self._playing and self.delay_est.locked:
+                # Barge-in: only once the AEC is locked + cancelling. Before lock the reference
+                # is zeros, so `clean` still carries the full echo -> the VAD would fire on the
+                # AI's OWN voice (a warmup false-barge that killed playback before the estimator
+                # could acquire). Gating on `locked` closes that ~0.5 s window.
+                if self.delay_est.locked:
                     onsets = self.vad.process(clean)
                     if onsets:
                         self._n_onsets += 1
                         await self._barge_in()
                 else:
-                    self.vad.reset()    # keep the floor fresh for when we do arm
+                    self.vad.reset()    # keep the floor fresh for when we arm
                 self.backend.feed_mic(clean)
             except Exception:  # surface a crash instead of silently killing the task
                 print("[orch] DSP loop error:\n" + traceback.format_exc())
