@@ -100,7 +100,11 @@ LC3 encode → BLE notify during `MODE_DICTATION`). Cross-thread state uses `ato
 `r` reboot · `b` UF2 bootloader · `g` dump gravity · `t` sim double-tap
 (unbound) · `y` sim triple-tap (unbound) · `c` tap-cal logging · `+`/`-` TAP_THS ·
 `q` PPG probe · `z` gyro-bias trace · `v` pose trace · `u` clear BLE bonds ·
-`m` PDM mic bench probe (`[MIC]` rms/veM/frac log; toggle OFF for the auto gate).
+`m` PDM mic bench probe (`[MIC]` rms/veM/frac log; toggle OFF for the auto gate) ·
+`k` toggle chip tap engine + tap-event log (speaker-vs-tap false-trigger test) ·
+`0`-`9` speaker volume 0–90% (boot default 100%).
+(The `j` force-mic / `p` test-tone / `w` SD-WAV test commands were removed 2026-06-24;
+the mic now gates ONLY on the real `POSE_EAR` + voice path.)
 
 **STANDING RULE:** every firmware AND throwaway test app must include the `r`
 (reboot, `sys_reboot` COLD) and `b` (UF2 bootloader via `NRF_POWER->GPREGRET=0x57`
@@ -122,6 +126,9 @@ LC3 encode → BLE notify during `MODE_DICTATION`). Cross-thread state uses `ato
   (the consolidated gesture doc); HR algorithm + roadmap in
   `docs/research/hr-algorithm-decisions.md`; specs + plans under
   `docs/superpowers/`. We use brainstorm → spec → plan → subagent build.
+- **Device BLE contract** (the durable wire format for any host/phone client —
+  audio service UUIDs, uplink `[seq16][ts32][LC3]`, downlink, status, FLUSH,
+  clock model): `docs/device-ble-contract.md`.
 - (Air-mouse only, on `feature/air-mouse`): macOS pointer-accel must be OFF;
   `CURSOR_SENSITIVITY` stays 1.0; HID chars are `PERM_READ_ENCRYPT`.
 
