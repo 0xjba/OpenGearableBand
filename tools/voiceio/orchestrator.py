@@ -39,25 +39,17 @@ from voiceio.delay_estimator import DelayEstimator
 from voiceio.vad import BargeInVad
 
 SR = 16000
+# [USER/HOUSING] Barge-in absolute floor: a frame whose level is below this NEVER fires a
+# barge-in, even on a relative rise. The VAD is otherwise relative (it triggers on a jump above
+# its adaptive noise floor) -- but with the continuous-tracking AEC cancelling well, that floor
+# collapses to ~0.0001, so a tiny residual-echo wiggle (HW-measured ~0.0008-0.0016 = -62..-56
+# dBFS during playback) reads as a huge relative rise and false-fires. Real over-talk lands at
+# ~0.02-0.09 (-34..-21 dBFS) -- a ~20x gap -- so this floor cleanly rejects the residual while
+# passing voice. Re-check when the production speaker/placement changes the echo coupling.
+BARGE_ABS_FLOOR_DB = -42.0    # ~0.0079 linear: between the ~0.002 residual and ~0.03 voice
 CAL_SECONDS = 0.8             # length of the startup calibration chirp
 SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the conversation
 HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
-
-# --- Barge-in double-talk detection (DTD): tell "user talking over" from "leftover echo".
-# An energy gate alone false-fires on residual echo, and a FIXED absolute floor is fragile: the
-# residual-echo level varies session to session with the echo coupling (HW run 8 weak -> a fixed
-# -38 dB worked; run 11 stronger -> the same -38 dB false-fired and chopped replies). So the floor
-# is ADAPTIVE: track the residual-echo level during THIS session's playback and set the barge-in
-# threshold a fixed margin ABOVE it. Strong echo -> higher bar, weak echo -> lower bar; only the
-# user's voice (well above the residual, since they talk right into the wrist) crosses it.
-# (A linear NCC DTD -- the textbook method -- was tried + rejected: the cheap speaker's
-# nonlinearity makes echo-NCC low even for pure echo, so it never suppresses on our hardware, and
-# where echo IS linearly strong it over-suppresses genuine over-talk.)
-# [USER/HOUSING: BARGE_FLOOR_MULT / BARGE_BASE_FLOOR may want re-tuning on the production acoustic
-# design; they are now adaptive so they should travel across echo conditions far better.]
-BARGE_BASE_FLOOR = 0.006      # ~-44 dBFS: minimum threshold (well-cancelled/quiet sessions)
-BARGE_FLOOR_MULT = 3.0        # barge-in needs clean > MULT x the tracked residual-echo level
-BARGE_FLOOR_ALPHA = 0.05      # EMA rate for the residual-echo-level estimate (slow)
 EST_EVERY_BLOCKS = 12         # refine the alignment ~every 240 ms while the AI plays
 # In-flight buffer between "sample transmitted" and "sample heard by the mic": the device
 # playout jitter buffer (~setpoint) plus whatever ble_link still has queued. Used to derive
@@ -127,13 +119,9 @@ class Orchestrator:
         self.backend = backend
         self.codec = Lc3Codec(lib_path)
         self.aec = DtlnAec(model_dir)
-        # buffers internally (AEC's 128/256-sample chunks are fine). Its abs_floor is driven
-        # ADAPTIVELY each block from the tracked residual-echo level (see the DSP loop).
-        # onset_frames=8 (8 x 30 ms = 240 ms): require the over-talk to be SUSTAINED, so a brief
-        # reply-onset residual burst (which fired the lone session-1 false barge at ~150 ms) does
-        # not latch. Real over-talk lasts far longer than 240 ms, so genuine barge-ins still fire.
-        self.vad = BargeInVad(sr=SR, onset_frames=8)
-        self._echo_floor = BARGE_BASE_FLOOR   # tracked residual-echo level (adaptive barge-in DTD)
+        # buffers internally (AEC's 128/256-sample chunks are fine). abs_floor rejects the tiny
+        # residual-echo rises that false-fire the relative-only detector (see BARGE_ABS_FLOOR_DB).
+        self.vad = BargeInVad(sr=SR, abs_floor_db=BARGE_ABS_FLOOR_DB)
         self.delay_est = DelayEstimator()
 
         self._mic_q = asyncio.Queue()
@@ -215,23 +203,16 @@ class Orchestrator:
                 self._since_est += 1
                 if self._since_est >= EST_EVERY_BLOCKS and len(self._mic_hist) >= HIST_SAMPLES:
                     self._since_est = 0
-                    if self.delay_est.locked:
-                        # TRACKING (AEC3 pattern): refine around the HELD estimate. Do NOT
-                        # re-derive the center from the playout counters -- played_samples
-                        # freezes during far-end silence (between turns / after a barge-in
-                        # flush) while the mic clock keeps running, so a counter-difference
-                        # center drifts by the gap and the alignment wobbles. Centering on the
-                        # held lock is immune to that by construction (the gap can't move it).
-                        center = int(self.delay_est.current())
-                    else:
-                        # ACQUISITION (coarse): the one place a playout-derived seed belongs.
-                        # heard sample = played_samples (TRANSMITTED only; ble_link increments
-                        # it as it paces sends) minus the DEVICE buffer (~setpoint); NOT the host
-                        # send queue (downlink_pending), which sits before transmission. Heard at
-                        # the most recent mic sample -> center = mic_now - heard_idx/ratio.
-                        mic_now = self._mic_hist_start + len(self._mic_hist)
-                        heard_idx = max(0, self.ble.played_samples - SETPOINT_SAMPLES)
-                        center = int(mic_now - heard_idx / AEC_DRIFT_RATIO)
+                    # Live search center from the playout position. played_samples counts only
+                    # TRANSMITTED samples (ble_link increments it as it paces sends), so the
+                    # sample HEARD now is played_samples minus only the DEVICE buffer
+                    # (~setpoint) -- NOT the host send queue (downlink_pending), which sits
+                    # BEFORE transmission and would wrongly add seconds when a backend bursts a
+                    # whole reply in. Heard at the most recent mic sample: center =
+                    # mic_now - heard_idx/ratio (~ ref_base_mic).
+                    mic_now = self._mic_hist_start + len(self._mic_hist)
+                    heard_idx = max(0, self.ble.played_samples - SETPOINT_SAMPLES)
+                    center = int(mic_now - heard_idx / AEC_DRIFT_RATIO)
                     self.delay_est.estimate(self._mic_hist, self._mic_hist_start, played, center)
                 ref = np.zeros(n, dtype=np.float32)
                 ref_base_mic = self.delay_est.current()
@@ -258,37 +239,20 @@ class Orchestrator:
                 # is zeros, so `clean` still carries the full echo -> the VAD would fire on the
                 # AI's OWN voice (a warmup false-barge that killed playback before the estimator
                 # could acquire). Gating on `locked` closes that ~0.5 s window.
-                # ARTIFACT GATE: a real near-end voice can only LOSE energy through an echo
-                # suppressor (it removes echo, passes voice) -> clean <= mic. When clean > mic the
-                # DTLN net ADDED energy: that is a suppression artifact / overshoot, never the user
-                # talking. Those overshoots were the "series of barge-ins from the device" (clean
-                # 0.0316 > mic 0.0251, clean 0.0186 > mic 0.0106). Suppress them, and don't let them
-                # poison the residual-echo estimate. Real over-talk shows clean << mic (0.0253 vs
-                # 0.0704) and passes cleanly.
-                artifact = self._clean_rms > self._mic_rms
-                if self.delay_est.locked and not self._calibrating and not artifact:
-                    # ADAPTIVE double-talk floor: barge-in audio must clear MULT x this session's
-                    # tracked residual-echo level. The estimate is updated only on residual-level
-                    # blocks (clean < current threshold) so the user's own over-talk can't inflate
-                    # it. This self-calibrates to the session's echo coupling -- a fixed floor was
-                    # fragile (run 8 weak echo passed, run 11 stronger echo false-fired).
-                    thr = max(BARGE_BASE_FLOOR, BARGE_FLOOR_MULT * self._echo_floor)
-                    if self._clean_rms < thr:
-                        self._echo_floor += BARGE_FLOOR_ALPHA * (self._clean_rms - self._echo_floor)
-                        thr = max(BARGE_BASE_FLOOR, BARGE_FLOOR_MULT * self._echo_floor)
-                    self.vad.abs_floor_linear = thr
+                if self.delay_est.locked and not self._calibrating:
                     onsets = self.vad.process(clean)
                     if onsets:
                         self._n_onsets += 1
                         await self._barge_in()
                 else:
                     self.vad.reset()    # keep the floor fresh for when we arm
-                # Do NOT feed the AI's own audio back to the model while it is playing: the
-                # cleaned mic still carries RESIDUAL ECHO of the AI's voice, and the model's
-                # server-side VAD hears it and interrupts/responds to itself ("talking over
-                # itself"). Send silence instead. A genuine barge-in is caught by the LOCAL VAD
-                # above -> flush -> play=0 -> the not-playing branch then forwards the user's
-                # voice to the model. (Standard "gate the mic->LLM path during TTS" pattern.)
+                # Do NOT feed the AI's own audio back to the model while it is playing: even with
+                # good cancellation the cleaned mic carries a little RESIDUAL ECHO at reply onsets
+                # (HW: clean ~0.003-0.007), and the model's server-side VAD hears it and interrupts
+                # itself ("cutting off with its own voice" -- seen as `<- interrupted` with NO local
+                # barge_in). Send silence instead. A genuine barge-in is caught by the LOCAL VAD
+                # above -> flush -> play=0 -> the not-playing branch then forwards the user's voice
+                # to the model. (Standard "gate the mic->LLM path during TTS" pattern; LiveKit etc.)
                 self.backend.feed_mic(np.zeros(len(clean), dtype=np.float32))
             except Exception:  # surface a crash instead of silently killing the task
                 print("[orch] DSP loop error:\n" + traceback.format_exc())
@@ -326,10 +290,10 @@ class Orchestrator:
         # every reply AFTER the first barge-in -> no AEC -> the AI echoed back into the mic
         # and Gemini interrupted itself repeatedly.
         self._dl_origin_mic = None
-        # NOTE: the delay lock is intentionally KEPT through a barge-in. The flush empties the
-        # device playout buffer (a playout discontinuity), but since tracking now centers on the
-        # held estimate (not the playout counters), that discontinuity can't corrupt the lock --
-        # so the next reply stays aligned + barge-in-armed immediately instead of re-acquiring.
+        # The flush empties the device playout buffer (a playout discontinuity) and the
+        # barge-in double-talk can corrupt the alignment, so re-acquire cleanly on the next
+        # reply instead of carrying a bad lock.
+        self.delay_est.reset()
         self._reset_mic_hist()
         self.vad.reset()
 
@@ -407,13 +371,11 @@ class Orchestrator:
             # mic_rms = raw mic level (is the band hearing anything?); clean_rms = what the
             # VAD sees after AEC; floor = VAD's tracked echo floor. Barge-in needs
             # clean_rms > floor*~4 (12 dB) AND clean_rms > abs floor.
-            # barge_floor = the ADAPTIVE threshold clean must clear to barge in (= MULT x the
-            # tracked residual-echo level). A barge-in needs clean_rms over barge_floor (sustained).
-            barge_floor = max(BARGE_BASE_FLOOR, BARGE_FLOOR_MULT * self._echo_floor)
             print(f"[stat] uplink={self._n_uplink}(+{up_rate}/s) sent={self._n_blocks_sent} "
                   f"play={int(self._playing)} delay={d_str} "
                   f"mic_rms={self._mic_rms:.4f} clean_rms={self._clean_rms:.4f} "
-                  f"barge_floor={barge_floor:.4f} barge_ins={self._n_onsets}")
+                  f"vad_floor={self.vad.floor if self.vad.floor is not None else 0:.4f} "
+                  f"barge_ins={self._n_onsets}")
 
     async def _calibrate(self):
         """Acquire the echo alignment at session start so barge-in is armed from the AI's
@@ -491,7 +453,6 @@ class Orchestrator:
         self.aec.reset()
         self.vad.reset()
         self.delay_est.reset()
-        self._echo_floor = BARGE_BASE_FLOOR   # re-estimate the residual level per conversation
         self._reset_mic_hist()
 
     # --- lifecycle ---

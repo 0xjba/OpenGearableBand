@@ -70,50 +70,24 @@ def test_silent_reference_holds():
     assert est.estimate(np.zeros(8000, np.float32), 10000, np.zeros(0, np.float32), 0) is None
 
 
-def _lock(est, ref, ref_base, mic_start, w=SR // 2):
-    """Acquire a lock by seeding the center at the true ref_base, return the locked value."""
-    est.estimate(_make_mic(ref, ref_base, mic_start, w), mic_start, ref, ref_base)
-    assert est.locked
-    return est.current()
-
-
-def test_locked_tracking_around_held_center_is_stable():
-    # Once locked, the orchestrator centers the search on the HELD estimate (current()).
-    # Repeated in-place tracking on matching echo must NOT drift.
-    ref = _make_ref(300000)
-    ref_base, w = 40000, SR // 2
-    est = DelayEstimator()
-    rb0 = _lock(est, ref, ref_base, ref_base + SR)
-    for j in range(8):
+def test_hysteresis_clamps_a_single_spurious_yank():
+    # AEC3-style hysteresis: once locked, a single update whose best peak sits far from the held
+    # value (e.g. a reply-onset frame where the playout center momentarily jumped) cannot move
+    # ref_base by more than max_step. This is what stops the onset `clean` spike / false barge.
+    ref = _make_ref(200000)
+    ref_base = 60000
+    w = SR // 2
+    est = DelayEstimator(conf_threshold=0.30, smooth=0.4, max_step_ms=40.0)
+    # Lock cleanly on the true alignment.
+    for j in range(6):
         ms = ref_base + SR + j * w
-        est.estimate(_make_mic(ref, ref_base, ms, w, noise=0.01, seed=j), ms, ref,
-                     int(est.current()))           # center on the held estimate
-    assert abs(est.current() - rb0) < 0.004 * SR   # stayed put (< 4 ms)
-
-
-def test_garbage_gap_center_cannot_move_a_held_lock():
-    # The inter-turn-silence bug: a playout-derived center that drifted by the gap (here a
-    # wildly wrong center). Searching ±span around it misses the true echo -> low conf ->
-    # the held lock is unchanged (this is what centering-on-held-estimate guarantees).
-    ref = _make_ref(300000)
-    ref_base, w = 40000, SR // 2
-    est = DelayEstimator()
-    rb0 = _lock(est, ref, ref_base, ref_base + SR)
-    ms = ref_base + 2 * SR
-    bad_center = ref_base - 15 * SR                 # ~15 s off, like the observed res -15753 ms
-    est.estimate(_make_mic(ref, ref_base, ms, w), ms, ref, bad_center)
-    assert est.confidence < est.conf_threshold      # window missed the echo
-    assert est.current() == rb0                      # lock untouched
-
-
-def test_hysteresis_clamps_per_update_step():
-    # A confident estimate that implies a big jump (echo genuinely shifted) may move the lock
-    # by at most max_step per update -- a single noisy frame can't yank it.
-    ref = _make_ref(300000)
-    ref_base, w = 40000, SR // 2
-    est = DelayEstimator(max_step_ms=40.0)
-    rb0 = _lock(est, ref, ref_base, ref_base + SR)
-    shifted = ref_base + int(0.20 * SR)             # true alignment jumps 200 ms
-    ms = ref_base + SR
-    est.estimate(_make_mic(ref, shifted, ms, w), ms, ref, int(est.current()))
-    assert abs(est.current() - rb0) <= est.max_step + 1   # moved at most max_step toward it
+        est.estimate(_make_mic(ref, ref_base, ms, w, noise=0.01, seed=j), ms, ref, ref_base)
+    locked = est.current()
+    assert abs(locked - ref_base) < 0.01 * SR
+    # Now feed a frame whose true echo is 500 ms away AND give a matching (jumped) center, so the
+    # correlation peak is a full 500 ms off. Without the clamp this yanks ref_base ~200 ms (0.4*500);
+    # with it, the move is capped at 40 ms.
+    far = ref_base + int(0.500 * SR)
+    mic = _make_mic(ref, far, far + SR, w, noise=0.01, seed=7)
+    est.estimate(mic, far + SR, ref, far)
+    assert abs(est.current() - locked) <= 0.040 * SR + 1     # moved at most max_step (40 ms)

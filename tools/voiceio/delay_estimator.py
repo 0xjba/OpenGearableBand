@@ -57,9 +57,12 @@ class DelayEstimator:
                 silence/double-talk). [USER/HOUSING: depends on echo strength of the final
                 acoustic design; re-check when the speaker/placement is finalized.]
             smooth: EMA factor toward a new accepted alignment (0..1; lower = steadier).
-            max_step_ms: hysteresis -- max distance ref_base may move per accepted update
-                once locked (a single noisy frame can't yank a held lock; WebRTC AEC3 uses
-                an equivalent hysteresis_limit on its refined delay).
+            max_step_ms: hysteresis -- max distance ref_base may move per accepted update. A
+                single noisy/spurious correlation peak (e.g. at a reply onset, when the playout
+                center momentarily jumps) cannot yank the held alignment; it can only nudge it by
+                this much, so the AEC stays aligned through the transition and `clean` does not
+                spike. WebRTC AEC3's render_delay_controller applies an equivalent limit. Drift
+                (~8 ms/s) is far below 40 ms/update, so true tracking is unaffected. [STRUCTURAL]
         """
         self.sr = sr
         self.ratio = ratio
