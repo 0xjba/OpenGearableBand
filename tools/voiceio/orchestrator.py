@@ -266,7 +266,13 @@ class Orchestrator:
                         await self._barge_in()
                 else:
                     self.vad.reset()    # keep the floor fresh for when we arm
-                self.backend.feed_mic(clean)
+                # Do NOT feed the AI's own audio back to the model while it is playing: the
+                # cleaned mic still carries RESIDUAL ECHO of the AI's voice, and the model's
+                # server-side VAD hears it and interrupts/responds to itself ("talking over
+                # itself"). Send silence instead. A genuine barge-in is caught by the LOCAL VAD
+                # above -> flush -> play=0 -> the not-playing branch then forwards the user's
+                # voice to the model. (Standard "gate the mic->LLM path during TTS" pattern.)
+                self.backend.feed_mic(np.zeros(len(clean), dtype=np.float32))
             except Exception:  # surface a crash instead of silently killing the task
                 print("[orch] DSP loop error:\n" + traceback.format_exc())
 
