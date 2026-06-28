@@ -193,16 +193,23 @@ class Orchestrator:
                 self._since_est += 1
                 if self._since_est >= EST_EVERY_BLOCKS and len(self._mic_hist) >= HIST_SAMPLES:
                     self._since_est = 0
-                    # Live search center from the playout position. played_samples counts only
-                    # TRANSMITTED samples (ble_link increments it as it paces sends), so the
-                    # sample HEARD now is played_samples minus only the DEVICE buffer
-                    # (~setpoint) -- NOT the host send queue (downlink_pending), which sits
-                    # BEFORE transmission and would wrongly add seconds when a backend bursts a
-                    # whole reply in. Heard at the most recent mic sample: center =
-                    # mic_now - heard_idx/ratio (~ ref_base_mic).
-                    mic_now = self._mic_hist_start + len(self._mic_hist)
-                    heard_idx = max(0, self.ble.played_samples - SETPOINT_SAMPLES)
-                    center = int(mic_now - heard_idx / AEC_DRIFT_RATIO)
+                    if self.delay_est.locked:
+                        # TRACKING (AEC3 pattern): refine around the HELD estimate. Do NOT
+                        # re-derive the center from the playout counters -- played_samples
+                        # freezes during far-end silence (between turns / after a barge-in
+                        # flush) while the mic clock keeps running, so a counter-difference
+                        # center drifts by the gap and the alignment wobbles. Centering on the
+                        # held lock is immune to that by construction (the gap can't move it).
+                        center = int(self.delay_est.current())
+                    else:
+                        # ACQUISITION (coarse): the one place a playout-derived seed belongs.
+                        # heard sample = played_samples (TRANSMITTED only; ble_link increments
+                        # it as it paces sends) minus the DEVICE buffer (~setpoint); NOT the host
+                        # send queue (downlink_pending), which sits before transmission. Heard at
+                        # the most recent mic sample -> center = mic_now - heard_idx/ratio.
+                        mic_now = self._mic_hist_start + len(self._mic_hist)
+                        heard_idx = max(0, self.ble.played_samples - SETPOINT_SAMPLES)
+                        center = int(mic_now - heard_idx / AEC_DRIFT_RATIO)
                     self.delay_est.estimate(self._mic_hist, self._mic_hist_start, played, center)
                 ref = np.zeros(n, dtype=np.float32)
                 ref_base_mic = self.delay_est.current()
@@ -273,10 +280,10 @@ class Orchestrator:
         # every reply AFTER the first barge-in -> no AEC -> the AI echoed back into the mic
         # and Gemini interrupted itself repeatedly.
         self._dl_origin_mic = None
-        # The flush empties the device playout buffer (a playout discontinuity) and the
-        # barge-in double-talk can corrupt the alignment, so re-acquire cleanly on the next
-        # reply instead of carrying a bad lock.
-        self.delay_est.reset()
+        # NOTE: the delay lock is intentionally KEPT through a barge-in. The flush empties the
+        # device playout buffer (a playout discontinuity), but since tracking now centers on the
+        # held estimate (not the playout counters), that discontinuity can't corrupt the lock --
+        # so the next reply stays aligned + barge-in-armed immediately instead of re-acquiring.
         self._reset_mic_hist()
         self.vad.reset()
 

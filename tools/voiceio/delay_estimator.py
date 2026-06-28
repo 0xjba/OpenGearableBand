@@ -48,7 +48,7 @@ def _ncc_valid(mic, ref_win):
 
 class DelayEstimator:
     def __init__(self, sr=SR, ratio=AEC_DRIFT_RATIO, search_ms=250.0,
-                 conf_threshold=0.30, smooth=0.4):
+                 conf_threshold=0.30, smooth=0.4, max_step_ms=40.0):
         """
         Args:
             search_ms: +/- window (ms) searched around the live center. [STRUCTURAL: widen if
@@ -57,12 +57,16 @@ class DelayEstimator:
                 silence/double-talk). [USER/HOUSING: depends on echo strength of the final
                 acoustic design; re-check when the speaker/placement is finalized.]
             smooth: EMA factor toward a new accepted alignment (0..1; lower = steadier).
+            max_step_ms: hysteresis -- max distance ref_base may move per accepted update
+                once locked (a single noisy frame can't yank a held lock; WebRTC AEC3 uses
+                an equivalent hysteresis_limit on its refined delay).
         """
         self.sr = sr
         self.ratio = ratio
         self.span = int(search_ms * sr / 1000.0)
         self.conf_threshold = conf_threshold
         self.smooth = smooth
+        self.max_step = max_step_ms * sr / 1000.0
         self._ref_base = None        # tracked absolute alignment (mic index of played_ref[0])
         self._last_center = None
         self.confidence = 0.0
@@ -114,9 +118,11 @@ class DelayEstimator:
         self.confidence = peak
         if peak >= self.conf_threshold:
             if self._ref_base is None:
-                self._ref_base = float(B)
+                self._ref_base = float(B)                        # initial (coarse) lock
             else:
-                self._ref_base += self.smooth * (B - self._ref_base)
+                step = self.smooth * (B - self._ref_base)        # EMA toward the new estimate
+                step = max(-self.max_step, min(self.max_step, step))   # hysteresis clamp
+                self._ref_base += step
         return self._ref_base
 
     def current(self):
