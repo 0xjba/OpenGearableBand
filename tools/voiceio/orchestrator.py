@@ -47,6 +47,14 @@ SR = 16000
 # ~0.02-0.09 (-34..-21 dBFS) -- a ~20x gap -- so this floor cleanly rejects the residual while
 # passing voice. Re-check when the production speaker/placement changes the echo coupling.
 BARGE_ABS_FLOOR_DB = -42.0    # ~0.0079 linear: between the ~0.002 residual and ~0.03 voice
+# [USER] Reply-onset barge-in grace: don't ARM barge-in for the first second of each reply. At a
+# reply's play 0->1 the AEC alignment is still re-converging (coarsest on the FIRST reply, where
+# only the calibration lock is available), so `clean` briefly carries un-cancelled echo that can
+# clip the absolute floor -- the residual onset false-barge (HW: ~2x on a loud first reply). The
+# AEC still runs during the grace (so it converges); only the FIRING is suppressed. A real
+# interruption in the first second is rare (you let a reply begin before talking over it), and the
+# hysteresis clamp already keeps most onsets clean -- this covers the loud-TTS tail.
+BARGE_ONSET_GRACE_S = 1.0
 CAL_SECONDS = 0.8             # length of the startup calibration chirp
 SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the conversation
 HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
@@ -128,6 +136,7 @@ class Orchestrator:
         self._last_mic_ts = 0
         self._dl_origin_mic = None     # coarse seed: mic ts32 when this response started playing
         self._playing = False          # is the AI currently being streamed out?
+        self._play_started_ts = None   # mic ts32 when the CURRENT reply's playback began (onset grace)
         self._dl_residual = np.zeros(0, dtype=np.float32)  # sub-block carry for encoding
         self._mic_hist = np.zeros(0, dtype=np.float32)     # recent mic for the delay estimator
         self._mic_hist_start = 0       # abs mic index of _mic_hist[0]
@@ -193,10 +202,13 @@ class Orchestrator:
                     self._aec_mic = np.zeros(0, dtype=np.float32)
                     self._aec_ref = np.zeros(0, dtype=np.float32)
                     self.vad.reset()
+                    self._play_started_ts = None   # next reply re-arms the onset grace
                     self.backend.feed_mic(mic)
                     continue
 
                 # --- AI is playing: drift-aligned reference + DTLN echo cancellation ---
+                if self._play_started_ts is None:
+                    self._play_started_ts = mic_ts   # first block of this reply -> start grace clock
                 played = self.ble.played_reference()
                 self._push_mic_hist(mic_ts, mic)
                 # Refine the alignment online (~every 240 ms) -- no hardcoded constant.
@@ -239,13 +251,15 @@ class Orchestrator:
                 # is zeros, so `clean` still carries the full echo -> the VAD would fire on the
                 # AI's OWN voice (a warmup false-barge that killed playback before the estimator
                 # could acquire). Gating on `locked` closes that ~0.5 s window.
-                if self.delay_est.locked and not self._calibrating:
+                in_onset_grace = (self._play_started_ts is not None and
+                                  (mic_ts - self._play_started_ts) < BARGE_ONSET_GRACE_S * SR)
+                if self.delay_est.locked and not self._calibrating and not in_onset_grace:
                     onsets = self.vad.process(clean)
                     if onsets:
                         self._n_onsets += 1
                         await self._barge_in()
                 else:
-                    self.vad.reset()    # keep the floor fresh for when we arm
+                    self.vad.reset()    # keep the floor fresh for when we arm (incl. onset grace)
                 # Do NOT feed the AI's own audio back to the model while it is playing: even with
                 # good cancellation the cleaned mic carries a little RESIDUAL ECHO at reply onsets
                 # (HW: clean ~0.003-0.007), and the model's server-side VAD hears it and interrupts
