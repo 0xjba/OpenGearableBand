@@ -129,7 +129,10 @@ class Orchestrator:
         self.aec = DtlnAec(model_dir)
         # buffers internally (AEC's 128/256-sample chunks are fine). Its abs_floor is driven
         # ADAPTIVELY each block from the tracked residual-echo level (see the DSP loop).
-        self.vad = BargeInVad(sr=SR)
+        # onset_frames=8 (8 x 30 ms = 240 ms): require the over-talk to be SUSTAINED, so a brief
+        # reply-onset residual burst (which fired the lone session-1 false barge at ~150 ms) does
+        # not latch. Real over-talk lasts far longer than 240 ms, so genuine barge-ins still fire.
+        self.vad = BargeInVad(sr=SR, onset_frames=8)
         self._echo_floor = BARGE_BASE_FLOOR   # tracked residual-echo level (adaptive barge-in DTD)
         self.delay_est = DelayEstimator()
 
@@ -255,7 +258,15 @@ class Orchestrator:
                 # is zeros, so `clean` still carries the full echo -> the VAD would fire on the
                 # AI's OWN voice (a warmup false-barge that killed playback before the estimator
                 # could acquire). Gating on `locked` closes that ~0.5 s window.
-                if self.delay_est.locked and not self._calibrating:
+                # ARTIFACT GATE: a real near-end voice can only LOSE energy through an echo
+                # suppressor (it removes echo, passes voice) -> clean <= mic. When clean > mic the
+                # DTLN net ADDED energy: that is a suppression artifact / overshoot, never the user
+                # talking. Those overshoots were the "series of barge-ins from the device" (clean
+                # 0.0316 > mic 0.0251, clean 0.0186 > mic 0.0106). Suppress them, and don't let them
+                # poison the residual-echo estimate. Real over-talk shows clean << mic (0.0253 vs
+                # 0.0704) and passes cleanly.
+                artifact = self._clean_rms > self._mic_rms
+                if self.delay_est.locked and not self._calibrating and not artifact:
                     # ADAPTIVE double-talk floor: barge-in audio must clear MULT x this session's
                     # tracked residual-echo level. The estimate is updated only on residual-level
                     # blocks (clean < current threshold) so the user's own over-talk can't inflate

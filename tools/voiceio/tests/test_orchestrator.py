@@ -68,3 +68,25 @@ def test_adaptive_barge_floor_blocks_residual_passes_voice():
 
     assert run(0.008) == []          # residual burst: blocked by the adaptive absolute floor
     assert len(run(0.03)) >= 1       # real over-talk: clears it and fires
+
+
+def test_longer_sustain_rejects_brief_burst_passes_real_overtalk():
+    # The orchestrator builds BargeInVad(onset_frames=8) (8 x 30 ms = 240 ms): a brief
+    # reply-onset residual burst (~150 ms) must NOT latch a barge-in, while a sustained
+    # over-talk (well over 240 ms) still fires. This is what stops the lone session-1
+    # onset false-barge without delaying genuine interruptions.
+    from voiceio.vad import BargeInVad
+    sr = 16000
+    rng = np.random.default_rng(7)
+
+    def run(burst_ms):
+        v = BargeInVad(sr=sr, onset_frames=8)
+        v.abs_floor_linear = 0.006
+        x = (rng.standard_normal(2 * sr).astype(np.float32) * 0.001)   # quiet bed
+        s = sr // 2
+        n = int(sr * burst_ms / 1000.0)
+        x[s:s + n] += rng.standard_normal(n).astype(np.float32) * 0.03  # loud over-talk
+        return v.process(x)
+
+    assert run(150) == []            # brief burst: under the 240 ms sustain -> no latch
+    assert len(run(600)) >= 1        # sustained over-talk: fires
