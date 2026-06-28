@@ -43,22 +43,28 @@ def test_recovers_drifted_delayed_echo():
     assert np.corrcoef(out, echo)[0, 1] > np.corrcoef(wrong, echo)[0, 1]
 
 
-def test_barge_abs_floor_blocks_residual_burst_that_margin_would_pass():
-    # The HW run-8 failure: a residual-echo BURST (0.008) over a low tracked floor (0.001) is
-    # 8x = 18 dB over the floor, so the relative margin gate (12 dB) PASSES it -> false barge-in.
-    # The raised absolute floor must block it (0.008 < ~0.0126), while a real over-talk burst
-    # (0.03) -- also well over the floor -- clears BOTH gates and fires.
-    from voiceio.orchestrator import BARGE_ABS_FLOOR_DB
+def test_adaptive_barge_floor_blocks_residual_passes_voice():
+    # The adaptive DTD sets vad.abs_floor_linear = MULT x the tracked residual-echo level. With a
+    # residual ~0.004 -> floor ~0.012: a residual BURST (0.008, which is 18 dB over the VAD's
+    # relative floor and WOULD pass the margin gate) is blocked by the absolute floor, while a
+    # real over-talk burst (0.03) clears it and fires.
+    from voiceio.orchestrator import BARGE_FLOOR_MULT
     from voiceio.vad import BargeInVad
     sr = 16000
     rng = np.random.default_rng(4)
+    floor = BARGE_FLOOR_MULT * 0.004                                       # adaptive threshold
 
     def stream(burst_amp):
-        x = rng.standard_normal(8 * sr).astype(np.float32) * 0.001         # quiet floor
+        x = rng.standard_normal(8 * sr).astype(np.float32) * 0.001         # quiet relative floor
         for t in (2, 4, 6):
             s = t * sr
             x[s:s + sr // 2] += rng.standard_normal(sr // 2).astype(np.float32) * burst_amp
         return x
 
-    assert BargeInVad(sr=sr, abs_floor_db=BARGE_ABS_FLOOR_DB).process(stream(0.008)) == []   # residual: blocked
-    assert len(BargeInVad(sr=sr, abs_floor_db=BARGE_ABS_FLOOR_DB).process(stream(0.03))) >= 1  # voice: fires
+    def run(amp):
+        v = BargeInVad(sr=sr)
+        v.abs_floor_linear = floor                                        # driven adaptively
+        return v.process(stream(amp))
+
+    assert run(0.008) == []          # residual burst: blocked by the adaptive absolute floor
+    assert len(run(0.03)) >= 1       # real over-talk: clears it and fires

@@ -44,18 +44,20 @@ SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the
 HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
 
 # --- Barge-in double-talk detection (DTD): tell "user talking over" from "leftover echo".
-# An energy gate alone false-fires on residual echo (HW run 8: ~6 spurious barge-ins chopped
-# the AI's replies). For a NEURAL AEC on a WEAK echo path, the right discriminator is the
-# residual's ABSOLUTE level: the AI's echo -- even when DTLN cancels it poorly -- stays low in
-# absolute terms (echo-path-gain-bounded, ~<=0.01) because the echo path itself is weak, while
-# the user's voice survives the AEC at a much higher level (~>=0.015). So barge-in requires the
-# cleaned mic to clear a raised absolute floor (in addition to the VAD's relative margin).
-# A linear normalized-cross-correlation DTD (the textbook method) was tried + rejected here: the
-# cheap speaker's NONLINEARITY makes echo-NCC low even for pure echo (it never suppresses on our
-# hardware), and where echo IS linearly strong it over-suppresses genuine over-talk.
-# [USER/HOUSING: depends on echo coupling + user loudness + speaker volume; re-tune on the
-# production acoustic design, or make it ADAPTIVE off the residual floor tracked during playback.]
-BARGE_ABS_FLOOR_DB = -38.0    # ~0.0126: above weak-echo residual, below near-end voice
+# An energy gate alone false-fires on residual echo, and a FIXED absolute floor is fragile: the
+# residual-echo level varies session to session with the echo coupling (HW run 8 weak -> a fixed
+# -38 dB worked; run 11 stronger -> the same -38 dB false-fired and chopped replies). So the floor
+# is ADAPTIVE: track the residual-echo level during THIS session's playback and set the barge-in
+# threshold a fixed margin ABOVE it. Strong echo -> higher bar, weak echo -> lower bar; only the
+# user's voice (well above the residual, since they talk right into the wrist) crosses it.
+# (A linear NCC DTD -- the textbook method -- was tried + rejected: the cheap speaker's
+# nonlinearity makes echo-NCC low even for pure echo, so it never suppresses on our hardware, and
+# where echo IS linearly strong it over-suppresses genuine over-talk.)
+# [USER/HOUSING: BARGE_FLOOR_MULT / BARGE_BASE_FLOOR may want re-tuning on the production acoustic
+# design; they are now adaptive so they should travel across echo conditions far better.]
+BARGE_BASE_FLOOR = 0.006      # ~-44 dBFS: minimum threshold (well-cancelled/quiet sessions)
+BARGE_FLOOR_MULT = 3.0        # barge-in needs clean > MULT x the tracked residual-echo level
+BARGE_FLOOR_ALPHA = 0.05      # EMA rate for the residual-echo-level estimate (slow)
 EST_EVERY_BLOCKS = 12         # refine the alignment ~every 240 ms while the AI plays
 # In-flight buffer between "sample transmitted" and "sample heard by the mic": the device
 # playout jitter buffer (~setpoint) plus whatever ble_link still has queued. Used to derive
@@ -125,9 +127,10 @@ class Orchestrator:
         self.backend = backend
         self.codec = Lc3Codec(lib_path)
         self.aec = DtlnAec(model_dir)
-        # buffers internally (AEC's 128/256-sample chunks are fine). Raised absolute floor =
-        # the primary double-talk gate: weak-echo residual stays below it, near-end voice above.
-        self.vad = BargeInVad(sr=SR, abs_floor_db=BARGE_ABS_FLOOR_DB)
+        # buffers internally (AEC's 128/256-sample chunks are fine). Its abs_floor is driven
+        # ADAPTIVELY each block from the tracked residual-echo level (see the DSP loop).
+        self.vad = BargeInVad(sr=SR)
+        self._echo_floor = BARGE_BASE_FLOOR   # tracked residual-echo level (adaptive barge-in DTD)
         self.delay_est = DelayEstimator()
 
         self._mic_q = asyncio.Queue()
@@ -253,13 +256,16 @@ class Orchestrator:
                 # AI's OWN voice (a warmup false-barge that killed playback before the estimator
                 # could acquire). Gating on `locked` closes that ~0.5 s window.
                 if self.delay_est.locked and not self._calibrating:
-                    # Double-talk gate is the VAD's RAISED ABSOLUTE FLOOR (BARGE_ABS_FLOOR_DB):
-                    # weak-echo residual stays below it, near-end voice above it. (A linear NCC
-                    # mic-vs-reference DTD was tried + rejected: the cheap speaker's nonlinearity
-                    # makes echo-NCC low even for pure echo -> it never suppresses on our hardware,
-                    # and when echo IS linearly strong it over-suppresses genuine over-talk. The
-                    # residual absolute level is the right discriminator for a neural AEC + weak
-                    # echo path.)
+                    # ADAPTIVE double-talk floor: barge-in audio must clear MULT x this session's
+                    # tracked residual-echo level. The estimate is updated only on residual-level
+                    # blocks (clean < current threshold) so the user's own over-talk can't inflate
+                    # it. This self-calibrates to the session's echo coupling -- a fixed floor was
+                    # fragile (run 8 weak echo passed, run 11 stronger echo false-fired).
+                    thr = max(BARGE_BASE_FLOOR, BARGE_FLOOR_MULT * self._echo_floor)
+                    if self._clean_rms < thr:
+                        self._echo_floor += BARGE_FLOOR_ALPHA * (self._clean_rms - self._echo_floor)
+                        thr = max(BARGE_BASE_FLOOR, BARGE_FLOOR_MULT * self._echo_floor)
+                    self.vad.abs_floor_linear = thr
                     onsets = self.vad.process(clean)
                     if onsets:
                         self._n_onsets += 1
@@ -390,11 +396,13 @@ class Orchestrator:
             # mic_rms = raw mic level (is the band hearing anything?); clean_rms = what the
             # VAD sees after AEC; floor = VAD's tracked echo floor. Barge-in needs
             # clean_rms > floor*~4 (12 dB) AND clean_rms > abs floor.
+            # barge_floor = the ADAPTIVE threshold clean must clear to barge in (= MULT x the
+            # tracked residual-echo level). A barge-in needs clean_rms over barge_floor (sustained).
+            barge_floor = max(BARGE_BASE_FLOOR, BARGE_FLOOR_MULT * self._echo_floor)
             print(f"[stat] uplink={self._n_uplink}(+{up_rate}/s) sent={self._n_blocks_sent} "
                   f"play={int(self._playing)} delay={d_str} "
                   f"mic_rms={self._mic_rms:.4f} clean_rms={self._clean_rms:.4f} "
-                  f"vad_floor={self.vad.floor if self.vad.floor is not None else 0:.4f} "
-                  f"barge_ins={self._n_onsets}")
+                  f"barge_floor={barge_floor:.4f} barge_ins={self._n_onsets}")
 
     async def _calibrate(self):
         """Acquire the echo alignment at session start so barge-in is armed from the AI's
@@ -472,6 +480,7 @@ class Orchestrator:
         self.aec.reset()
         self.vad.reset()
         self.delay_est.reset()
+        self._echo_floor = BARGE_BASE_FLOOR   # re-estimate the residual level per conversation
         self._reset_mic_hist()
 
     # --- lifecycle ---
