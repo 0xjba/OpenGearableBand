@@ -10,6 +10,7 @@
 #include <limits.h>
 
 #include "mic_vad.h"
+#include "audio_out.h"   /* audio_out_active(): hold the ear session through a lean while the AI is speaking */
 
 LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 
@@ -242,17 +243,21 @@ static void ear_gate_update(pose_id_t best)
         return;
     }
 
-    /* Otherwise exit only when the pose has been gone AND near-field voice has
-     * stopped. Voice-continuity holds the session through a comfortable lean
-     * (pose out of the cone) while the user keeps speaking AT the near-field
-     * level -- self-limiting: lowering the arm makes voice far-field/quiet (not
-     * hot), so it can't hold a session when the wrist isn't near the mouth. */
+    /* Otherwise exit only when the pose has been gone AND neither party is
+     * talking. Continuity holds the session through a comfortable lean (pose out
+     * of the cone) when EITHER the user keeps speaking at the near-field level
+     * (dictation) OR the AI is currently speaking to them (audio_out_active --
+     * listening to a reply). The user half is self-limiting (lowering the arm
+     * makes their voice far-field/quiet); the playback half is bounded by the AI
+     * turn ending plus the session-silence timeout above, so a forgotten hold
+     * still releases. Without the playback term, leaning while LISTENING (the
+     * user isn't talking, so the voice term is false) dropped the session. */
     if (!pose_stale) {
         ear_voice_holding = false;          /* pose back inside the cone */
-    } else if (mic_vad_voice_active()) {
+    } else if (mic_vad_voice_active() || audio_out_active()) {
         if (!ear_voice_holding) {
             ear_voice_holding = true;
-            LOG_INF("POSE_EAR out of cone but voice continues -> holding (lean)");
+            LOG_INF("POSE_EAR out of cone but voice/playback continues -> holding (lean)");
         }
     } else {
         ear_session_end("pose dropped + voice stopped");
