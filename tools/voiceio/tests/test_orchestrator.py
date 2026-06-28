@@ -41,3 +41,24 @@ def test_recovers_drifted_delayed_echo():
     # And it is meaningfully BETTER aligned than ignoring the drift (ratio=1 wrong model):
     wrong = aligned_reference(ref, ref_base_mic=base, mic_count_start=m0, n=n, ratio=1.0)
     assert np.corrcoef(out, echo)[0, 1] > np.corrcoef(wrong, echo)[0, 1]
+
+
+def test_barge_abs_floor_blocks_residual_burst_that_margin_would_pass():
+    # The HW run-8 failure: a residual-echo BURST (0.008) over a low tracked floor (0.001) is
+    # 8x = 18 dB over the floor, so the relative margin gate (12 dB) PASSES it -> false barge-in.
+    # The raised absolute floor must block it (0.008 < ~0.0126), while a real over-talk burst
+    # (0.03) -- also well over the floor -- clears BOTH gates and fires.
+    from voiceio.orchestrator import BARGE_ABS_FLOOR_DB
+    from voiceio.vad import BargeInVad
+    sr = 16000
+    rng = np.random.default_rng(4)
+
+    def stream(burst_amp):
+        x = rng.standard_normal(8 * sr).astype(np.float32) * 0.001         # quiet floor
+        for t in (2, 4, 6):
+            s = t * sr
+            x[s:s + sr // 2] += rng.standard_normal(sr // 2).astype(np.float32) * burst_amp
+        return x
+
+    assert BargeInVad(sr=sr, abs_floor_db=BARGE_ABS_FLOOR_DB).process(stream(0.008)) == []   # residual: blocked
+    assert len(BargeInVad(sr=sr, abs_floor_db=BARGE_ABS_FLOOR_DB).process(stream(0.03))) >= 1  # voice: fires

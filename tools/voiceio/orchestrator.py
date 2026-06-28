@@ -42,6 +42,20 @@ SR = 16000
 CAL_SECONDS = 0.8             # length of the startup calibration chirp
 SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the conversation
 HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
+
+# --- Barge-in double-talk detection (DTD): tell "user talking over" from "leftover echo".
+# An energy gate alone false-fires on residual echo (HW run 8: ~6 spurious barge-ins chopped
+# the AI's replies). For a NEURAL AEC on a WEAK echo path, the right discriminator is the
+# residual's ABSOLUTE level: the AI's echo -- even when DTLN cancels it poorly -- stays low in
+# absolute terms (echo-path-gain-bounded, ~<=0.01) because the echo path itself is weak, while
+# the user's voice survives the AEC at a much higher level (~>=0.015). So barge-in requires the
+# cleaned mic to clear a raised absolute floor (in addition to the VAD's relative margin).
+# A linear normalized-cross-correlation DTD (the textbook method) was tried + rejected here: the
+# cheap speaker's NONLINEARITY makes echo-NCC low even for pure echo (it never suppresses on our
+# hardware), and where echo IS linearly strong it over-suppresses genuine over-talk.
+# [USER/HOUSING: depends on echo coupling + user loudness + speaker volume; re-tune on the
+# production acoustic design, or make it ADAPTIVE off the residual floor tracked during playback.]
+BARGE_ABS_FLOOR_DB = -38.0    # ~0.0126: above weak-echo residual, below near-end voice
 EST_EVERY_BLOCKS = 12         # refine the alignment ~every 240 ms while the AI plays
 # In-flight buffer between "sample transmitted" and "sample heard by the mic": the device
 # playout jitter buffer (~setpoint) plus whatever ble_link still has queued. Used to derive
@@ -111,7 +125,9 @@ class Orchestrator:
         self.backend = backend
         self.codec = Lc3Codec(lib_path)
         self.aec = DtlnAec(model_dir)
-        self.vad = BargeInVad(sr=SR)   # buffers internally, so AEC's 128/256-sample chunks are fine
+        # buffers internally (AEC's 128/256-sample chunks are fine). Raised absolute floor =
+        # the primary double-talk gate: weak-echo residual stays below it, near-end voice above.
+        self.vad = BargeInVad(sr=SR, abs_floor_db=BARGE_ABS_FLOOR_DB)
         self.delay_est = DelayEstimator()
 
         self._mic_q = asyncio.Queue()
@@ -237,6 +253,13 @@ class Orchestrator:
                 # AI's OWN voice (a warmup false-barge that killed playback before the estimator
                 # could acquire). Gating on `locked` closes that ~0.5 s window.
                 if self.delay_est.locked and not self._calibrating:
+                    # Double-talk gate is the VAD's RAISED ABSOLUTE FLOOR (BARGE_ABS_FLOOR_DB):
+                    # weak-echo residual stays below it, near-end voice above it. (A linear NCC
+                    # mic-vs-reference DTD was tried + rejected: the cheap speaker's nonlinearity
+                    # makes echo-NCC low even for pure echo -> it never suppresses on our hardware,
+                    # and when echo IS linearly strong it over-suppresses genuine over-talk. The
+                    # residual absolute level is the right discriminator for a neural AEC + weak
+                    # echo path.)
                     onsets = self.vad.process(clean)
                     if onsets:
                         self._n_onsets += 1
