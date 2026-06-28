@@ -51,9 +51,11 @@ static uint8_t  volume_pct = 75;
 
 /* --- DIAGNOSTIC: per-session glitch counters, logged at session end. --- */
 static uint32_t dbg_blocks;
-static uint32_t dbg_underruns;            /* ring held < a full block -> silence-padded */
-static uint32_t dbg_underruns_partial;    /* 0 < got < block: producer behind = AUDIBLE crackle
-                                           * (vs got==0 empties = gaps / the drain tail) */
+static uint32_t dbg_underruns;            /* ring held < a full block -> silence-padded (ALL,
+                                           * incl. the inaudible end-of-session drain tail) */
+static uint32_t dbg_underruns_partial;    /* 0 < got < block: producer behind = AUDIBLE crackle */
+static uint32_t dbg_underruns_midgap;     /* got==0 with real audio AFTER it = a mid-stream
+                                           * AUDIBLE silence gap (NOT the trailing drain tail) */
 static uint32_t dbg_writeerr;
 static int64_t  dbg_play_start_ms;        /* uptime at first real block (effective-rate calc) */
 static uint32_t dbg_play_samples;         /* real mono samples clocked out (drift detector) */
@@ -137,10 +139,12 @@ static void feeder(void *a, void *b, void *c)
 			block_ms = 1;
 		}
 		uint32_t silence_ms = 0;
+		uint32_t pending_gap = 0;    /* run of got==0 not yet classified: tail vs mid-stream */
 		int primed = 0;
 		dbg_blocks = 0;
 		dbg_underruns = 0;
 		dbg_underruns_partial = 0;
+		dbg_underruns_midgap = 0;
 		dbg_writeerr = 0;
 		dbg_play_start_ms = 0;
 		dbg_play_samples = 0;
@@ -158,17 +162,24 @@ static void feeder(void *a, void *b, void *c)
 			if (got < FRAMES_PER_BLOCK) {
 				atomic_or(&event_flags, AUDIO_OUT_EV_UNDERRUN);
 				dbg_underruns++;
-				/* 0 < got < block = ring not yet empty but producer is
-				 * behind -> this is the audible mid-stream crackle; got==0
-				 * is a full gap / the post-stream drain tail (inaudible). */
+				/* 0 < got < block = ring not empty but producer behind -> AUDIBLE
+				 * crackle. got==0 is a full silence block: either a mid-stream gap
+				 * (audible) or the post-stream drain tail (inaudible) -- can't tell
+				 * yet, so hold it pending until we see whether real audio follows. */
 				if (got > 0) {
 					dbg_underruns_partial++;
+				} else {
+					pending_gap++;
 				}
 			}
 			/* Effective I2S rate = real samples clocked / wall-clock. If it
 			 * reads > session_rate, the I2S clock runs fast and steadily drains
 			 * the jitter buffer (drift), vs burst jitter which wouldn't. */
 			if (got > 0) {
+				/* Real audio resumed -> any pending got==0 empties were a
+				 * MID-STREAM gap (audible), not the trailing drain tail. */
+				dbg_underruns_midgap += pending_gap;
+				pending_gap = 0;
 				if (dbg_play_start_ms == 0) {
 					dbg_play_start_ms = k_uptime_get();
 				}
@@ -210,9 +221,14 @@ static void feeder(void *a, void *b, void *c)
 			(uint32_t)(((int64_t)dbg_blocks * FRAMES_PER_BLOCK * 1000) / play_ms) : 0;
 		uint32_t audio_hz = play_ms ?
 			(uint32_t)(((int64_t)dbg_play_samples * 1000) / play_ms) : 0;
-		LOG_INF("audio_out session: %u blocks, %u underruns (%u partial/audible), "
-			"%ld overflow, %u write-err",
-			dbg_blocks, dbg_underruns, dbg_underruns_partial,
+		/* AUDIBLE = mid-stream crackle (partial) + mid-stream silence gap (midgap).
+		 * The rest of dbg_underruns is the trailing end-of-session drain tail
+		 * (IDLE_STOP_MS of silence after the AI stops) -- inaudible. */
+		uint32_t audible = dbg_underruns_partial + dbg_underruns_midgap;
+		uint32_t tail = dbg_underruns - audible;
+		LOG_INF("audio_out session: %u blocks, %u AUDIBLE underruns "
+			"(%u crackle + %u gap), %u tail-drain (silent), %ld overflow, %u write-err",
+			dbg_blocks, audible, dbg_underruns_partial, dbg_underruns_midgap, tail,
 			(long)atomic_get(&dbg_overflow), dbg_writeerr);
 		LOG_INF("audio_out rate: req=%u Hz, i2s=%u Hz (drift check), audio=%u Hz "
 			"over %lld ms", session_rate, i2s_hz, audio_hz, (long long)play_ms);
