@@ -51,10 +51,12 @@ def test_feed_mic_is_a_noop_for_loopback():
 
 def test_minimal_backend_runs_via_lifecycle_defaults():
     # A new backend implementing only the 3 required methods must work through the
-    # default no-op lifecycle (start_session/end_session/wait_ready/end_turn/reset/close).
+    # default no-op lifecycle (start_session/end_session/wait_ready/reset/close) and the
+    # default server_barge_count() (0 -> never self-barges).
     class MyAPI(VoiceBackend):
         def feed_mic(self, pcm): pass
         def next_audio(self, n): return np.zeros(0, np.float32)
         def barge_in(self): pass
     b = MyAPI()
-    b.start_session(); b.wait_ready(); b.end_turn(); b.reset(); b.end_session(); b.close()
+    b.start_session(); b.wait_ready(); b.reset(); b.end_session(); b.close()
+    assert b.server_barge_count() == 0

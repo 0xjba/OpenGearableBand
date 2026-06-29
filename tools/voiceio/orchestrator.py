@@ -27,6 +27,7 @@ REFERENCE ALIGNMENT (the load-bearing, hardware-tuned part):
   AEC passes the mic through unchanged (correct: nothing to cancel).
 """
 import asyncio
+import time
 
 import numpy as np
 
@@ -36,24 +37,13 @@ from voiceio.ble_link import BLOCK_SAMPLES, FRAME_BYTES, FRAME_SAMPLES, FRAMES_P
 from voiceio.clocks import AEC_DRIFT_RATIO
 from voiceio.codec import Lc3Codec
 from voiceio.delay_estimator import DelayEstimator
-from voiceio.vad import BargeInVad
 
 SR = 16000
-# [USER/HOUSING] Barge-in absolute floor: a frame whose level is below this NEVER fires a
-# barge-in, even on a relative rise. The VAD is otherwise relative (it triggers on a jump above
-# its adaptive noise floor) -- but with the continuous-tracking AEC cancelling well, that floor
-# collapses to ~0.0001, so a tiny residual-echo wiggle (HW-measured ~0.0008-0.0016 = -62..-56
-# dBFS during playback) reads as a huge relative rise and false-fires. Real over-talk lands at
-# ~0.02-0.09 (-34..-21 dBFS) -- a ~20x gap -- so this floor cleanly rejects the residual while
-# passing voice. Re-check when the production speaker/placement changes the echo coupling.
-BARGE_ABS_FLOOR_DB = -42.0    # ~0.0079 linear: between the ~0.002 residual and ~0.03 voice
-# [USER] Reply-onset barge-in grace: don't ARM barge-in for the first second of each reply. At a
-# reply's play 0->1 the AEC alignment is still re-converging (coarsest on the FIRST reply, where
-# only the calibration lock is available), so `clean` briefly carries un-cancelled echo that can
-# clip the absolute floor -- the residual onset false-barge (HW: ~2x on a loud first reply). The
-# AEC still runs during the grace (so it converges); only the FIRING is suppressed. A real
-# interruption in the first second is rare (you let a reply begin before talking over it), and the
-# hysteresis clamp already keeps most onsets clean -- this covers the loud-TTS tail.
+# [USER] Reply-onset gate: for the first second of each reply the AEC alignment is still
+# (re)converging, so `clean` still carries un-cancelled echo. During this window we do NOT forward
+# the cleaned mic to the backend (we send silence), so that un-cancelled onset echo cannot trip the
+# backend's VAD into a self-interruption. After it, the residual is low (HW-measured clean
+# ~0.0000-0.001) and the cleaned mic is forwarded so the backend's VAD can hear a real barge-in.
 BARGE_ONSET_GRACE_S = 1.0
 CAL_SECONDS = 0.8             # length of the startup calibration chirp
 SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the conversation
@@ -119,6 +109,15 @@ class Orchestrator:
             model_dir: DTLN model path prefix (e.g. ".../dtln_aec_512").
             lib_path: liblc3 shared lib.
 
+        BARGE-IN MODEL (finalized 2026-06-30, HW-validated): there is NO local barge detector. While
+        the AI plays, the orchestrator forwards the AEC-cleaned mic to the backend (gated off during
+        the pre-lock onset); the backend's own VAD hears the user talk over the AI and fires its
+        interrupt, which _server_barge_loop mirrors with a local flush+reset. This "clean signal +
+        backend VAD" design beat a local energy detector in the A/B (the energy detector false-fired
+        on ambient + residual echo; the backend VAD did not), so the energy detector, abs-floor, and
+        auto/manual harness modes were removed. It needs no Silero/DTD, and is viable because the AEC
+        residual is low in steady state (clean ~0.0000-0.001). See docs/research/barge-in-aec-2026-research.md.
+
         The render->capture alignment is tracked live by DelayEstimator (AEC3-style) -- no
         hardcoded delay -- so it self-calibrates per unit/session and carries to production
         hardware unchanged.
@@ -127,9 +126,6 @@ class Orchestrator:
         self.backend = backend
         self.codec = Lc3Codec(lib_path)
         self.aec = DtlnAec(model_dir)
-        # buffers internally (AEC's 128/256-sample chunks are fine). abs_floor rejects the tiny
-        # residual-echo rises that false-fire the relative-only detector (see BARGE_ABS_FLOOR_DB).
-        self.vad = BargeInVad(sr=SR, abs_floor_db=BARGE_ABS_FLOOR_DB)
         self.delay_est = DelayEstimator()
 
         self._mic_q = asyncio.Queue()
@@ -157,9 +153,9 @@ class Orchestrator:
         # --- bring-up instrumentation (printed by _status_loop) ---
         self._n_uplink = 0             # mic frames received from the band
         self._n_blocks_sent = 0        # downlink blocks transmitted
-        self._n_onsets = 0             # barge-ins fired
+        self._n_onsets = 0             # barge-ins handled (backend-VAD interrupts mirrored locally)
         self._mic_rms = 0.0            # last raw mic level
-        self._clean_rms = 0.0          # last echo-cancelled level (what the VAD sees)
+        self._clean_rms = 0.0          # last echo-cancelled level
 
     # --- uplink: light callback (decode + enqueue only) ---
 
@@ -178,7 +174,7 @@ class Orchestrator:
             chunks.append(pcm16.astype(np.float32) / 32768.0)
         return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
-    # --- DSP task: sequential AEC + VAD + barge-in + feed backend ---
+    # --- DSP task: sequential AEC, then forward the cleaned mic to the backend ---
 
     async def _dsp_loop(self):
         import traceback
@@ -201,8 +197,7 @@ class Orchestrator:
                     self._clean_rms = self._mic_rms
                     self._aec_mic = np.zeros(0, dtype=np.float32)
                     self._aec_ref = np.zeros(0, dtype=np.float32)
-                    self.vad.reset()
-                    self._play_started_ts = None   # next reply re-arms the onset grace
+                    self._play_started_ts = None   # next reply re-arms the onset gate
                     self.backend.feed_mic(mic)
                     continue
 
@@ -247,27 +242,16 @@ class Orchestrator:
                 if len(clean) == 0:
                     continue
                 self._clean_rms = float(np.sqrt(np.mean(clean ** 2) + 1e-12))
-                # Barge-in: only once the AEC is locked + cancelling. Before lock the reference
-                # is zeros, so `clean` still carries the full echo -> the VAD would fire on the
-                # AI's OWN voice (a warmup false-barge that killed playback before the estimator
-                # could acquire). Gating on `locked` closes that ~0.5 s window.
-                in_onset_grace = (self._play_started_ts is not None and
-                                  (mic_ts - self._play_started_ts) < BARGE_ONSET_GRACE_S * SR)
-                if self.delay_est.locked and not self._calibrating and not in_onset_grace:
-                    onsets = self.vad.process(clean)
-                    if onsets:
-                        self._n_onsets += 1
-                        await self._barge_in()
-                else:
-                    self.vad.reset()    # keep the floor fresh for when we arm (incl. onset grace)
-                # Do NOT feed the AI's own audio back to the model while it is playing: even with
-                # good cancellation the cleaned mic carries a little RESIDUAL ECHO at reply onsets
-                # (HW: clean ~0.003-0.007), and the model's server-side VAD hears it and interrupts
-                # itself ("cutting off with its own voice" -- seen as `<- interrupted` with NO local
-                # barge_in). Send silence instead. A genuine barge-in is caught by the LOCAL VAD
-                # above -> flush -> play=0 -> the not-playing branch then forwards the user's voice
-                # to the model. (Standard "gate the mic->LLM path during TTS" pattern; LiveKit etc.)
-                self.backend.feed_mic(np.zeros(len(clean), dtype=np.float32))
+                # Once the alignment is locked and we're past the per-reply onset gate, FORWARD the
+                # cleaned mic so the backend's own VAD can hear the user talk over the AI and fire its
+                # interrupt (-> _server_barge_loop cleanup). During the onset gate (or before lock /
+                # during calibration) the residual is still un-cancelled echo, so we send silence
+                # instead -- forwarding it would self-interrupt the backend's VAD.
+                in_onset_gate = (self._play_started_ts is not None and
+                                 (mic_ts - self._play_started_ts) < BARGE_ONSET_GRACE_S * SR)
+                forward = (self.delay_est.locked and not self._calibrating and not in_onset_gate)
+                self.backend.feed_mic(clean if forward
+                                      else np.zeros(len(clean), dtype=np.float32))
             except Exception:  # surface a crash instead of silently killing the task
                 print("[orch] DSP loop error:\n" + traceback.format_exc())
 
@@ -293,23 +277,37 @@ class Orchestrator:
         self._aec_mic = np.zeros(0, dtype=np.float32)
         self._aec_ref = np.zeros(0, dtype=np.float32)
 
-    async def _barge_in(self):
-        print("[orch] barge-in -> flush downlink + stop backend")
+    async def _local_barge_cleanup(self):
+        """Orchestrator-side of a barge (no backend call): flush the device playout + reset the
+        per-turn playing/alignment state so the next reply re-acquires cleanly. Shared by the
+        local-detector path (_barge_in) and the server-initiated path (_server_barge_loop)."""
         await self.ble.flush()
-        self.backend.barge_in()
         self._dl_residual = np.zeros(0, dtype=np.float32)
         self._playing = False
-        # MUST also clear the per-turn origin: the downlink loop re-arms _playing only when
-        # _dl_origin_mic is None (a fresh response). Leaving it set kept _playing False on
-        # every reply AFTER the first barge-in -> no AEC -> the AI echoed back into the mic
-        # and Gemini interrupted itself repeatedly.
+        # Clear the per-turn origin: the downlink loop re-arms _playing only when _dl_origin_mic is
+        # None (a fresh response). Leaving it set keeps _playing False on every later reply -> no AEC.
         self._dl_origin_mic = None
-        # The flush empties the device playout buffer (a playout discontinuity) and the
-        # barge-in double-talk can corrupt the alignment, so re-acquire cleanly on the next
-        # reply instead of carrying a bad lock.
+        # The flush is a playout discontinuity and barge double-talk can corrupt the alignment, so
+        # re-acquire cleanly on the next reply rather than carry a bad lock.
         self.delay_est.reset()
         self._reset_mic_hist()
-        self.vad.reset()
+
+    async def _server_barge_loop(self):
+        """The barge-in path: the backend's own VAD detects the user talking over the AI and fires
+        its interrupt (the backend drops its local playout queue + bumps its barge counter). We poll
+        that counter and mirror each interrupt with the orchestrator-side cleanup (flush the device
+        playout + reset alignment). Backend-agnostic via server_barge_count() -- 0 for backends with
+        no server VAD (e.g. the loopback test backend), which therefore never barge."""
+        last = self.backend.server_barge_count()
+        while not self._stop.is_set():
+            await asyncio.sleep(0.04)
+            n = self.backend.server_barge_count()
+            if n > last:
+                last = n
+                self._n_onsets += 1
+                print(f"[barge] {time.monotonic():.3f} backend interrupt #{n} "
+                      f"-> flush device playout + reset alignment")
+                await self._local_barge_cleanup()
 
     # --- downlink producer: assemble 20 ms blocks from backend audio ---
 
@@ -382,13 +380,12 @@ class Orchestrator:
                 d_str = f"acquiring(conf{self.delay_est.confidence:.2f})"
             up_rate = self._n_uplink - prev_up
             prev_up = self._n_uplink
-            # mic_rms = raw mic level (is the band hearing anything?); clean_rms = what the
-            # VAD sees after AEC; floor = VAD's tracked echo floor. Barge-in needs
-            # clean_rms > floor*~4 (12 dB) AND clean_rms > abs floor.
+            # mic_rms = raw mic level (is the band hearing anything?); clean_rms = level after AEC.
+            # During AI playback a LOW clean_rms vs mic_rms means the AEC is cancelling well (the
+            # residual the backend VAD must ignore). barge_ins = backend-VAD interrupts handled.
             print(f"[stat] uplink={self._n_uplink}(+{up_rate}/s) sent={self._n_blocks_sent} "
                   f"play={int(self._playing)} delay={d_str} "
                   f"mic_rms={self._mic_rms:.4f} clean_rms={self._clean_rms:.4f} "
-                  f"vad_floor={self.vad.floor if self.vad.floor is not None else 0:.4f} "
                   f"barge_ins={self._n_onsets}")
 
     async def _calibrate(self):
@@ -460,12 +457,12 @@ class Orchestrator:
     def _reset_session_state(self):
         """Clear all per-conversation DSP/playout state (between conversations)."""
         self._playing = False
+        self._play_started_ts = None
         self._dl_origin_mic = None
         self._dl_residual = np.zeros(0, dtype=np.float32)
         self._cal_audio = np.zeros(0, dtype=np.float32)
         self._calibrating = False
         self.aec.reset()
-        self.vad.reset()
         self.delay_est.reset()
         self._reset_mic_hist()
 
@@ -474,13 +471,13 @@ class Orchestrator:
     async def run(self):
         """Start streaming + the DSP/downlink/session tasks; runs until stop()."""
         self.aec.reset()
-        self.vad.reset()
         await self.ble.start(self._on_uplink)
         tasks = [
             asyncio.create_task(self._dsp_loop()),
             asyncio.create_task(self._downlink_loop()),
             asyncio.create_task(self._status_loop()),
             asyncio.create_task(self._session_loop()),
+            asyncio.create_task(self._server_barge_loop()),
         ]
         try:
             await self._stop.wait()

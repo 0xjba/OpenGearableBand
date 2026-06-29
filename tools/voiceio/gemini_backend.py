@@ -45,9 +45,6 @@ INTERNAL_HZ = 16000           # our pipeline rate (device mic + speaker)
 DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
 GEMINI_IN_MIME = "audio/pcm;rate=16000"
 
-# Sentinel pushed through the mic queue to flush an explicit end-of-turn.
-_END_TURN = object()
-
 
 def _f32_to_pcm16le(x: np.ndarray) -> bytes:
     """float32 [-1,1] -> raw 16-bit little-endian PCM bytes."""
@@ -69,7 +66,12 @@ class GeminiLiveBackend(VoiceBackend):
             api_key: Gemini key. Defaults to env GEMINI_API_KEY (never hardcode).
             model: Live-API model id.
             system_instruction: optional system prompt (e.g. to shape reply style).
-        """
+
+        Barge-in uses Gemini's AUTOMATIC VAD: the orchestrator forwards the AEC-cleaned mic while the
+        AI plays, the server hears the user talk over it, cancels + discards the in-flight response
+        (retaining only what it already sent to us), and signals `server_content.interrupted` -- which
+        we surface via server_barge_count(). (The manual activity_start/end A/B leg lost on HW and was
+        removed 2026-06-30.)"""
         from google import genai
         from google.genai import types
         self._types = types
@@ -102,6 +104,7 @@ class GeminiLiveBackend(VoiceBackend):
         self._err = None
         self._n_turns = 0                      # completed model turns (diagnostic)
         self._n_audio_recv = 0                 # audio chunks received (diagnostic)
+        self._n_interrupts = 0                 # server-side `interrupted` events (Gemini's VAD fired)
 
     # --- VoiceBackend interface (called from the orchestrator's audio thread) ---
 
@@ -128,7 +131,9 @@ class GeminiLiveBackend(VoiceBackend):
         return out.astype(np.float32)
 
     def barge_in(self):
-        """User interrupted: drop all pending/buffered AI audio immediately."""
+        """User interrupted: drop all pending/buffered AI audio locally. (Gemini cancels + discards
+        its in-flight generation server-side on its own interrupt, retaining only what it already
+        sent, so there's no separate cancel/truncate call to make here.)"""
         self._play_buf = np.zeros(0, np.float32)
         while True:
             try:
@@ -136,16 +141,10 @@ class GeminiLiveBackend(VoiceBackend):
             except queue.Empty:
                 break
 
-    def end_turn(self):
-        """Signal end-of-user-turn explicitly (audio_stream_end).
-
-        The live loop relies on the server's AUTOMATIC VAD to detect turn ends
-        from the continuous post-AEC mic stream (which has a real noise floor).
-        This explicit signal is for one-shot/push-to-talk use, where a stream of
-        digital-zero silence does NOT trip automatic VAD."""
-        if not self._ready.is_set() or self._loop is None or self._err is not None:
-            return
-        self._loop.call_soon_threadsafe(self._aio_mic_q.put_nowait, _END_TURN)
+    def server_barge_count(self):
+        """How many times Gemini's server VAD has fired `interrupted` this object's lifetime. The
+        orchestrator polls this to mirror each barge with a device-playout flush + alignment reset."""
+        return self._n_interrupts
 
     def wait_ready(self, timeout=10.0):
         """Block until the session is connected. Raises if it failed to connect."""
@@ -218,9 +217,6 @@ class GeminiLiveBackend(VoiceBackend):
         try:
             while True:
                 item = await self._aio_mic_q.get()
-                if item is _END_TURN:
-                    await session.send_realtime_input(audio_stream_end=True)
-                    continue
                 await session.send_realtime_input(
                     audio=self._types.Blob(data=item, mime_type=GEMINI_IN_MIME)
                 )
@@ -244,7 +240,9 @@ class GeminiLiveBackend(VoiceBackend):
                     sc = response.server_content
                     # Server-side interruption: flush, mirroring our local barge_in().
                     if sc is not None and getattr(sc, "interrupted", False):
-                        print("[gemini] <- interrupted")
+                        self._n_interrupts += 1
+                        print(f"[gemini] <- interrupted #{self._n_interrupts} "
+                              f"(server VAD; {self._n_audio_recv} chunks so far)")
                         self.barge_in()
                         continue
                     data = getattr(response, "data", None)
@@ -256,7 +254,7 @@ class GeminiLiveBackend(VoiceBackend):
                     if sc is not None and getattr(sc, "turn_complete", False):
                         self._n_turns += 1
                         print(f"[gemini] <- turn_complete (#{self._n_turns}, "
-                              f"{self._n_audio_recv} audio chunks total)")
+                              f"{self._n_audio_recv} chunks total)")
                 # turn generator ended -> loop back into receive() for the next turn
         except asyncio.CancelledError:
             raise

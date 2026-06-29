@@ -36,10 +36,22 @@ class VoiceBackend:
         raise NotImplementedError
 
     def barge_in(self):
-        """The user interrupted -- stop/flush the current output immediately."""
+        """The user interrupted -- STOP/flush the current output immediately. Drops any audio the
+        backend still has queued for playback (the orchestrator separately flushes the device
+        playout). A backend whose own server cancels/truncates its generation on interrupt (e.g.
+        Gemini Live retains only what it already sent) does that here too. Called either by the
+        orchestrator or self-triggered when the backend's own VAD reports an interrupt."""
         raise NotImplementedError
 
     # --- optional lifecycle: safe no-op defaults so the core treats all backends alike ---
+
+    def server_barge_count(self):
+        """How many barge-ins the backend's OWN detector (server-side VAD) has signalled so far.
+        The orchestrator polls this and mirrors each new one with a device-playout flush + reset
+        (see Orchestrator._server_barge_loop). A backend with no server-side VAD returns 0 (the
+        default) and so never self-barges. This is the model-agnostic barge boundary -- the core
+        never names a specific API."""
+        return 0
 
     def start_session(self, timeout=15.0):
         """Begin a NEW conversation session (e.g. open the AI WebSocket) and block until
@@ -58,11 +70,6 @@ class VoiceBackend:
     def wait_ready(self, timeout=15.0):
         """Block until ready. Deprecated alias kept for callers; prefer start_session().
         Default: ready immediately."""
-        return
-
-    def end_turn(self):
-        """Signal end-of-user-turn explicitly (push-to-talk). Backends with their own
-        server-side turn detection (VAD) can ignore this. Default: no-op."""
         return
 
     def reset(self):
