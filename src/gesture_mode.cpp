@@ -243,18 +243,22 @@ static void ear_gate_update(pose_id_t best)
         return;
     }
 
-    /* Otherwise exit only when the pose has been gone AND neither party is
-     * talking. Continuity holds the session through a comfortable lean (pose out
-     * of the cone) when EITHER the user keeps speaking at the near-field level
-     * (dictation) OR the AI is currently speaking to them (audio_out_active --
-     * listening to a reply). The user half is self-limiting (lowering the arm
-     * makes their voice far-field/quiet); the playback half is bounded by the AI
-     * turn ending plus the session-silence timeout above, so a forgotten hold
-     * still releases. Without the playback term, leaning while LISTENING (the
-     * user isn't talking, so the voice term is false) dropped the session. */
+    /* Otherwise exit only when the pose has been gone AND nothing is keeping the
+     * session alive. Continuity holds through a comfortable lean (pose out of the
+     * cone) in two SYMMETRIC ways, each self-limiting on lowering the arm:
+     *   - DICTATION: the user keeps speaking AT the near-field level. Lowering the
+     *     arm makes their voice far-field/quiet -> term goes false -> release.
+     *   - LISTENING: the AI is speaking (audio_out_active) AND the wrist is still
+     *     raised (orientation UP_RAISED). Lowering the arm drops orientation to
+     *     NEUTRAL -> term goes false -> release. The UP_RAISED gate is the
+     *     playback-side equivalent of "voice still near-field": it makes lowering
+     *     end a listening session exactly like it ends a dictation one (instead of
+     *     holding until the reply happens to finish). A forgotten hold also still
+     *     releases via the session-silence timeout above. */
+    bool listening_lean = audio_out_active() && (orientation_current == WRIST_UP_RAISED);
     if (!pose_stale) {
         ear_voice_holding = false;          /* pose back inside the cone */
-    } else if (mic_vad_voice_active() || audio_out_active()) {
+    } else if (mic_vad_voice_active() || listening_lean) {
         if (!ear_voice_holding) {
             ear_voice_holding = true;
             LOG_INF("POSE_EAR out of cone but voice/playback continues -> holding (lean)");
