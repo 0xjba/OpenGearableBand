@@ -109,6 +109,19 @@ repositioning the speaker.**
   (loud noise crossing the gate); rain w/ loud passages = 6/7 (nonlinear echo); **repositioned = 0.**
 - Stutter (separate audio-quality issue): fixed via thread priorities (LC3 encode/decode prio 7→8,
   below the I2S feeder) + `CONFIG_TIMESLICING`. A few residual underruns under peak load remain.
+- 🌀 **Fan / ambient noise is a NON-issue (2026-07-01 A/B).** Fan-ON gave **0** self-barges despite a
+  *higher* mic floor + more clamps; fan-OFF (with the intermittent volume boost) gave 5. The backend's
+  speech-VAD ignores broadband noise — only *speech* (incl. the AI's own residual) fires it. So the
+  earlier "traffic 1/2" was the boost, not the noise per se.
+- 🎚️ **Self-barges = AI residual during the volume boost** (nonlinear echo). Mechanism (confirmed by
+  the clamp logs): boost → DTLN diverges → clamp caps `clean` to *mic*, but mic is loud (>0.008) → the
+  clamped value still crosses the forward gate → opens the 0.5 s hangover → forwards the AI's own
+  residual → VAD fires. The latch A/B was confounded by this the whole time.
+- ✅ **Fix added (host, 2026-07-01): don't open the forward hangover on a `diverged` (clamp-fired)
+  block.** A diverged block is uncancelled echo, not a barge; a real barge has clean<mic (not diverged)
+  so it still gets through. Catches the `clean>mic` boost (what we observed, ratio 1.04–1.80); a
+  `clean≈mic` boost could still slip → root fix remains HW (5V amp + decoupling). Permanent correctness
+  improvement (divergence ≠ barge), survives to production; also de-confounds dev-rig barge testing.
 
 ### Wearable acoustic design (researched — our geometry matches the leaders)
 - Smart speakers separate mic↔speaker by **10–15 cm**; a wrist device can't, so it trades distance

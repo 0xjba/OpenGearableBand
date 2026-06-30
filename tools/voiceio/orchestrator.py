@@ -303,7 +303,8 @@ class Orchestrator:
                 # different samples due to the carry, so the block-RMS is mis-windowed and let a few
                 # marginal clean>mic blocks slip the clamp).
                 mic_chunk_rms = float(np.sqrt(np.mean(mic_chunk ** 2) + 1e-12))
-                if self._clean_rms > mic_chunk_rms and mic_chunk_rms > 1e-6:
+                diverged = self._clean_rms > mic_chunk_rms and mic_chunk_rms > 1e-6
+                if diverged:
                     over = self._clean_rms / mic_chunk_rms
                     clean = clean * (mic_chunk_rms / self._clean_rms)
                     self._clean_rms = mic_chunk_rms
@@ -326,20 +327,20 @@ class Orchestrator:
                             self._aec_converged = True
                     else:
                         self._conv_blocks = 0
-                # Absolute amplitude gate: forward to the backend ONLY when the cleaned mic is loud
-                # enough to be the USER (not the <=0.0023 residual), with a short hangover to bridge
-                # the gaps in a real sentence. This keeps the residual (which Gemini's speech-VAD would
-                # otherwise self-barge on) from ever reaching it; a real barge (~0.02+) sails through.
-                # [LATCH-REMOVAL TEST 2026-07-01] Dropped the `self._aec_converged` requirement from
-                # BOTH the hangover trigger and the forward decision -- testing whether the convergence
-                # latch is still needed after the speaker reposition (weak, linear echo) or whether the
-                # 0.008 amplitude gate alone now suffices. The latch above still computes _aec_converged
-                # (shown as conv= in [stat]) for observability. REVERT both `and self._aec_converged`
-                # clauses if a reply-1-onset self-barge returns.
-                if self._clean_rms > BARGE_ABS_THRESH:
+                # FORWARD gate: open the hangover (forward the cleaned mic to the backend VAD) ONLY when
+                # the block is (a) past convergence (conv=1, latch), (b) loud enough to be the USER
+                # (clean > 0.008, not the quiet residual), and (c) the AEC was actually CANCELLING it
+                # (not `diverged`). (c) is the key fix: a diverged block (clamp fired, clean>mic) is
+                # uncancelled echo, NOT a barge -- opening the hangover on it forwarded the AI's own
+                # residual and self-barged. That was the volume-boost path (boost -> divergence ->
+                # clamp-to-loud-mic still >0.008 -> hangover -> VAD fires; fan-OFF A/B 2026-07-01). A real
+                # barge has clean<mic (cancelling, not diverged), so it still opens the hangover.
+                # [Boost root fix is HW (5V amp + decoupling). Fan/ambient is a NON-issue -- the backend's
+                # speech-VAD ignores broadband noise. See docs/PROJECT-LOG.md.]
+                if self._aec_converged and self._clean_rms > BARGE_ABS_THRESH and not diverged:
                     self._fwd_hangover = BARGE_HANGOVER_BLOCKS
                 forward = (self.delay_est.locked and not self._calibrating
-                           and self._fwd_hangover > 0)
+                           and self._aec_converged and self._fwd_hangover > 0)
                 if self._fwd_hangover > 0:
                     self._fwd_hangover -= 1
                 self._forward(clean if forward
