@@ -167,6 +167,11 @@ repositioning the speaker.**
 - **Intended-pose cupping test** (palm over ear, speaker into palm, mic facing mouth) — can't be done
   on the current non-wearable prototype; it's a product-stage milestone.
 - Scope the 5V rail under load; compare ERLE vs the dev board.
+- **Re-evaluate the AEC convergence latch** (the `AEC_CONV_*` gate that blocks forwarding until the AEC
+  proves it's cancelling). Its necessity is **UNPROVEN** — every removal A/B on the dev rig was
+  confounded by the intermittent volume boost, so we kept it conservatively. Once the boost is gone
+  (5V amp + decoupling), re-run the removal A/B on clean hardware: if reply-1 onset stays clean without
+  it, drop the latch + its 4 `[USER]` constants (simplification). Do NOT remove before that clean re-test.
 
 ### Other deferred
 - HR: commercial-grade auto-workout detection (activity recognition + sustained HR elevation).
