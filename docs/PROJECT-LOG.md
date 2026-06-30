@@ -117,11 +117,15 @@ repositioning the speaker.**
   the clamp logs): boost → DTLN diverges → clamp caps `clean` to *mic*, but mic is loud (>0.008) → the
   clamped value still crosses the forward gate → opens the 0.5 s hangover → forwards the AI's own
   residual → VAD fires. The latch A/B was confounded by this the whole time.
-- ✅ **Fix added (host, 2026-07-01): don't open the forward hangover on a `diverged` (clamp-fired)
-  block.** A diverged block is uncancelled echo, not a barge; a real barge has clean<mic (not diverged)
-  so it still gets through. Catches the `clean>mic` boost (what we observed, ratio 1.04–1.80); a
-  `clean≈mic` boost could still slip → root fix remains HW (5V amp + decoupling). Permanent correctness
-  improvement (divergence ≠ barge), survives to production; also de-confounds dev-rig barge testing.
+- ❌ **TRIED & REVERTED (host, 2026-07-01): don't open the forward hangover on a `diverged` (clamp-fired)
+  block.** Premise was "clean>mic = AI residual, never a real barge." **FALSE — it MISSED REAL BARGES.**
+  During a real barge (double-talk) DTLN *also* diverges (clean>mic), so the clamp fired on the user's
+  own voice and the gate dropped the barge (divfix1/2: 89–134 clamps incl. mic up to 0.039–0.047, very
+  few barges through). So `clean>mic` is **NOT** unambiguous — it's *both* AI-residual boost *and* user
+  double-talk, the **same energy ceiling** as `clean≈mic`. **Lesson: no energy/AEC-state signal separates
+  self-barge from real barge** (clamp ratio, clean/mic, ERLE all fail). Only HW (5V amp + decoupling, stop
+  the boost) or identity (Personal VAD, who's speaking) can. The clamp itself (amplitude cap) is kept;
+  only the forward-gate coupling was reverted.
 
 ### Wearable acoustic design (researched — our geometry matches the leaders)
 - Smart speakers separate mic↔speaker by **10–15 cm**; a wrist device can't, so it trades distance

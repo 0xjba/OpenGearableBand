@@ -303,8 +303,7 @@ class Orchestrator:
                 # different samples due to the carry, so the block-RMS is mis-windowed and let a few
                 # marginal clean>mic blocks slip the clamp).
                 mic_chunk_rms = float(np.sqrt(np.mean(mic_chunk ** 2) + 1e-12))
-                diverged = self._clean_rms > mic_chunk_rms and mic_chunk_rms > 1e-6
-                if diverged:
+                if self._clean_rms > mic_chunk_rms and mic_chunk_rms > 1e-6:
                     over = self._clean_rms / mic_chunk_rms
                     clean = clean * (mic_chunk_rms / self._clean_rms)
                     self._clean_rms = mic_chunk_rms
@@ -327,17 +326,16 @@ class Orchestrator:
                             self._aec_converged = True
                     else:
                         self._conv_blocks = 0
-                # FORWARD gate: open the hangover (forward the cleaned mic to the backend VAD) ONLY when
-                # the block is (a) past convergence (conv=1, latch), (b) loud enough to be the USER
-                # (clean > 0.008, not the quiet residual), and (c) the AEC was actually CANCELLING it
-                # (not `diverged`). (c) is the key fix: a diverged block (clamp fired, clean>mic) is
-                # uncancelled echo, NOT a barge -- opening the hangover on it forwarded the AI's own
-                # residual and self-barged. That was the volume-boost path (boost -> divergence ->
-                # clamp-to-loud-mic still >0.008 -> hangover -> VAD fires; fan-OFF A/B 2026-07-01). A real
-                # barge has clean<mic (cancelling, not diverged), so it still opens the hangover.
-                # [Boost root fix is HW (5V amp + decoupling). Fan/ambient is a NON-issue -- the backend's
-                # speech-VAD ignores broadband noise. See docs/PROJECT-LOG.md.]
-                if self._aec_converged and self._clean_rms > BARGE_ABS_THRESH and not diverged:
+                # FORWARD gate: open the hangover (forward the cleaned mic to the backend VAD) when the
+                # block is past convergence (conv=1, latch) and loud enough to be the USER (clean>0.008).
+                # [TRIED also gating on `not diverged` (clamp-fired) to kill the volume-boost self-barge
+                # (b4864e6) -> REVERTED 2026-07-01: it MISSED REAL BARGES. During a real barge (double-
+                # talk) DTLN *also* diverges (clean>mic), so the clamp fired on the USER's own voice and
+                # the gate dropped the barge (divfix1: 134 clamps incl. mic up to 0.039, only 2 barges
+                # through). So clean>mic is NOT unambiguous -- it's BOTH AI-residual boost AND user
+                # double-talk, the same energy ceiling as clean~=mic. The boost-self-barge stays a HW
+                # problem (5V amp + decoupling) or an identity problem (Personal VAD), NOT an energy gate.]
+                if self._aec_converged and self._clean_rms > BARGE_ABS_THRESH:
                     self._fwd_hangover = BARGE_HANGOVER_BLOCKS
                 forward = (self.delay_est.locked and not self._calibrating
                            and self._aec_converged and self._fwd_hangover > 0)
