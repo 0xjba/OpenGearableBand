@@ -87,6 +87,17 @@ class GeminiLiveBackend(VoiceBackend):
         self._config = {"response_modalities": ["AUDIO"]}
         if system_instruction:
             self._config["system_instruction"] = system_instruction
+        # Detune the server VAD. HW log 2026-07-01 showed Gemini firing `interrupted` (self-barge) on
+        # NEAR-SILENT post-AEC input (clean_rms 0.0001-0.0019, ~-70 dBFS) -- its default sensitivity is
+        # too hot for our unusually-quiet, AEC-cleaned stream. START_SENSITIVITY_LOW makes it require
+        # real, sustained, louder speech before declaring a user interruption, so the ultra-quiet
+        # residual can't trip it while a genuine barge (~0.02-0.09) still does. END_SENSITIVITY_LOW
+        # likewise tolerates natural pauses. [USER/HOUSING: re-tune per host + production speaker/coupling.]
+        self._config["realtime_input_config"] = types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+            ))
 
         # Per-session plumbing -- (re)created by start_session(). The WebSocket is opened
         # per CONVERSATION (arm raised -> start_session, arm lowered -> end_session), NOT in

@@ -16,7 +16,12 @@ LOG_MODULE_REGISTER(audio_downlink, LOG_LEVEL_INF);
 #define DL_RATE_HZ      16000                       /* [UNIT] matches LC3 16 kHz */
 #define DL_MAX_PAYLOAD  240                         /* [STRUCTURAL] up to 6 x 40 B frames per write */
 #define DL_MSGQ_DEPTH   16                          /* [STRUCTURAL] downlink jitter queue */
-#define DL_THREAD_PRIO  7                           /* [STRUCTURAL] decode thread priority (uplink-audio tier) */
+#define DL_THREAD_PRIO  8                           /* [STRUCTURAL] SOFT codec: BELOW the I2S feeder (7) and
+                                                     * PDM capture (6). At 7 (equal to the feeder) a host
+                                                     * burst made this thread decode a 16-item backlog without
+                                                     * blocking, starving the hard-real-time feeder past its
+                                                     * 64 ms DMA window -> I2S underrun -> session death.
+                                                     * (2026-06-30 full-duplex stutter fix.) */
 #define DL_PREBUF_MS    140                         /* [STRUCTURAL] downlink jitter buffer = host control setpoint (HW-tuned) */
 #define DL_STATUS_PERIOD_MS 100                     /* [STRUCTURAL] buffer-feedback cadence */
 /* [STRUCTURAL] decode thread stack. liblc3's lc3_decode is stack-hungry (MDCT +

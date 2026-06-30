@@ -39,13 +39,43 @@ from voiceio.codec import Lc3Codec
 from voiceio.delay_estimator import DelayEstimator
 
 SR = 16000
-# [USER] Reply-onset gate: for the first second of each reply the AEC alignment is still
-# (re)converging, so `clean` still carries un-cancelled echo. During this window we do NOT forward
-# the cleaned mic to the backend (we send silence), so that un-cancelled onset echo cannot trip the
-# backend's VAD into a self-interruption. After it, the residual is low (HW-measured clean
-# ~0.0000-0.001) and the cleaned mic is forwarded so the backend's VAD can hear a real barge-in.
-BARGE_ONSET_GRACE_S = 1.0
-CAL_SECONDS = 0.8             # length of the startup calibration chirp
+# [USER/HOUSING] AEC-convergence FORWARDING gate (2026-07-01, HW-measured). We forward the cleaned mic
+# to the backend only AFTER the AEC has DEMONSTRABLY cancelled this reply: clean_rms * AEC_CONV_RATIO <
+# mic_rms (~14 dB ERLE) with real echo present, for AEC_CONV_BLOCKS consecutive blocks. Before that, at
+# each reply's onset the alignment is still (re)acquiring and `clean` carries un-cancelled echo (the AI's
+# OWN voice); forwarding it tripped the backend's VAD into a SELF-barge -- which flushed + reset the
+# alignment, so the next reply's onset was un-cancelled again => a self-perpetuating barge loop. HW data:
+# every self-barge fired in the first ~1-2 s with clean ~= mic (ratio 1-3x); the converged remainder
+# (clean ~0.0001 = 20-200x below mic) NEVER barged. Latched per reply: once converged we forward
+# everything (so a real LOUD barge still gets through); re-proven each reply (reset in the not-playing
+# branch). Replaces the old fixed 1 s onset timer, which keyed off `locked` -- true even on a garbage lock.
+AEC_CONV_RATIO    = 5.0     # clean must be < mic / this (~14 dB ERLE) to count as "cancelling"
+AEC_CONV_MIN_MIC  = 0.003   # only judge convergence when there's real echo present to cancel
+AEC_CONV_BLOCKS   = 3       # consecutive cancelling blocks before we start forwarding. (Briefly tried
+                            # 2 on 2026-07-01 to shorten the first-reply onset hold, but it REGRESSED:
+                            # latching "converged" after only 2 blocks flips the gate on earlier, so
+                            # more of each reply is exposed to LATER AEC divergence that then gets
+                            # forwarded -> self-barge. Dump analysis showed ~32 divergence-forward
+                            # events. Reverted to 3. The real fix is a divergence-aware forward gate,
+                            # not a shorter convergence proof -- see the latch vulnerability below.)
+# Absolute inaudibility floor (2026-07-01): the ratio gate alone opened while clean was still ~0.002 --
+# faint but COHERENT residual AI speech the user could hear AND the backend's speech-VAD self-barged on
+# (a speech detector fires on low-level coherent speech, not just loud energy). So also require clean to
+# be genuinely INAUDIBLE before forwarding. HW: audible self-barges sat at clean 0.0011-0.0019; truly
+# silent stretches 0.0001-0.0002 -- so 0.0005 sits between, and the AEC's steady state clears it. [USER]
+AEC_CONV_MAX_CLEAN = 0.0005
+# [USER/HOUSING] Absolute barge amplitude gate (2026-07-01, HW-measured, DECISIVE). Even after the
+# convergence gate, the residual intermittently SPIKES to ~0.0018-0.0023 (coherent AI speech, on
+# alignment drift) -- and Gemini's server VAD, being a SPEECH detector, fires on that coherent speech.
+# But the residual (incl. spikes) tops out ~0.0023 while a real barge (voice at the ear) is ~0.02-0.09
+# -- a ~10x gap. So we stop feeding Gemini's VAD the residual: forward the cleaned mic ONLY when it's
+# loud enough to be the user (clean_rms > this), which sits cleanly in the gap (rejects all residual,
+# passes a real barge). A short hangover keeps forwarding through the natural gaps in your sentence so
+# the whole utterance reaches the model once you do barge. [USER: re-tune per host gain / how loud the
+# user talks / production speaker coupling -- the gap may shift.]
+BARGE_ABS_THRESH = 0.008       # clean_rms above this = real user (not residual) -> forward to backend
+BARGE_HANGOVER_BLOCKS = 25     # ~0.5 s: keep forwarding after a loud block, to bridge word gaps
+CAL_SECONDS = 0.8          # length of the startup calibration chirp
 SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the conversation
 HIST_SAMPLES = SR // 2        # 0.5 s mic window fed to the delay estimator
 EST_EVERY_BLOCKS = 12         # refine the alignment ~every 240 ms while the AI plays
@@ -101,7 +131,7 @@ class Orchestrator:
     """Full-duplex real-time voice loop over a BleLink + a VoiceBackend."""
 
     def __init__(self, ble_link, backend, model_dir, lib_path="tools/lib/liblc3.dylib",
-                 calibrate_on_start=True):
+                 calibrate_on_start=True, dump_path=None):
         """
         Args:
             ble_link: a connected BleLink (call .connect() first).
@@ -132,7 +162,9 @@ class Orchestrator:
         self._last_mic_ts = 0
         self._dl_origin_mic = None     # coarse seed: mic ts32 when this response started playing
         self._playing = False          # is the AI currently being streamed out?
-        self._play_started_ts = None   # mic ts32 when the CURRENT reply's playback began (onset grace)
+        self._aec_converged = False    # has the AEC proven it's cancelling THIS reply? (forward gate)
+        self._conv_blocks = 0          # consecutive cancelling blocks toward AEC_CONV_BLOCKS
+        self._fwd_hangover = 0         # blocks left to keep forwarding after a loud (user) block
         self._dl_residual = np.zeros(0, dtype=np.float32)  # sub-block carry for encoding
         self._mic_hist = np.zeros(0, dtype=np.float32)     # recent mic for the delay estimator
         self._mic_hist_start = 0       # abs mic index of _mic_hist[0]
@@ -156,6 +188,12 @@ class Orchestrator:
         self._n_onsets = 0             # barge-ins handled (backend-VAD interrupts mirrored locally)
         self._mic_rms = 0.0            # last raw mic level
         self._clean_rms = 0.0          # last echo-cancelled level
+        # Debug (--dump-clean): record the EXACT signal forwarded to the backend (the "cleaned" mic
+        # Gemini's VAD judges) and the raw mic, to two WAVs, so residual echo can be heard directly.
+        self._dump_path = dump_path
+        self._dump_fed = [] if dump_path else None
+        self._dump_mic = [] if dump_path else None
+        self._dump_aec = [] if dump_path else None   # un-gated AEC `clean` output (during playback)
 
     # --- uplink: light callback (decode + enqueue only) ---
 
@@ -174,6 +212,13 @@ class Orchestrator:
             chunks.append(pcm16.astype(np.float32) / 32768.0)
         return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
 
+    def _forward(self, pcm):
+        """Feed the backend the user-side audio, and (debug) record exactly what we forwarded
+        so it can be played back to check for residual echo (what Gemini's VAD actually judges)."""
+        self.backend.feed_mic(pcm)
+        if self._dump_fed is not None:
+            self._dump_fed.append(np.asarray(pcm, dtype=np.float32).copy())
+
     # --- DSP task: sequential AEC, then forward the cleaned mic to the backend ---
 
     async def _dsp_loop(self):
@@ -187,6 +232,8 @@ class Orchestrator:
                     continue
                 n = len(mic)
                 self._mic_rms = float(np.sqrt(np.mean(mic ** 2) + 1e-12))
+                if self._dump_mic is not None:
+                    self._dump_mic.append(np.asarray(mic, dtype=np.float32).copy())
 
                 if not self._playing:
                     # AI silent -> no echo to cancel. Pass the user's mic STRAIGHT to the
@@ -197,13 +244,13 @@ class Orchestrator:
                     self._clean_rms = self._mic_rms
                     self._aec_mic = np.zeros(0, dtype=np.float32)
                     self._aec_ref = np.zeros(0, dtype=np.float32)
-                    self._play_started_ts = None   # next reply re-arms the onset gate
-                    self.backend.feed_mic(mic)
+                    self._aec_converged = False    # next reply must re-prove cancellation
+                    self._conv_blocks = 0
+                    self._fwd_hangover = 0
+                    self._forward(mic)
                     continue
 
                 # --- AI is playing: drift-aligned reference + DTLN echo cancellation ---
-                if self._play_started_ts is None:
-                    self._play_started_ts = mic_ts   # first block of this reply -> start grace clock
                 played = self.ble.played_reference()
                 self._push_mic_hist(mic_ts, mic)
                 # Refine the alignment online (~every 240 ms) -- no hardcoded constant.
@@ -242,16 +289,61 @@ class Orchestrator:
                 if len(clean) == 0:
                     continue
                 self._clean_rms = float(np.sqrt(np.mean(clean ** 2) + 1e-12))
-                # Once the alignment is locked and we're past the per-reply onset gate, FORWARD the
-                # cleaned mic so the backend's own VAD can hear the user talk over the AI and fire its
-                # interrupt (-> _server_barge_loop cleanup). During the onset gate (or before lock /
-                # during calibration) the residual is still un-cancelled echo, so we send silence
-                # instead -- forwarding it would self-interrupt the backend's VAD.
-                in_onset_gate = (self._play_started_ts is not None and
-                                 (mic_ts - self._play_started_ts) < BARGE_ONSET_GRACE_S * SR)
-                forward = (self.delay_est.locked and not self._calibrating and not in_onset_gate)
-                self.backend.feed_mic(clean if forward
-                                      else np.zeros(len(clean), dtype=np.float32))
+                # AEC INSTABILITY CLAMP (2026-07-01): a canceller can only REMOVE echo, never ADD
+                # energy -- clean <= mic is a structural property of echo cancellation. But DTLN
+                # occasionally goes unstable and emits MORE energy than its mic input (HW-measured
+                # ratio up to 2.4x: clean 0.032 from mic 0.013). That hallucinated output is pure
+                # divergence -- if forwarded it self-barges. Proven NOT caused by playback underruns
+                # (0/201 divergence blocks coincided with a device UNDERRUN, buffer healthy), so it's
+                # internal to the model. A genuine near-end barge is always <= mic (the user's voice
+                # IS in the mic), so scaling clean down to mic level can only ever cancel divergence,
+                # never attenuate a real barge. [STRUCTURAL: holds for any AEC, not a tuned constant.]
+                # Compare against the SAME chunk's mic level (not self._mic_rms, the raw 320-sample
+                # block -- `clean` is the AEC output of `mic_chunk`, a 128-multiple that spans
+                # different samples due to the carry, so the block-RMS is mis-windowed and let a few
+                # marginal clean>mic blocks slip the clamp).
+                mic_chunk_rms = float(np.sqrt(np.mean(mic_chunk ** 2) + 1e-12))
+                if self._clean_rms > mic_chunk_rms and mic_chunk_rms > 1e-6:
+                    over = self._clean_rms / mic_chunk_rms
+                    clean = clean * (mic_chunk_rms / self._clean_rms)
+                    self._clean_rms = mic_chunk_rms
+                    if mic_chunk_rms > BARGE_ABS_THRESH:   # only log audible instability events
+                        print(f"[aec-clamp] DTLN divergence caught: {over:.2f}x over mic "
+                              f"-> clamped to mic={mic_chunk_rms:.4f}")
+                if self._dump_aec is not None:
+                    self._dump_aec.append(np.asarray(clean, dtype=np.float32).copy())
+                # AEC-convergence FORWARDING gate: prove the AEC is cancelling THIS reply (clean well
+                # below mic, real echo present, for a few blocks) BEFORE we forward the cleaned mic to
+                # the backend's VAD -- otherwise the un-cancelled onset echo (the AI's own voice) self-
+                # barges it. Latch once converged so a real LOUD barge (clean spikes with the user's
+                # voice) still gets forwarded; the latch is reset per reply in the not-playing branch.
+                if not self._aec_converged and not self._calibrating:
+                    if (self._mic_rms > AEC_CONV_MIN_MIC and
+                            self._clean_rms * AEC_CONV_RATIO < self._mic_rms and
+                            self._clean_rms < AEC_CONV_MAX_CLEAN):
+                        self._conv_blocks += 1
+                        if self._conv_blocks >= AEC_CONV_BLOCKS:
+                            self._aec_converged = True
+                    else:
+                        self._conv_blocks = 0
+                # Absolute amplitude gate: forward to the backend ONLY when the cleaned mic is loud
+                # enough to be the USER (not the <=0.0023 residual), with a short hangover to bridge
+                # the gaps in a real sentence. This keeps the residual (which Gemini's speech-VAD would
+                # otherwise self-barge on) from ever reaching it; a real barge (~0.02+) sails through.
+                # [LATCH-REMOVAL TEST 2026-07-01] Dropped the `self._aec_converged` requirement from
+                # BOTH the hangover trigger and the forward decision -- testing whether the convergence
+                # latch is still needed after the speaker reposition (weak, linear echo) or whether the
+                # 0.008 amplitude gate alone now suffices. The latch above still computes _aec_converged
+                # (shown as conv= in [stat]) for observability. REVERT both `and self._aec_converged`
+                # clauses if a reply-1-onset self-barge returns.
+                if self._clean_rms > BARGE_ABS_THRESH:
+                    self._fwd_hangover = BARGE_HANGOVER_BLOCKS
+                forward = (self.delay_est.locked and not self._calibrating
+                           and self._fwd_hangover > 0)
+                if self._fwd_hangover > 0:
+                    self._fwd_hangover -= 1
+                self._forward(clean if forward
+                              else np.zeros(len(clean), dtype=np.float32))
             except Exception:  # surface a crash instead of silently killing the task
                 print("[orch] DSP loop error:\n" + traceback.format_exc())
 
@@ -287,9 +379,14 @@ class Orchestrator:
         # Clear the per-turn origin: the downlink loop re-arms _playing only when _dl_origin_mic is
         # None (a fresh response). Leaving it set keeps _playing False on every later reply -> no AEC.
         self._dl_origin_mic = None
-        # The flush is a playout discontinuity and barge double-talk can corrupt the alignment, so
-        # re-acquire cleanly on the next reply rather than carry a bad lock.
-        self.delay_est.reset()
+        # AEC-DIVERGENCE FIX (2026-07-01): do NOT reset the delay estimator here. The physical loop
+        # delay (speaker->air->mic + BLE/buffers) is HARDWARE-STABLE across replies, so the converged
+        # lock should PERSIST. Resetting forced a full re-acquisition whose first lock is un-clamped and,
+        # in the post-barge double-talk/discontinuity, grabbed a SPURIOUS peak -> mis-aligned AEC ->
+        # residual SPIKE -> self-barge -> reset -> repeat (the vicious cycle behind the res -12000ms
+        # blow-ups). Keeping the lock lets the hysteresis clamp hold it steady; only the per-turn DSP
+        # carry/history is cleared (a playout discontinuity, not a delay change). delay_est is still
+        # reset between CONVERSATIONS in _reset_session_state.
         self._reset_mic_hist()
 
     async def _server_barge_loop(self):
@@ -373,20 +470,24 @@ class Orchestrator:
         prev_up = 0
         while not self._stop.is_set():
             await asyncio.sleep(1.0)
-            if self.delay_est.locked:
-                res = self.delay_est.residual_ms
-                d_str = f"locked(res{res:+.0f}ms,conf{self.delay_est.confidence:.2f})"
-            else:
-                d_str = f"acquiring(conf{self.delay_est.confidence:.2f})"
+            # ERLE (echo-cancellation quality) is the meaningful AEC-health metric: how far `clean`
+            # sits below `mic` during playback. The estimator's residual_ms readout was MISLEADING --
+            # it drifts with the playout center after barge-flushes (played_samples counts flushed
+            # audio) even while the AEC cancels fine, so a scary `res -31000 ms` had clean ~0.0002.
+            # We show ERLE here instead and keep residual_ms internal-only. (2026-07-01.)
+            lock = "locked" if self.delay_est.locked else "acquiring"
+            d_str = f"{lock}(conf{self.delay_est.confidence:.2f})"
+            erle_db = (20.0 * np.log10(self._mic_rms / max(self._clean_rms, 1e-6))
+                       if self._playing else 0.0)
             up_rate = self._n_uplink - prev_up
             prev_up = self._n_uplink
-            # mic_rms = raw mic level (is the band hearing anything?); clean_rms = level after AEC.
-            # During AI playback a LOW clean_rms vs mic_rms means the AEC is cancelling well (the
-            # residual the backend VAD must ignore). barge_ins = backend-VAD interrupts handled.
+            # mic_rms = raw mic level; clean_rms = level after AEC; erle = cancellation in dB (higher =
+            # better; >~20 dB during play means the AEC is cancelling well). barge_ins = backend-VAD
+            # interrupts handled. conv = AEC has converged enough this reply to forward the mic.
             print(f"[stat] uplink={self._n_uplink}(+{up_rate}/s) sent={self._n_blocks_sent} "
-                  f"play={int(self._playing)} delay={d_str} "
+                  f"play={int(self._playing)} delay={d_str} erle={erle_db:+.0f}dB "
                   f"mic_rms={self._mic_rms:.4f} clean_rms={self._clean_rms:.4f} "
-                  f"barge_ins={self._n_onsets}")
+                  f"conv={int(self._aec_converged)} barge_ins={self._n_onsets}")
 
     async def _calibrate(self):
         """Acquire the echo alignment at session start so barge-in is armed from the AI's
@@ -457,7 +558,9 @@ class Orchestrator:
     def _reset_session_state(self):
         """Clear all per-conversation DSP/playout state (between conversations)."""
         self._playing = False
-        self._play_started_ts = None
+        self._aec_converged = False
+        self._conv_blocks = 0
+        self._fwd_hangover = 0
         self._dl_origin_mic = None
         self._dl_residual = np.zeros(0, dtype=np.float32)
         self._cal_audio = np.zeros(0, dtype=np.float32)
@@ -485,6 +588,20 @@ class Orchestrator:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self._dump_path and self._dump_fed:
+                import soundfile as sf
+                fed = np.concatenate(self._dump_fed)
+                mic = np.concatenate(self._dump_mic) if self._dump_mic else np.zeros(0, np.float32)
+                base = self._dump_path.rsplit(".", 1)[0]
+                mic_path, aec_path = base + ".mic.wav", base + ".aec.wav"
+                sf.write(self._dump_path, fed, SR)
+                sf.write(mic_path, mic, SR)
+                msg = (f"[dump] forwarded ({len(fed)/SR:.1f}s) -> {self._dump_path}; "
+                       f"raw mic -> {mic_path}")
+                if self._dump_aec:
+                    sf.write(aec_path, np.concatenate(self._dump_aec), SR)
+                    msg += f"; UN-GATED AEC clean ({len(np.concatenate(self._dump_aec))/SR:.1f}s) -> {aec_path}"
+                print(msg)
 
     def stop(self):
         self._stop.set()

@@ -43,11 +43,13 @@ static atomic_t active = ATOMIC_INIT(0);
 static uint32_t session_rate = 16000;
 static uint32_t session_prebuf_bytes = RING_BYTES / 2;   /* set per session by audio_out_start */
 static int16_t  mono_scratch[FRAMES_PER_BLOCK];
-/* [USER] playback volume 0-100%. Dev default 75%: on the bare XIAO 3V3 rail (no
- * bulk cap), full-volume peaks sag the rail and crackle; 75% is clean for dev.
- * PRODUCTION: with a proper amp supply (boost/dedicated rail + decoupling) set
- * this to 100. See docs/research/2026-06-20-audio-storage-ble-architecture-review.md. */
-static uint8_t  volume_pct = 75;
+/* [USER] playback volume 0-100%. Dev default 70% (2026-07-01): on the bare XIAO 3V3 rail
+ * (no bulk cap), full-volume peaks sag the rail and crackle -- AND the rail-sag distortion
+ * is a NONLINEAR echo the AEC can't model, which worsens the residual that drives barge-in
+ * self-interruption; 70% keeps the echo cleaner/more-cancellable. PRODUCTION: with a proper
+ * amp supply (boost/dedicated rail + decoupling) this can rise. See
+ * docs/research/2026-06-20-audio-storage-ble-architecture-review.md + docs/product-stage-audio-hardware.md. */
+static uint8_t  volume_pct = 70;
 
 /* --- DIAGNOSTIC: per-session glitch counters, logged at session end. --- */
 static uint32_t dbg_blocks;

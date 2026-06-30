@@ -614,7 +614,7 @@ static void uart_rx_cb(const struct device *dev, void *user_data) {
             // Toggle the chip tap engine + tap-event logging (speaker-vs-tap test).
             pending_cmd = 'k';
         } else if (c >= '0' && c <= '9') {
-            // Speaker volume: '0'..'9' -> 0%..90% (boot default 100%).
+            // Speaker volume: '0'..'9' -> 0%..90% (boot default 70%).
             pending_cmd = c;
         }
         // Other chars are intentionally ignored -- silently dropping
@@ -651,7 +651,7 @@ void reset_thread_entry(void *, void *, void *) {
     LOG_INF("  'u'=clear ALL BLE bonds (then Forget on host + re-pair)");
     LOG_INF("  'm'=toggle PDM mic bench probe ([MIC] rms/veM/frac log; off for gate test)");
     LOG_INF("  'k'=toggle chip tap engine + tap-event log (test speaker-vs-tap false trigger)");
-    LOG_INF("  '0'-'9'=speaker volume 0-90%% (boot default 100%%)");
+    LOG_INF("  '0'-'9'=speaker volume 0-90%% (boot default 70%%)");
 
     while (1) {
         uint8_t cmd = pending_cmd;

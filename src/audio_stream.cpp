@@ -138,8 +138,12 @@ static void audio_thread(void *, void *, void *)
 	}
 }
 
-/* Priority 7: strictly below the mic capture thread (6) so the encode/notify
- * work can never delay the slab drain that keeps the PDM DMA alive.
+/* Priority 8: SOFT codec work, strictly BELOW the PDM capture thread (6) AND the
+ * I2S feeder (7). Both of those are hard-real-time -- capture fail-stops on slab
+ * starvation, the feeder DMA-underruns (which KILLS the I2S session) -- whereas this
+ * encode/notify is buffered (msgq + drop-on-full) and must yield to them. At 7 (equal
+ * to the feeder) a burst starved this thread for 234 ms and the feeder past its 64 ms
+ * window -> I2S session death + dropped mic blocks. (2026-06-30 full-duplex stutter fix.)
  * Stack 6144: measured high-water during LC3 encode+notify was 3520 B
  * (2026-06-18 thread-analyzer bring-up); 6144 leaves comfortable FPU margin. */
-K_THREAD_DEFINE(audio_thread_id, 6144, audio_thread, NULL, NULL, NULL, 7, 0, 0);
+K_THREAD_DEFINE(audio_thread_id, 6144, audio_thread, NULL, NULL, NULL, 8, 0, 0);

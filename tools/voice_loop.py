@@ -85,6 +85,10 @@ async def main():
                         "Eleven. Twelve. Thirteen. Fourteen. Fifteen. Sixteen. Seventeen. "
                         "Eighteen. Nineteen. Twenty. That is the end of my counting."),
                     help="loopback: text to synthesize if --canned is not given")
+    ap.add_argument("--dump-clean", default=None,
+                    help="debug: write the cleaned mic forwarded to the backend (what the AI's VAD "
+                         "hears) to this WAV, + the raw mic to <name>.mic.wav, so you can listen for "
+                         "residual echo. e.g. --dump-clean /tmp/clean.wav")
     ap.add_argument("--model-dir", default=DEFAULT_MODEL, help="DTLN model path prefix")
     ap.add_argument("--lib", default=DEFAULT_LIB, help="liblc3 shared lib")
     ap.add_argument("--address", default=None, help="connect directly to this BLE address")
@@ -100,7 +104,8 @@ async def main():
     # --- BLE + orchestrator (backend-agnostic) ---
     ble = BleLink(address=args.address)
     await ble.connect()
-    orch = Orchestrator(ble, backend, model_dir=args.model_dir, lib_path=args.lib)
+    orch = Orchestrator(ble, backend, model_dir=args.model_dir, lib_path=args.lib,
+                        dump_path=args.dump_clean)
 
     run_task = asyncio.create_task(orch.run())
     print("[voice_loop] running. Raise to ear + speak (force mic with serial 'j'). Ctrl-C to stop.")
