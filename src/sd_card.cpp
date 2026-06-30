@@ -5,8 +5,7 @@
  * production listen path is BLE from the phone, NOT SD playback. For now this
  * module only mounts the FAT volume so the recording path can be built on top.
  *
- * Mount point "/SD:" (FAT). Proven SD/SPI/FAT recipe borrowed from the standalone
- * spkr_test/ app, which runs on this exact hardware.
+ * Mount point "/SD:" (FAT). SD/SPI/FAT recipe verified on this exact hardware.
  */
 #include "sd_card.h"
 
