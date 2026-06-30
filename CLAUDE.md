@@ -73,7 +73,7 @@ known gotchas). Keep it current when these stable facts change.
     encode+notify starved the PDM slab; see the B spec.)
   - `src/ble_audio.{h,cpp}` — minimal custom 128-bit GATT service, one NOTIFY char,
     own connection tracking + conn-param control. No control/status char.
-  - Borrowed from the prior `oneDiary` project; host test receiver `tools/audio_rx.py`.
+  - Borrowed from the prior `oneDiary` project; host client is `tools/voiceio/` (run via `tools/voice_loop.py`).
 - `src/orientation.{h,cpp}` — Mahony complementary filter → pitch/roll
   (gravity-locked, drift-free), yaw (gyro-only, drifts), `at_rest` (ZUPT),
   gyro-bias (ZARU). Shared IMU foundation for pose detection. (Auto yaw re-zero on

@@ -7,7 +7,7 @@ wire formats below can drive the band — no firmware change required to add a n
 
 Source of truth in firmware: `src/ble_audio.h` (custom audio service), `src/lc3_codec.h`
 (codec framing), `src/main.cpp` (advertising + HRS/BAS). Reference host implementation:
-`tools/voiceio/ble_link.py`, `tools/voiceio/frame.py`, `tools/audio_tx.py`.
+`tools/voiceio/ble_link.py`, `tools/voiceio/frame.py`, `tools/voiceio/clock_recovery.py`.
 
 ---
 
@@ -111,7 +111,7 @@ Each notification is `BLE_AUDIO_STATUS_LEN = 5` bytes:
   (16 kHz mono 16-bit). The host holds `ring_used` near a setpoint (reference: **140 ms**
   = 4480 B) with a slow PI loop that nudges the **send pace** (and, in the AEC client, the
   reference-resample ratio). This absorbs the fixed device/host clock-rate difference and
-  jitter. (Reference: `clock_recovery_step` in `audio_tx.py` / `voiceio/clock_recovery.py`.)
+  jitter. (Reference: `step()` in `voiceio/clock_recovery.py`.)
 - **`flags`** byte bits:
   - `0x01` `ACTIVE` — a playback session is active on the device.
   - `0x02` `OVERFLOW` — the ring overflowed since the last report (host sending too fast).
