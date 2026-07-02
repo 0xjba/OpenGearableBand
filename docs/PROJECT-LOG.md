@@ -126,6 +126,17 @@ repositioning the speaker.**
   self-barge from real barge** (clamp ratio, clean/mic, ERLE all fail). Only HW (5V amp + decoupling, stop
   the boost) or identity (Personal VAD, who's speaking) can. The clamp itself (amplitude cap) is kept;
   only the forward-gate coupling was reverted.
+- ✅ **Constants rework #1 — adaptive floor-relative barge gate (host, 2026-07-02).** Replaced the fixed
+  `BARGE_ABS_THRESH = 0.008` absolute amplitude gate (the "Geigel" method — rig-specific, fragile) with
+  the **MCRA ratio** (Rangachari & Loizou / Cohen): forward when `clean_rms > BARGE_FLOOR_RATIO × ` a
+  continuously-tracked **residual floor** (min-statistics: instant-down, slow-recover-up, frozen while
+  barging). Dimensionless ratio → **level/gain-invariant → portable** across mount/gain/room, no re-tuning.
+  New `[STRUCTURAL]` constants: `BARGE_FLOOR_RATIO=12` (the one live-tune knob), `BARGE_FLOOR_RECOVER=1.003`,
+  `BARGE_FLOOR_MIN=1e-4`. `[stat]` now prints `floor=` for live tuning. **Portability fix only — does NOT
+  cure the volume-boost self-barge (energy ceiling); that stays HW/identity.** Grounded in deep-research
+  wo2yue0su; chosen over coherence/NCC (option B, more canonical but costlier, alignment-sensitive,
+  degrades under nonlinearity, and redundant with Gemini's backend VAD). Validation: live HW.
+  Checkpoint to revert the whole rework: git tag `pre-constants-rework`.
 
 ### Wearable acoustic design (researched — our geometry matches the leaders)
 - Smart speakers separate mic↔speaker by **10–15 cm**; a wrist device can't, so it trades distance

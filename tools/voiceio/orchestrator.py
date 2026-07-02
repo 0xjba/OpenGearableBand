@@ -64,16 +64,25 @@ AEC_CONV_BLOCKS   = 3       # consecutive cancelling blocks before we start forw
 # be genuinely INAUDIBLE before forwarding. HW: audible self-barges sat at clean 0.0011-0.0019; truly
 # silent stretches 0.0001-0.0002 -- so 0.0005 sits between, and the AEC's steady state clears it. [USER]
 AEC_CONV_MAX_CLEAN = 0.0005
-# [USER/HOUSING] Absolute barge amplitude gate (2026-07-01, HW-measured, DECISIVE). Even after the
-# convergence gate, the residual intermittently SPIKES to ~0.0018-0.0023 (coherent AI speech, on
-# alignment drift) -- and Gemini's server VAD, being a SPEECH detector, fires on that coherent speech.
-# But the residual (incl. spikes) tops out ~0.0023 while a real barge (voice at the ear) is ~0.02-0.09
-# -- a ~10x gap. So we stop feeding Gemini's VAD the residual: forward the cleaned mic ONLY when it's
-# loud enough to be the user (clean_rms > this), which sits cleanly in the gap (rejects all residual,
-# passes a real barge). A short hangover keeps forwarding through the natural gaps in your sentence so
-# the whole utterance reaches the model once you do barge. [USER: re-tune per host gain / how loud the
-# user talks / production speaker coupling -- the gap may shift.]
-BARGE_ABS_THRESH = 0.008       # clean_rms above this = real user (not residual) -> forward to backend
+# ADAPTIVE FLOOR-RELATIVE barge gate (2026-07-02) -- replaces the old fixed BARGE_ABS_THRESH = 0.008.
+# That was an ABSOLUTE amplitude gate ("clean_rms > 0.008 == the user"): the textbook Geigel method,
+# hand-tuned for ONE mount / mic-gain / room, and fragile everywhere else. Production systems decide
+# near-end speech RELATIVE to a tracked floor, not against a baked number. We now use the MCRA principle
+# (Rangachari & Loizou 2006 / Cohen): decide "this is the user" when clean_rms rises BARGE_FLOOR_RATIO x
+# above its own CONTINUOUSLY-TRACKED residual floor. The ratio is dimensionless -> level/gain-invariant
+# -> portable across mount/gain/room with no re-tuning. Same minimum-controlled-averaging idea the
+# firmware `mic_vad` already uses for its adaptive noise floor. (The floor tracker lives in the DSP loop.)
+# Grounding: deep-research workflow wo2yue0su. [STRUCTURAL] -- these are dimensionless ratios / time
+# constants, portable; only BARGE_FLOOR_RATIO is a real behavioural knob, tuned LIVE (validation is live).
+# SCOPE: this is a PORTABILITY fix. It does NOT cure the volume-boost self-barge -- loud residual and a
+# real barge both raise the ratio (the proven energy ceiling: no energy signal separates them). That
+# remains a hardware (5V amp + decoupling) / identity (Personal VAD) problem, per docs/PROJECT-LOG.md.
+BARGE_FLOOR_RATIO   = 12.0      # user when clean_rms > this x the tracked residual floor (~+21 dB;
+                               #   sits above residual spikes, below a real barge). Primary live-tune knob.
+BARGE_FLOOR_RECOVER = 1.003     # per-block up-creep of the floor so it recovers when the residual
+                               #   genuinely rises (minimum-statistics slow release); slightly > 1.
+BARGE_FLOOR_MIN     = 1e-4      # floor guard ~ mic self-noise amplitude, so a near-silent residual
+                               #   can't make the ratio hypersensitive (divide-by-near-zero).
 BARGE_HANGOVER_BLOCKS = 25     # ~0.5 s: keep forwarding after a loud block, to bridge word gaps
 CAL_SECONDS = 0.8          # length of the startup calibration chirp
 SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the conversation
@@ -188,6 +197,8 @@ class Orchestrator:
         self._n_onsets = 0             # barge-ins handled (backend-VAD interrupts mirrored locally)
         self._mic_rms = 0.0            # last raw mic level
         self._clean_rms = 0.0          # last echo-cancelled level
+        self._clean_floor = 0.0        # adaptive residual-echo floor (MCRA min-tracker) for the barge
+                                       # gate; 0 = unseeded, self-seeds on the first block, reset per session
         # Debug (--dump-clean): record the EXACT signal forwarded to the backend (the "cleaned" mic
         # Gemini's VAD judges) and the raw mic, to two WAVs, so residual echo can be heard directly.
         self._dump_path = dump_path
@@ -307,7 +318,7 @@ class Orchestrator:
                     over = self._clean_rms / mic_chunk_rms
                     clean = clean * (mic_chunk_rms / self._clean_rms)
                     self._clean_rms = mic_chunk_rms
-                    if mic_chunk_rms > BARGE_ABS_THRESH:   # only log audible instability events
+                    if mic_chunk_rms > 0.005:   # log-verbosity only: skip near-silent clamp events
                         print(f"[aec-clamp] DTLN divergence caught: {over:.2f}x over mic "
                               f"-> clamped to mic={mic_chunk_rms:.4f}")
                 if self._dump_aec is not None:
@@ -326,16 +337,23 @@ class Orchestrator:
                             self._aec_converged = True
                     else:
                         self._conv_blocks = 0
-                # FORWARD gate: open the hangover (forward the cleaned mic to the backend VAD) when the
-                # block is past convergence (conv=1, latch) and loud enough to be the USER (clean>0.008).
-                # [TRIED also gating on `not diverged` (clamp-fired) to kill the volume-boost self-barge
-                # (b4864e6) -> REVERTED 2026-07-01: it MISSED REAL BARGES. During a real barge (double-
-                # talk) DTLN *also* diverges (clean>mic), so the clamp fired on the USER's own voice and
-                # the gate dropped the barge (divfix1: 134 clamps incl. mic up to 0.039, only 2 barges
-                # through). So clean>mic is NOT unambiguous -- it's BOTH AI-residual boost AND user
-                # double-talk, the same energy ceiling as clean~=mic. The boost-self-barge stays a HW
-                # problem (5V amp + decoupling) or an identity problem (Personal VAD), NOT an energy gate.]
-                if self._aec_converged and self._clean_rms > BARGE_ABS_THRESH:
+                # --- Adaptive floor-relative barge gate (MCRA ratio; replaces the fixed 0.008) ---
+                # Track the RESIDUAL-ECHO FLOOR of `clean` (the quiet level between the user's words)
+                # with a minimum-statistics tracker: snap DOWN to any new minimum instantly, and RECOVER
+                # up only SLOWLY -- and only while NOT barging (fwd_hangover==0), so the user's own voice
+                # can't inflate the floor. Then "this is the USER" = clean rises BARGE_FLOOR_RATIO x above
+                # that tracked floor. This is the Rangachari&Loizou / Cohen MCRA principle (ratio of the
+                # signal to a tracked local minimum) -> level/gain-invariant -> portable, no rig-specific
+                # absolute. Reset per session (below); self-seeds on the first block.
+                # [The forward decision downstream is unchanged: locked + conv=1 latch + hangover.]
+                # SCOPE reminder: PORTABILITY only -- a loud residual (volume boost) also crosses the
+                # ratio, so this does NOT cure the boost self-barge (energy ceiling); that stays HW/identity.
+                if self._clean_floor <= 0.0 or self._clean_rms < self._clean_floor:
+                    self._clean_floor = self._clean_rms          # instant attack: snap to a new minimum
+                elif self._fwd_hangover == 0:
+                    self._clean_floor *= BARGE_FLOOR_RECOVER      # slow release UP (only when not barging)
+                self._clean_floor = max(self._clean_floor, BARGE_FLOOR_MIN)   # guard near-silence
+                if self._aec_converged and self._clean_rms > BARGE_FLOOR_RATIO * self._clean_floor:
                     self._fwd_hangover = BARGE_HANGOVER_BLOCKS
                 forward = (self.delay_est.locked and not self._calibrating
                            and self._aec_converged and self._fwd_hangover > 0)
@@ -483,10 +501,13 @@ class Orchestrator:
             # mic_rms = raw mic level; clean_rms = level after AEC; erle = cancellation in dB (higher =
             # better; >~20 dB during play means the AEC is cancelling well). barge_ins = backend-VAD
             # interrupts handled. conv = AEC has converged enough this reply to forward the mic.
+            # floor = the adaptive residual floor; the barge gate fires when clean_rms > RATIO x floor,
+            # so watch clean_rms/floor vs BARGE_FLOOR_RATIO to sanity-check/tune the ratio live.
             print(f"[stat] uplink={self._n_uplink}(+{up_rate}/s) sent={self._n_blocks_sent} "
                   f"play={int(self._playing)} delay={d_str} erle={erle_db:+.0f}dB "
                   f"mic_rms={self._mic_rms:.4f} clean_rms={self._clean_rms:.4f} "
-                  f"conv={int(self._aec_converged)} barge_ins={self._n_onsets}")
+                  f"floor={self._clean_floor:.4f} conv={int(self._aec_converged)} "
+                  f"barge_ins={self._n_onsets}")
 
     async def _calibrate(self):
         """Acquire the echo alignment at session start so barge-in is armed from the AI's
@@ -560,6 +581,7 @@ class Orchestrator:
         self._aec_converged = False
         self._conv_blocks = 0
         self._fwd_hangover = 0
+        self._clean_floor = 0.0        # re-seed the adaptive barge floor for the new conversation
         self._dl_origin_mic = None
         self._dl_residual = np.zeros(0, dtype=np.float32)
         self._cal_audio = np.zeros(0, dtype=np.float32)
