@@ -77,12 +77,13 @@ AEC_CONV_MAX_CLEAN = 0.0005
 # SCOPE: this is a PORTABILITY fix. It does NOT cure the volume-boost self-barge -- loud residual and a
 # real barge both raise the ratio (the proven energy ceiling: no energy signal separates them). That
 # remains a hardware (5V amp + decoupling) / identity (Personal VAD) problem, per docs/PROJECT-LOG.md.
-BARGE_FLOOR_RATIO   = 12.0      # user when clean_rms > this x the tracked residual floor (~+21 dB;
-                               #   sits above residual spikes, below a real barge). Primary live-tune knob.
-BARGE_FLOOR_RECOVER = 1.003     # per-block up-creep of the floor so it recovers when the residual
-                               #   genuinely rises (minimum-statistics slow release); slightly > 1.
-BARGE_FLOOR_MIN     = 1e-4      # floor guard ~ mic self-noise amplitude, so a near-silent residual
-                               #   can't make the ratio hypersensitive (divide-by-near-zero).
+BARGE_FLOOR_RATIO   = 12.0      # [STRUCTURAL] dimensionless -> portable. User when clean_rms > this x the
+                               #   tracked residual floor (~+21 dB; above residual spikes, below a real
+                               #   barge). The one behavioural knob -- tune ONCE live, then holds across rigs.
+BARGE_FLOOR_RECOVER = 1.003     # [STRUCTURAL] per-block up-creep of the floor so it recovers when the
+                               #   residual genuinely rises (minimum-statistics slow release); slightly > 1.
+BARGE_FLOOR_MIN     = 1e-4      # [UNIT] floor guard ~ mic self-noise amplitude (hardware-dependent), so a
+                               #   near-silent residual can't make the ratio hypersensitive (div-by-~0).
 BARGE_HANGOVER_BLOCKS = 25     # ~0.5 s: keep forwarding after a loud block, to bridge word gaps
 CAL_SECONDS = 0.8          # length of the startup calibration chirp
 SESSION_END_S = 2.5           # uplink silent this long (arm lowered) -> end the conversation
