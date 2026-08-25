@@ -160,6 +160,13 @@ the OLED. Proves the SoftDevice/controller on nRF54L + the output path end-to-en
 
 **M2 exit criteria:** host → BLE write → OLED text. Commit (on user ask).
 
+> **✅ DONE 2026-08-26 (HW-verified).** SoftDevice Controller up (BT 6.0 / HCI 6.2),
+> advertises as `gband-OLED` with battery + custom display service
+> (svc `e9a10001-…`, text char `e9a10002-…`). Wrote text from nRF Connect mobile →
+> rendered on OLED. App `apps/nrf54_ble`, module `src/ble_display`, host test
+> `tools/nrf54_ble_display_test.py`. Advertising uses explicit `BT_LE_ADV_OPT_CONN`
+> param (`BT_LE_ADV_CONN` removed in Zephyr 4.2).
+
 ---
 
 ## Milestone 3 — Sensors: PMIC rail → PDM mic + IMU → dictation
