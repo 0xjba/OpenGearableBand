@@ -21,6 +21,11 @@ int display_oled_init(void);
  * Lines beyond the panel height are clipped by CFB. Returns 0 on success. */
 int display_oled_show(const char *line1, const char *line2);
 
+/* Screen-estate test: draw a full-panel border + corner-to-corner X so the exact
+ * usable area is visible, and log the panel size + text capacity per font. Use
+ * during bench testing to see how much room the UI actually has. */
+void display_oled_estate_test(void);
+
 #ifdef __cplusplus
 }
 #endif

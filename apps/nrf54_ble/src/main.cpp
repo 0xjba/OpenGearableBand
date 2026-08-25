@@ -94,6 +94,15 @@ BT_CONN_CB_DEFINE(conn_cbs) = {
 };
 
 /* ---- Serial console ---- */
+/* The UART rx callback runs in ISR context, where a blocking I2C transfer isn't
+ * allowed. Draw operations are therefore deferred to the system workqueue. */
+static void estate_work_handler(struct k_work *w)
+{
+	ARG_UNUSED(w);
+	display_oled_estate_test();
+}
+static K_WORK_DEFINE(estate_work, estate_work_handler);
+
 static void uart_rx_cb(const struct device *dev, void *user_data)
 {
 	ARG_UNUSED(user_data);
@@ -112,6 +121,11 @@ static void uart_rx_cb(const struct device *dev, void *user_data)
 			LOG_INF("no UF2 bootloader on nRF54L -- flash via "
 				"./flash_nrf54.sh (probe-rs); rebooting cold");
 			sys_reboot(SYS_REBOOT_COLD);
+			break;
+		case 'd':
+			/* Screen-estate test: deferred to a thread (I2C can't run in
+			 * this ISR context). */
+			k_work_submit(&estate_work);
 			break;
 		default:
 			break;

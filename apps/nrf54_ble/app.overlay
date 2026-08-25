@@ -26,5 +26,7 @@
 		com-invdir;
 		com-sequential;
 		prechargep = <0x22>;
+		/* Color inversion is done in software (cfb_framebuffer_invert) --
+		 * the panel-level inversion command is a visual no-op here. */
 	};
 };

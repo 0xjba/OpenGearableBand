@@ -28,5 +28,6 @@
 		com-invdir;
 		com-sequential;           /* 128x32 uses sequential COM pins */
 		prechargep = <0x22>;
+		/* Color inversion done in software (cfb_framebuffer_invert). */
 	};
 };
