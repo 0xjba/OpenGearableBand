@@ -1,0 +1,65 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Board-common nodes (LEDs, button, header buses) for the XIAO nRF54LM20A Sense.
+ */
+
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include "xiao_nrf54lm20a-pinctrl.dtsi"
+
+/ {
+	leds {
+		compatible = "gpio-leds";
+
+		/* On-board RGB LED. Polarity assumed active-low (common-anode to
+		 * 3V3, as on the nRF52840 XIAO Sense) -- VERIFY on HW. */
+		led_red: led_red {
+			gpios = <&gpio1 22 GPIO_ACTIVE_LOW>;
+			label = "Red LED";
+		};
+		led_blue: led_blue {
+			gpios = <&gpio1 23 GPIO_ACTIVE_LOW>;
+			label = "Blue LED";
+		};
+		led_green: led_green {
+			gpios = <&gpio1 24 GPIO_ACTIVE_LOW>;
+			label = "Green LED";
+		};
+	};
+
+	buttons: buttons {
+		compatible = "gpio-keys";
+
+		usr_btn: usr-btn {
+			gpios = <&gpio0 9 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "USR";
+			zephyr,code = <INPUT_KEY_0>;
+		};
+	};
+
+	aliases {
+		led0 = &led_green;
+		sw0 = &usr_btn;
+		watchdog0 = &wdt31;
+	};
+};
+
+&uart20 {
+	current-speed = <115200>;
+	pinctrl-0 = <&uart20_default>;
+	pinctrl-1 = <&uart20_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+/* OLED I2C bus (header D10/D9). SSD1306 node is added in the app overlay.
+ * concat-buf-size: SSD1306/CFB writes the whole 128x32 framebuffer (512 B) + 1
+ * command byte in a single transfer; the nRF TWIM needs a concatenation buffer
+ * at least that large or it errors "internal buffer insufficient (1 + 512 > 16)".
+ * Lives here so every app that drives the OLED inherits it. */
+&i2c22 {
+	pinctrl-0 = <&i2c22_default>;
+	pinctrl-1 = <&i2c22_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <400000>;
+	zephyr,concat-buf-size = <1088>;
+};

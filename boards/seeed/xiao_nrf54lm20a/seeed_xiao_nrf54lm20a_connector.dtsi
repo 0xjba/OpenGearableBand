@@ -1,0 +1,29 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * XIAO 2.54mm header (Add-On-Plus) pin map for the nRF54LM20A Sense.
+ * D-numbers -> SoC GPIO per schematic Rev V1.0 sheet 5 (U7).
+ */
+
+/ {
+	xiao_d: connector {
+		compatible = "seeed,xiao-gpio";
+		#gpio-cells = <2>;
+		gpio-map-mask = <0xffffffff 0xffffffc0>;
+		gpio-map-pass-thru = <0 0x3f>;
+		gpio-map = <0 0 &gpio1 0 0>,	/* D0  P1.00 */
+			   <1 0 &gpio1 31 0>,	/* D1  P1.31 */
+			   <2 0 &gpio1 30 0>,	/* D2  P1.30 */
+			   <3 0 &gpio1 29 0>,	/* D3  P1.29 */
+			   <4 0 &gpio1 3 0>,	/* D4  P1.03 (SDA) */
+			   <5 0 &gpio1 7 0>,	/* D5  P1.07 (SCL) */
+			   <6 0 &gpio1 8 0>,	/* D6  P1.08 */
+			   <7 0 &gpio1 9 0>,	/* D7  P1.09 */
+			   <8 0 &gpio1 4 0>,	/* D8  P1.04 */
+			   <9 0 &gpio1 5 0>,	/* D9  P1.05 */
+			   <10 0 &gpio1 6 0>;	/* D10 P1.06 */
+	};
+};
+
+xiao_i2c: &i2c22 {};
+xiao_serial: &uart20 {};

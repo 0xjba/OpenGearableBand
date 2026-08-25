@@ -1,0 +1,13 @@
+identifier: xiao_nrf54lm20a/nrf54lm20a/cpuapp
+name: Seeed XIAO nRF54LM20A Sense
+type: mcu
+arch: arm
+toolchain:
+  - gnuarmemb
+  - zephyr
+ram: 512
+flash: 449
+supported:
+  - gpio
+  - i2c
+  - serial
