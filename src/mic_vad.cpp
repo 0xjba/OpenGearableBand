@@ -30,7 +30,10 @@ LOG_MODULE_REGISTER(mic_vad, LOG_LEVEL_INF);
 #define MIC_PCM_RATE_HZ    16000
 #define MIC_BLOCK_SAMPLES  (MIC_PCM_RATE_HZ * 20 / 1000)   /* 320 */
 #define MIC_BLOCK_BYTES    (MIC_BLOCK_SAMPLES * 2)          /* 640 */
-#define MIC_SLAB_BLOCKS    4
+#define MIC_SLAB_BLOCKS    8   /* DMA buffer depth. 8 (was 4) gives headroom in the
+                                * converged firmware where the acq/gesture/OLED load
+                                * makes the capture thread's drain burstier -- 4 was
+                                * exhausting (dmic "Failed to allocate buffer: -12"). */
 
 /* Voiced-band spectral feature. 512-pt real FFT over the 320-sample block
  * (Hann-windowed, zero-padded). Bin width = 16000/512 = 31.25 Hz.
