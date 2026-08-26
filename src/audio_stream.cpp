@@ -36,7 +36,10 @@ LOG_MODULE_REGISTER(audio_stream, CONFIG_LOG_DEFAULT_LEVEL);
  * 20 ms PCM block; k_msgq copies it in, so the slab buffer is released the moment
  * audio_stream_feed() returns. Depth gives slack for transient encode/notify
  * jitter without ever back-pressuring (full -> drop, never block the producer). */
-#define AUDIO_STREAM_Q_DEPTH 6
+#define AUDIO_STREAM_Q_DEPTH 16   /* ~320 ms buffer. Deeper than 6 so a transient
+                                   * BLE-notify stall (waiting on a conn event)
+                                   * doesn't drop mic blocks -- dropped blocks make
+                                   * gappy audio that fails host ASR. */
 K_MSGQ_DEFINE(audio_pcm_q, AUDIO_STREAM_BLOCK_BYTES, AUDIO_STREAM_Q_DEPTH, 4);
 
 /* Idle timeout: after this long with no PCM, treat the dictation burst as ended
