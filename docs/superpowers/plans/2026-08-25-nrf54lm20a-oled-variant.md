@@ -209,10 +209,20 @@ mic→BLE **LC3 uplink** stream. HR stays compiled out.
 > workqueue (fixes the M3c.2 -12 race). Added a test-only
 > `gesture_mode_debug_force_dictation` (console `d`) to exercise the uplink
 > without the pose. `beta` re-verified building after the shared changes.
-> **Remaining (productionization, NOT milestones):** (1) host Gemini text-bridge
-> (uplink→ASR/LLM→text→display char) + **host AGC** to a target level before
-> Gemini (raw capture ~2% FS, quiet); (2) wrist-mount POSE_EAR recalibration +
-> mic-port geometry; (3) low-power pass; (4) maybe on-device PDM gain.
+> **Remaining (productionization, NOT milestones):**
+> 1. **Host Gemini text-bridge** (uplink→ASR/LLM→text→display char) + **host AGC**
+>    to a target level before Gemini (raw capture ~2% FS, quiet). **DO THIS FIRST.**
+> 2. **NEW pose model for the OLED variant** (do after #1). This variant is NOT
+>    raise-to-ear — with no speaker and the band on the **volar (inner) wrist**,
+>    the user brings the wrist **up in front of the face to SEE the OLED** ("like
+>    reading your palm"), and that SAME pose is when they speak AND read. So
+>    replace `POSE_EAR` with a new `POSE_READ` (bring-to-face, volar-facing
+>    screen toward the user): new canonical gravity vector, new FSM naming, gates
+>    both the mic uplink and (future) the display wake. Needs a wrist-mount
+>    capture session (`c` in `apps/nrf54_pose`) to measure the canonical +
+>    tune mic-port geometry for level.
+> 3. **Low-power pass** (none done). 4. Optional on-device PDM gain bump.
+> 5. Final 3D case around the soldered XIAO+OLED+battery (the shipping form).
 
 > **M3c.2 ✅ DONE + M3 COMPLETE 2026-08-26 (HW-verified).** Full LC3 uplink:
 > mic_vad → audio_stream → lc3_codec (liblc3, 16k/10ms/32kbps) → ble_audio
