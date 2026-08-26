@@ -103,11 +103,14 @@ regulators. Rails (schematic sheet 3 block diagram + sheet 4 power):
 1. ~~Is header **3V3_OUT always-on or GPIO-gated**?~~ **RESOLVED 2026-08-26:**
    effectively always-on — the OLED powers from the header 3V3 with **no** GPIO
    enable in the board def (M1 OLED came up fine). No DCDC_EN hog needed.
-2. Exact **IMU part**: **CONFIRMED LSM6DS3TR-C** (Seeed spec + upstream Zephyr
-   board). Still verify I2C address (0x6A/0x6B) + tap-engine registers vs the
-   nRF52840's LSM6DSL at M3.
-3. **IMU&MIC_3V3 enable mechanism**: PMIC LDO1 via TWI vs. `P0.01` GPIO enable
-   (xlsx shows both in draft rows) (M3).
+2. ~~Exact **IMU part** + address~~ **RESOLVED 2026-08-26 (M3a):** LSM6DS3TR-C
+   at **I2C 0x6A** on IIC0 (i2c30), driven by Zephyr **`st,lsm6dsl`** — probes OK
+   (WHO_AM_I matched), gravity tracks tilt. Still verify the on-chip **tap-engine
+   registers** vs the nRF52840's LSM6DSL when porting taps.
+3. ~~**IMU&MIC_3V3 enable mechanism**~~ **RESOLVED 2026-08-26 (M3a):** the
+   **nPM1300 LDO1** (`regulator-boot-on`, 3.3V, `NPM13XX_LDSW_MODE_LDO`, on IIC1
+   i2c21 @ 0x6b) powers the rail. **No `P0.01` GPIO enable needed** (that was an
+   nrf54l15-template carryover in the xlsx draft).
 4. RGB LED **polarity** (active-high vs -low).
 
 ## OLED wiring + driver (VERIFIED 2026-08-26)

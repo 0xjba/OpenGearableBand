@@ -1,0 +1,88 @@
+/*
+ * M3a bring-up: nPM1300 LDO1 (IMU&MIC_3V3 rail) + LSM6DS3TR-C IMU.
+ *
+ * IMU on IIC0 (i2c30): SCL P0.07 / SDA P0.08, INT1 P0.06. LSM6DS3TR-C is
+ * register-compatible with the LSM6DSL (WHO_AM_I 0x6A) -> use st,lsm6dsl.
+ * PMIC on IIC1 (i2c21): SCL P1.17 / SDA P1.18; LDO1 powers the IMU/mic rail.
+ * See docs/nrf54lm20a-board.md.
+ */
+#include <dt-bindings/regulator/npm13xx.h>
+
+&pinctrl {
+	/* PMIC bus (IIC1). */
+	i2c21_default: i2c21_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 18)>,
+				<NRF_PSEL(TWIM_SCL, 1, 17)>;
+		};
+	};
+	i2c21_sleep: i2c21_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 18)>,
+				<NRF_PSEL(TWIM_SCL, 1, 17)>;
+			low-power-enable;
+		};
+	};
+
+	/* IMU bus (IIC0). */
+	i2c30_default: i2c30_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 8)>,
+				<NRF_PSEL(TWIM_SCL, 0, 7)>;
+		};
+	};
+	i2c30_sleep: i2c30_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 8)>,
+				<NRF_PSEL(TWIM_SCL, 0, 7)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2c21 {
+	status = "okay";
+	pinctrl-0 = <&i2c21_default>;
+	pinctrl-1 = <&i2c21_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <100000>;
+
+	npm1300: pmic@6b {
+		compatible = "nordic,npm1300";
+		reg = <0x6b>;
+
+		npm1300_regulators: regulators {
+			compatible = "nordic,npm1300-regulator";
+
+			/* LDO1 -> IMU&MIC_3V3. Boot-on + always-on so the rail is up
+			 * before the IMU driver probes. */
+			npm1300_ldo1: LDO1 {
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-initial-mode = <NPM13XX_LDSW_MODE_LDO>;
+				regulator-boot-on;
+				regulator-always-on;
+			};
+		};
+	};
+};
+
+&i2c30 {
+	status = "okay";
+	pinctrl-0 = <&i2c30_default>;
+	pinctrl-1 = <&i2c30_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <400000>;
+
+	lsm6dsl: lsm6dsl@6a {
+		compatible = "st,lsm6dsl";
+		reg = <0x6a>;
+		irq-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/ {
+	aliases {
+		imu0 = &lsm6dsl;
+	};
+};

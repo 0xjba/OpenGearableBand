@@ -199,6 +199,12 @@ mic→BLE **LC3 uplink** stream. HR stays compiled out.
 
 **M3 exit criteria:** dictation entry + mic uplink work on the OLED board. Commit.
 
+> **M3a ✅ DONE 2026-08-26 (HW-verified).** nPM1300 LDO1 (boot-on, IIC1 i2c21
+> @0x6b) powers the IMU/mic rail; LSM6DS3TR-C alive on IIC0 (i2c30) @0x6A via
+> `st,lsm6dsl` at 104 Hz (ODR Kconfig is an INDEX: 4=104Hz, NOT the Hz value);
+> gravity tracks tilt. App `apps/nrf54_imu`. No `P0.01` enable needed.
+> **M3b next:** port `orientation` + `gesture_poses` → `POSE_EAR`.
+
 ---
 
 ## Milestone 4 — Strip audio-downlink + wire AI-text → OLED
