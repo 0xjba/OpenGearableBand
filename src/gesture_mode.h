@@ -179,6 +179,11 @@ void gesture_mode_pose_trace_start(uint32_t n_samples);
  */
 GestureMode gesture_mode_get(void);
 
+/* Test/debug only: force MODE_DICTATION on/off, bypassing the POSE_EAR + voice
+ * gate (and starting/stopping the mic). For bench-exercising the mic uplink
+ * before POSE_EAR is wrist-mount calibrated. Not used by the normal FSM. */
+void gesture_mode_debug_force_dictation(bool on);
+
 /*
  * Read the current orientation classification.  Diagnostics-only --
  * mode transitions happen automatically inside the detector based on

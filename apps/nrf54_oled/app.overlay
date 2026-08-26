@@ -1,0 +1,112 @@
+/*
+ * Converged OLED variant (M4): all hardware in one overlay.
+ *   OLED  : SSD1306 on xiao_i2c (i2c22), SCL D10/P1.06, SDA D9/P1.05
+ *   IMU   : LSM6DS3TR-C on IIC0 (i2c30), SCL P0.07 / SDA P0.08, INT1 P0.06
+ *   MIC   : PDM (pdm20 -> dmic0 alias), CLK P1.13 / DIN P1.14
+ *   PMIC  : nPM1300 on IIC1 (i2c21), LDO1 powers the IMU&MIC rail
+ * See docs/nrf54lm20a-board.md.
+ */
+#include <dt-bindings/regulator/npm13xx.h>
+
+&pinctrl {
+	i2c21_default: i2c21_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 18)>, <NRF_PSEL(TWIM_SCL, 1, 17)>;
+		};
+	};
+	i2c21_sleep: i2c21_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 18)>, <NRF_PSEL(TWIM_SCL, 1, 17)>;
+			low-power-enable;
+		};
+	};
+	i2c30_default: i2c30_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 8)>, <NRF_PSEL(TWIM_SCL, 0, 7)>;
+		};
+	};
+	i2c30_sleep: i2c30_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 8)>, <NRF_PSEL(TWIM_SCL, 0, 7)>;
+			low-power-enable;
+		};
+	};
+	pdm20_default: pdm20_default {
+		group1 {
+			psels = <NRF_PSEL(PDM_CLK, 1, 13)>, <NRF_PSEL(PDM_DIN, 1, 14)>;
+		};
+	};
+};
+
+&i2c21 {
+	status = "okay";
+	pinctrl-0 = <&i2c21_default>;
+	pinctrl-1 = <&i2c21_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <100000>;
+
+	npm1300: pmic@6b {
+		compatible = "nordic,npm1300";
+		reg = <0x6b>;
+		npm1300_regulators: regulators {
+			compatible = "nordic,npm1300-regulator";
+			npm1300_ldo1: LDO1 {
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-initial-mode = <NPM13XX_LDSW_MODE_LDO>;
+				regulator-boot-on;
+				regulator-always-on;
+			};
+		};
+	};
+};
+
+&i2c30 {
+	status = "okay";
+	pinctrl-0 = <&i2c30_default>;
+	pinctrl-1 = <&i2c30_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <400000>;
+
+	lsm6dsl: lsm6dsl@6a {
+		compatible = "st,lsm6dsl";
+		reg = <0x6a>;
+		irq-gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+&pdm20 {
+	status = "okay";
+	pinctrl-0 = <&pdm20_default>;
+	pinctrl-names = "default";
+	clock-source = "PCLK32M";
+};
+
+&xiao_i2c {
+	status = "okay";
+
+	ssd1306: ssd1306@3c {
+		compatible = "solomon,ssd1306fb";
+		reg = <0x3c>;
+		width = <128>;
+		height = <32>;
+		segment-offset = <0>;
+		page-offset = <0>;
+		display-offset = <0>;
+		multiplex-ratio = <31>;
+		segment-remap;
+		com-invdir;
+		com-sequential;
+		prechargep = <0x22>;
+	};
+};
+
+/ {
+	aliases {
+		imu0 = &lsm6dsl;
+		dmic0 = &pdm20;
+	};
+	chosen {
+		zephyr,display = &ssd1306;
+	};
+};

@@ -108,11 +108,40 @@ int display_oled_show(const char *line1, const char *line2)
 		cfb_print(disp_dev, line1, 0, 0);
 		cfb_print(disp_dev, line2, 0, f.h);
 	} else if (have1) {
-		/* One line: biggest font that fits, centered vertically. */
-		struct font_info f = pick_font(strlen(line1), panel_h);
-		cfb_framebuffer_set_font(disp_dev, f.idx);
-		int16_t y = (panel_h > f.h) ? (int16_t)((panel_h - f.h) / 2) : 0;
-		cfb_print(disp_dev, line1, 0, y);
+		size_t len = strlen(line1);
+		int max_chars = panel_w / fonts[0].w;   /* chars/line at smallest font */
+
+		if ((int)len <= max_chars) {
+			/* Fits on one line: biggest font that fits, centered. */
+			struct font_info f = pick_font(len, panel_h);
+			cfb_framebuffer_set_font(disp_dev, f.idx);
+			int16_t y = (panel_h > f.h) ? (int16_t)((panel_h - f.h) / 2) : 0;
+			cfb_print(disp_dev, line1, 0, y);
+		} else {
+			/* Too long for one line: word-wrap onto two lines (small font).
+			 * Break at the last space <= max_chars, else hard-split. Anything
+			 * past 2 lines is clipped (128x32 holds ~24 chars; scrolling is a
+			 * future item). */
+			int split = max_chars;
+			for (int i = max_chars; i > 0; i--) {
+				if (line1[i] == ' ') { split = i; break; }
+			}
+			char a[24], b[24];
+			int alen = split < (int)sizeof(a) - 1 ? split : (int)sizeof(a) - 1;
+			memcpy(a, line1, alen);
+			a[alen] = '\0';
+			const char *rest = line1 + split + (line1[split] == ' ' ? 1 : 0);
+			size_t blen = strlen(rest);
+			if (blen > sizeof(b) - 1) {
+				blen = sizeof(b) - 1;
+			}
+			memcpy(b, rest, blen);
+			b[blen] = '\0';
+
+			cfb_framebuffer_set_font(disp_dev, fonts[0].idx);
+			cfb_print(disp_dev, a, 0, 0);
+			cfb_print(disp_dev, b, 0, fonts[0].h);
+		}
 	}
 
 	return cfb_framebuffer_finalize(disp_dev);

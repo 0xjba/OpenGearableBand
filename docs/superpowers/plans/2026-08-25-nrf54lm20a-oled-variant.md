@@ -199,6 +199,21 @@ mic→BLE **LC3 uplink** stream. HR stays compiled out.
 
 **M3 exit criteria:** dictation entry + mic uplink work on the OLED board. Commit.
 
+> **M4 ✅ DONE + OLED VARIANT FEATURE-COMPLETE 2026-08-26 (HW-verified).**
+> Converged firmware `apps/nrf54_oled`: acq thread → real `gesture_mode`
+> (POSE_EAR → MODE_DICTATION) → mic uplink; `ble_display` text char → OLED;
+> both BLE services advertised as `gband-oled`. NO HR / audio-downlink / AEC
+> (speaker_stubs replace the downlink+playback seam; `audio_out_active()`=false).
+> Verified: real POSE_EAR pose → dictation → LC3 uplink, audible, 0 drops,
+> ~3ms/block. OLED word-wraps long text (2 lines). Re-advertise deferred to a
+> workqueue (fixes the M3c.2 -12 race). Added a test-only
+> `gesture_mode_debug_force_dictation` (console `d`) to exercise the uplink
+> without the pose. `beta` re-verified building after the shared changes.
+> **Remaining (productionization, NOT milestones):** (1) host Gemini text-bridge
+> (uplink→ASR/LLM→text→display char) + **host AGC** to a target level before
+> Gemini (raw capture ~2% FS, quiet); (2) wrist-mount POSE_EAR recalibration +
+> mic-port geometry; (3) low-power pass; (4) maybe on-device PDM gain.
+
 > **M3c.2 ✅ DONE + M3 COMPLETE 2026-08-26 (HW-verified).** Full LC3 uplink:
 > mic_vad → audio_stream → lc3_codec (liblc3, 16k/10ms/32kbps) → ble_audio
 > NOTIFY (`47A10002`, `[seq16][ts32][80B LC3]`) → host. Verified with

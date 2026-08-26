@@ -29,6 +29,10 @@ LOG_MODULE_REGISTER(gesture_mode, LOG_LEVEL_INF);
 
 /* Atomically published mode; read by other threads. */
 static atomic_t mode_atomic = ATOMIC_INIT(MODE_IDLE);
+/* Test/debug: when set, the POSE_EAR mic gate is bypassed and MODE_DICTATION is
+ * held manually (gesture_mode_debug_force_dictation). Lets bench tests exercise
+ * the mic uplink before POSE_EAR is wrist-mount calibrated. Off in normal use. */
+static atomic_t force_dict = ATOMIC_INIT(0);
 
 /* POSE_EAR-held mic gate (dictation). Independent of the tap pose-arm: the mic
  * stays on while the ear pose is held (not a one-shot arm window). */
@@ -202,6 +206,11 @@ static void ear_session_end(const char *why)
 
 static void ear_gate_update(pose_id_t best)
 {
+    /* Debug force holds MODE_DICTATION manually -- don't let the gate override. */
+    if (atomic_get(&force_dict)) {
+        return;
+    }
+
     int64_t now = k_uptime_get();
 
     bool ear_pose = (best == POSE_EAR);   /* gravity match; motion-tolerant */
@@ -779,6 +788,18 @@ void gesture_mode_on_chip_triple_tap(void)
 GestureMode gesture_mode_get(void)
 {
     return (GestureMode)atomic_get(&mode_atomic);
+}
+
+void gesture_mode_debug_force_dictation(bool on)
+{
+    atomic_set(&force_dict, on ? 1 : 0);
+    if (on) {
+        mic_vad_start();               /* the gate normally starts this */
+        _transition_to(MODE_DICTATION);
+    } else {
+        _transition_to(MODE_IDLE);
+        mic_vad_stop();
+    }
 }
 
 WristOrientation gesture_mode_get_orientation(void)
