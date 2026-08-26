@@ -88,7 +88,11 @@ BT_CONN_CB_DEFINE(app_conn_cb) = { .disconnected = on_disconnected };
 
 /* ---- acq thread: 100 Hz IMU -> gesture_mode (drives pose gate + mic uplink) ---- */
 #define ACQ_STACK_SZ 2048
-#define ACQ_PRIO     7
+/* Below the audio thread (prio 8) so the 100 Hz IMU I2C + Mahony + OLED writes
+ * can't preempt LC3 encode/BLE-notify. At prio 7 (above audio) it starved the
+ * uplink -> encode+notify spiked 3->40 ms and audio_stream q_drops climbed.
+ * mic capture stays prio 6 (highest). */
+#define ACQ_PRIO     10
 static K_THREAD_STACK_DEFINE(acq_stack, ACQ_STACK_SZ);
 static struct k_thread acq_thread;
 
