@@ -57,3 +57,9 @@ def test_pcm_to_wav_has_riff_header_and_correct_length():
     wav = pcm_to_wav(pcm, rate=16000)
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
     assert len(wav) == 44 + 160 * 2
+
+def test_pcm_to_wav_clips_out_of_range():
+    pcm = np.array([1.5, -1.5, 0.0], dtype=np.float32)
+    wav = pcm_to_wav(pcm, rate=16000)
+    samples = np.frombuffer(wav[44:], dtype="<i2")
+    assert samples[0] == 32767 and samples[1] == -32768 and samples[2] == 0

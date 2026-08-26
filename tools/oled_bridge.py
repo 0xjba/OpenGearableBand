@@ -75,7 +75,11 @@ class GeminiBrain:
         wav = pcm_to_wav(pcm_f32_16k, 16000)
         resp = self._client.models.generate_content(
             model=self._model,
-            contents=[types.Part.from_bytes(data=wav, mime_type="audio/wav")],
+            contents=[types.Content(
+                role="user",
+                parts=[types.Part.from_bytes(data=wav, mime_type="audio/wav")],
+            )],
             config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
         )
-        return (resp.text or "").strip()
+        text = (resp.text or "").strip()
+        return text if text else "[no reply]"
