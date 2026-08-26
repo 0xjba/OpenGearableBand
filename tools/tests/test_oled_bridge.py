@@ -49,3 +49,11 @@ def test_wrap_word_exactly_cols_not_split():
 def test_wrap_cols_zero_raises():
     with pytest.raises(ValueError):
         wrap_pages("hi", cols=0)
+
+from oled_bridge import pcm_to_wav
+
+def test_pcm_to_wav_has_riff_header_and_correct_length():
+    pcm = np.zeros(160, dtype=np.float32)
+    wav = pcm_to_wav(pcm, rate=16000)
+    assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
+    assert len(wav) == 44 + 160 * 2
