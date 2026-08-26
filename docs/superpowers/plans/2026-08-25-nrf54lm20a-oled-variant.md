@@ -199,6 +199,16 @@ mic→BLE **LC3 uplink** stream. HR stays compiled out.
 
 **M3 exit criteria:** dictation entry + mic uplink work on the OLED board. Commit.
 
+> **M3c.2 ✅ DONE + M3 COMPLETE 2026-08-26 (HW-verified).** Full LC3 uplink:
+> mic_vad → audio_stream → lc3_codec (liblc3, 16k/10ms/32kbps) → ble_audio
+> NOTIFY (`47A10002`, `[seq16][ts32][80B LC3]`) → host. Verified with
+> `tools/nrf54_uplink_rx.py`: 0 ble/q drops, 0 seq gaps, encode+notify ~3ms/20ms
+> block, decoded WAV audible. App `apps/nrf54_uplink` (gesture_mode + audio_downlink
+> stubbed; `d` forces dictation). **Known minor:** on-disconnect re-advertise
+> raced ble_audio teardown (`adv start -12`) — defer to a workqueue in M4's
+> converged firmware. **M4 next:** Kconfig-gate out audio-DOWNLINK + HR; host
+> sends Gemini TEXT (not LC3) to the display-text char.
+
 > **M3c.1 ✅ DONE 2026-08-26 (HW-verified).** PDM mic (pdm20 via new `dmic0`
 > alias — nRF54L can't carry a `pdm0` nodelabel; SoC validation reserves it)
 > CLK P1.13/DIN P1.14, powered by nPM1300 LDO1. `mic_vad` capture + adaptive
