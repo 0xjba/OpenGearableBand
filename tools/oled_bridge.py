@@ -6,8 +6,9 @@ import numpy as np
 def agc(pcm, target_peak=0.25, max_gain=40.0):
     """Scale float32 PCM so its peak approaches target_peak (full-scale=1.0),
     capped at max_gain so silence isn't amplified into noise. Only boosts."""
+    assert pcm.dtype == np.float32, f"agc expects float32 PCM, got {pcm.dtype}"
     peak = float(np.max(np.abs(pcm))) if pcm.size else 0.0
-    if peak < 1e-6:
+    if not np.isfinite(peak) or peak < 1e-6:
         return pcm
     gain = min(max_gain, target_peak / peak)
     gain = max(gain, 1.0)
@@ -16,6 +17,8 @@ def agc(pcm, target_peak=0.25, max_gain=40.0):
 def wrap_pages(text, cols=12, rows=2):
     """Word-wrap text into lines <= cols chars, grouped into pages of <= rows lines.
     Long words are hard-split. Returns list[list[str]]."""
+    if cols < 1:
+        raise ValueError("cols must be >= 1")
     words = text.split()
     lines, cur = [], ""
     for w in words:

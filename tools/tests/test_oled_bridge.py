@@ -1,5 +1,6 @@
 import os, sys
 import numpy as np
+import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from oled_bridge import agc
 
@@ -17,7 +18,7 @@ def test_agc_caps_gain_on_silence():
 def test_agc_leaves_loud_audio_roughly_alone():
     loud = (np.sin(np.linspace(0, 200, 16000)) * 0.5).astype(np.float32)
     out = agc(loud, target_peak=0.25, max_gain=40.0)
-    assert float(np.max(np.abs(out))) <= 0.51
+    assert 0.49 < float(np.max(np.abs(out))) <= 0.51   # boost-only: unchanged
 
 from oled_bridge import wrap_pages
 
@@ -32,3 +33,19 @@ def test_wrap_paginates_long_text():
     assert len(pages) >= 2
     assert all(len(p) <= 2 for p in pages)
     assert all(len(line) <= 12 for p in pages for line in p)
+
+def test_agc_rejects_non_float32():
+    with pytest.raises(AssertionError):
+        agc(np.zeros(100, dtype=np.int16))
+
+def test_agc_nan_input_returns_unchanged():
+    x = np.array([np.nan, 0.1, -0.1], dtype=np.float32)
+    out = agc(x)
+    assert out is x   # NaN peak -> guard returns input unchanged
+
+def test_wrap_word_exactly_cols_not_split():
+    assert wrap_pages("a" * 12, cols=12) == [["a" * 12]]
+
+def test_wrap_cols_zero_raises():
+    with pytest.raises(ValueError):
+        wrap_pages("hi", cols=0)
