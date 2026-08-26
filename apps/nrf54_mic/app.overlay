@@ -1,0 +1,72 @@
+/*
+ * M3c.1 bring-up: nPM1300 LDO1 (IMU&MIC_3V3 rail) + PDM mic.
+ *
+ * The MEMS mic shares the IMU/mic rail (nPM1300 LDO1), so the PMIC LDO must be
+ * on. PDM on pdm20 (relabeled pdm0 so mic_vad's DT_NODELABEL(pdm0) resolves):
+ * CLK P1.13 / DIN P1.14. See docs/nrf54lm20a-board.md.
+ */
+#include <dt-bindings/regulator/npm13xx.h>
+
+&pinctrl {
+	/* PMIC bus (IIC1). */
+	i2c21_default: i2c21_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 18)>,
+				<NRF_PSEL(TWIM_SCL, 1, 17)>;
+		};
+	};
+	i2c21_sleep: i2c21_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 18)>,
+				<NRF_PSEL(TWIM_SCL, 1, 17)>;
+			low-power-enable;
+		};
+	};
+
+	/* PDM mic: CLK P1.13, DIN P1.14. */
+	pdm20_default: pdm20_default {
+		group1 {
+			psels = <NRF_PSEL(PDM_CLK, 1, 13)>,
+				<NRF_PSEL(PDM_DIN, 1, 14)>;
+		};
+	};
+};
+
+&i2c21 {
+	status = "okay";
+	pinctrl-0 = <&i2c21_default>;
+	pinctrl-1 = <&i2c21_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <100000>;
+
+	npm1300: pmic@6b {
+		compatible = "nordic,npm1300";
+		reg = <0x6b>;
+
+		npm1300_regulators: regulators {
+			compatible = "nordic,npm1300-regulator";
+
+			/* LDO1 -> IMU&MIC_3V3 (powers the mic). */
+			npm1300_ldo1: LDO1 {
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-initial-mode = <NPM13XX_LDSW_MODE_LDO>;
+				regulator-boot-on;
+				regulator-always-on;
+			};
+		};
+	};
+};
+
+&pdm20 {
+	status = "okay";
+	pinctrl-0 = <&pdm20_default>;
+	pinctrl-names = "default";
+	clock-source = "PCLK32M";
+};
+
+/ {
+	aliases {
+		dmic0 = &pdm20;   /* mic_vad references DT_ALIAS(dmic0) */
+	};
+};

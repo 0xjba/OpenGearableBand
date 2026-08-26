@@ -199,6 +199,15 @@ mic→BLE **LC3 uplink** stream. HR stays compiled out.
 
 **M3 exit criteria:** dictation entry + mic uplink work on the OLED board. Commit.
 
+> **M3c.1 ✅ DONE 2026-08-26 (HW-verified).** PDM mic (pdm20 via new `dmic0`
+> alias — nRF54L can't carry a `pdm0` nodelabel; SoC validation reserves it)
+> CLK P1.13/DIN P1.14, powered by nPM1300 LDO1. `mic_vad` capture + adaptive
+> floor + M-of-N voiced-onset run: speech → veM ~1000× ambient, VOICE ONSET
+> fires reliably, transients rejected. **nRF52840-tuned thresholds work as-is
+> (no retune, no Cobra needed).** App `apps/nrf54_mic` (audio_stream stubbed).
+> `mic_vad.cpp` now uses `DT_ALIAS(dmic0)` (both boards build). **M3c.2 next:**
+> real audio_stream + lc3_codec + ble_audio LC3 uplink.
+
 > **M3b ✅ DONE 2026-08-26 (HW-verified).** Ported `orientation` (Mahony) +
 > `gesture_poses` onto a 100 Hz acq thread reading the LSM6DS3TR-C. Pitch/roll
 > track tilt + settle (gravity-locked, drift-free), `at_rest` works, yaw drifts

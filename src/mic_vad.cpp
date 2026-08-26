@@ -84,7 +84,10 @@ K_MEM_SLAB_DEFINE(mic_slab, MIC_BLOCK_BYTES, MIC_SLAB_BLOCKS, 4);
  * and exit permanently.  DEVICE_DT_GET is a static initializer; the PDM driver
  * inits at POST_KERNEL (before any app thread runs), so the pointer is valid
  * and the device is ready by the time the thread checks. */
-static const struct device *mic_dev = DEVICE_DT_GET(DT_NODELABEL(pdm0));
+/* PDM device via the `dmic0` alias so this is board-agnostic (nRF52840 pdm0
+ * vs nRF54L pdm20 -- the latter can't carry a `pdm0` nodelabel, which the SoC
+ * base-address validation reserves for NRF_PDM0). Each board maps the alias. */
+static const struct device *mic_dev = DEVICE_DT_GET(DT_ALIAS(dmic0));
 static atomic_t mic_running = ATOMIC_INIT(0);
 static atomic_t mic_onset = ATOMIC_INIT(0);   /* latched voiced-onset, read-and-clear */
 static atomic_t mic_voice_active = ATOMIC_INIT(0); /* near-field voice within VAD_VOICE_HOLD_MS */

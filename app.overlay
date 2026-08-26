@@ -100,3 +100,9 @@
     clock-source = "PCLK32M";
 };
 
+/ {
+    aliases {
+        dmic0 = &pdm0;   /* mic_vad references DT_ALIAS(dmic0) */
+    };
+};
+
