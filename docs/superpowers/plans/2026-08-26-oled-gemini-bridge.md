@@ -5,6 +5,14 @@
 > checkbox (`- [ ]`) syntax. Pure helpers are TDD (host pytest); BLE + Gemini stages are
 > verified by running live against the band (hardware-in-the-loop, matching this project).
 
+> **✅ IMPLEMENTED 2026-08-26** (subagent-driven, spec+quality reviewed each chunk).
+> `tools/oled_bridge.py` + `tools/tests/test_oled_bridge.py` (12 tests). Model default is
+> **`gemini-3.6-flash`** (the plan's `gemini-2.5-flash` returned 404/deprecated; 3.6-flash
+> confirmed live). Offline `--wav` round-trip verified (real Gemini replies). Hardened:
+> agc dtype/NaN guards, malformed-BLE-packet guard, async brain (no event-loop block),
+> BLE reconnect loop. **Remaining: the live BLE end-to-end (Task 5 Step 3) — the human's
+> bench run with the band.**
+
 **Goal:** A host script `tools/oled_bridge.py` that closes the OLED loop — you speak into
 the band, a Gemini text reply appears on its OLED.
 
