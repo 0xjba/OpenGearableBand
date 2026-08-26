@@ -199,6 +199,15 @@ mic→BLE **LC3 uplink** stream. HR stays compiled out.
 
 **M3 exit criteria:** dictation entry + mic uplink work on the OLED board. Commit.
 
+> **M3b ✅ DONE 2026-08-26 (HW-verified).** Ported `orientation` (Mahony) +
+> `gesture_poses` onto a 100 Hz acq thread reading the LSM6DS3TR-C. Pitch/roll
+> track tilt + settle (gravity-locked, drift-free), `at_rest` works, yaw drifts
+> (expected, no mag). Pose classifier fired POSE_EAR at score 0.95 when gravity
+> matched the canonical -> full pipeline works. App `apps/nrf54_pose`; `v` trace,
+> `c` capture-canonical. **POSE_EAR needs wrist-mount recalibration** (canonical
+> is nRF52840-tuned) -- deferred to a rough-mount session after firmware.
+> **M3c next:** PDM mic + `mic_vad` + `MODE_DICTATION` + LC3 uplink.
+
 > **M3a ✅ DONE 2026-08-26 (HW-verified).** nPM1300 LDO1 (boot-on, IIC1 i2c21
 > @0x6b) powers the IMU/mic rail; LSM6DS3TR-C alive on IIC0 (i2c30) @0x6A via
 > `st,lsm6dsl` at 104 Hz (ODR Kconfig is an INDEX: 4=104Hz, NOT the Hz value);
