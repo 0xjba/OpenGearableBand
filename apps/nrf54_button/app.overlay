@@ -1,0 +1,76 @@
+/*
+ * Button + battery overlay for the XIAO nRF54LM20A Sense.
+ *
+ * BUTTON: external LilyPad wired P1.00 -> GND, internal pull-up, ACTIVE_LOW.
+ *   Referenced by node label (userbtn), NOT by overriding the sw0 alias -- the
+ *   board dtsi already points sw0 at the ONBOARD button on P0.09 and shadowing
+ *   it would silently break anything that expects the onboard one.
+ *
+ * BATTERY: the XIAO's ONBOARD nPM1300 on i2c21 (BAT_SDA P1.18 / BAT_SCL P1.17).
+ *   The charger node is deliberately READ-ONLY: no `charging-enable`, and NO
+ *   regulator sub-node. The board charges correctly with no firmware running,
+ *   so we only read status. Programming charge current / termination / NTC for
+ *   a cell whose capacity and thermistor fitment we have not confirmed is a
+ *   safety risk, not a feature.
+ *
+ * NOT PRESENT: ssd1306, LSM6DSL, PDM. This app must boot with them absent.
+ */
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+
+&gpio1 {
+	status = "okay";
+};
+
+/* watchdog0 alias already points here in the board dtsi; just enable it. */
+&wdt31 {
+	status = "okay";
+};
+
+&pinctrl {
+	i2c21_default: i2c21_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 18)>, <NRF_PSEL(TWIM_SCL, 1, 17)>;
+		};
+	};
+	i2c21_sleep: i2c21_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 18)>, <NRF_PSEL(TWIM_SCL, 1, 17)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2c21 {
+	status = "okay";
+	pinctrl-0 = <&i2c21_default>;
+	pinctrl-1 = <&i2c21_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <100000>;
+
+	npm1300: pmic@6b {
+		compatible = "nordic,npm1300";
+		reg = <0x6b>;
+
+		npm1300_charger: charger {
+			compatible = "nordic,npm1300-charger";
+			term-microvolt = <4200000>;
+			current-microamp = <150000>;
+			dischg-limit-microamp = <1000000>;
+			vbus-limit-microamp = <500000>;
+			thermistor-ohms = <10000>;
+			thermistor-beta = <3380>;
+			/* NO charging-enable -- read-only. See the header comment. */
+		};
+	};
+};
+
+/ {
+	buttons_ext {
+		compatible = "gpio-keys";
+		userbtn: button_ext_0 {
+			gpios = <&gpio1 0 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "external user button";
+			zephyr,code = <INPUT_KEY_0>;
+		};
+	};
+};
