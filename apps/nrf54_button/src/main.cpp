@@ -26,6 +26,7 @@
  * nRF CONNECT: connect, enable notifications on the Button characteristic
  * 00001524-1212-EFDE-1523-785FEABCD123. Press -> 0x01, release -> 0x00.
  */
+#include <stdlib.h>
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
@@ -35,22 +36,39 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
-#include <zephyr/bluetooth/services/bas.h>
 #include <bluetooth/services/lbs.h>
 
 #include "resilience.h"
 #include "battery.h"
 #include "led_status.h"
+#include "button_gesture.h"
 
 LOG_MODULE_REGISTER(btn_test, LOG_LEVEL_INF);
 
-/* [UNIT] 20ms sample, 2 agreeing samples -> ~40ms debounce. */
+/* POLICY, not a verified hardware fact: 20ms sample, 2 agreeing samples ->
+ * ~40ms debounce. Typical switch bounce settles well inside that; if a specific
+ * switch misbehaves, measure it rather than raising this blindly. */
 #define POLL_MS        20
 #define DEBOUNCE_N     2
-/* [USER] Long-press to restart. 10s is long enough that it cannot be hit by
- * accident in a pocket, short enough that a user will hold it that long when
- * told to. Matches the convention people already know from phones. */
-#define LONG_PRESS_MS  10000
+/* POLICY, not hardware facts -- battery protection thresholds.
+ *
+ * The nPM1300 hardware already prevents OVERcharge: it terminates at Seeed's
+ * term-microvolt (4.2V) and handles recharge itself. Nothing in hardware stops
+ * OVER-DISCHARGE while unplugged, though -- the firmware would advertise until
+ * the cell was flat, which is how the first cell reached 2.53V. So:
+ *
+ *   below LOW_BATT_WARN_MV  -> LED warns
+ *   below SHIP_CUTOFF_MV for SHIP_CONFIRM_READS consecutive 5s reads, on
+ *   battery only -> enter nPM1300 ship mode (Seeed: "ultra-low-power shipping
+ *   state"), woken again by plugging in USB.
+ *
+ * 3.30V leaves real charge in the cell so that sitting in ship mode for weeks
+ * does not walk it down toward the ~3.0V LiPo floor. The confirm count stops a
+ * momentary sag (radio TX burst) from shutting the device down. Tune these;
+ * they are judgement, not spec. */
+#define LOW_BATT_WARN_MV    3500
+#define SHIP_CUTOFF_MV      3300
+#define SHIP_CONFIRM_READS  3
 
 /* Node label, not the sw0 alias: sw0 is the board's ONBOARD button (P0.09)
  * and shadowing it would break anything expecting that one. */
@@ -84,7 +102,7 @@ static const struct bt_data sd[] = {
 static const struct bt_uuid_128 gb_svc = BT_UUID_INIT_128(GB_STATUS_SVC_VAL);
 static const struct bt_uuid_128 gb_chr = BT_UUID_INIT_128(GB_STATUS_CHR_VAL);
 
-static char status_line[64] = "starting";
+static char status_line[112] = "starting";
 static bool status_subscribed;
 
 static ssize_t status_read(struct bt_conn *c, const struct bt_gatt_attr *a,
@@ -221,35 +239,41 @@ int main(void)
 	 *    skippable, which matters: an I2C peripheral is what took the device
 	 *    down in the first place. */
 	led_status_init();
-	bool batt_ok = false;
-	if (!bi->safe_mode) {
-		batt_ok = (battery_init() == 0);
-	}
+	/* The PMIC is NOT optional: it powers the board (Seeed's BUCK2) and its
+	 * driver is instantiated from devicetree before main() either way. Binding
+	 * it here is just taking a handle -- and skipping it in safe mode would
+	 * disable over-discharge protection exactly when the device is unhealthy. */
+	bool batt_ok = (battery_init() == 0);
 
 	int last_raw = btn_ok ? gpio_pin_get_dt(&button) : 0;
 	int stable = last_raw, agree = 0;
-	int64_t press_started = 0;
+	struct button_gesture gest;
+	button_gesture_init(&gest);
 	atomic_set(&btn_state, stable);
 
 	struct battery_status bs = {};
 	int ticks = 0;
+	int low_reads = 0;
+	uint32_t last_chg_err = 0;
 
 	while (true) {
 		resilience_watchdog_feed();
 
-		/* [UNIT] Battery every 5s: the PMIC is slow-changing and each read is
-		 * an I2C transaction we would rather not do at the button poll rate. */
+		/* POLICY (not a hardware fact): 5s. The PMIC is slow-changing and each
+		 * read is an I2C transaction we would rather not do at the button rate. */
 		if (ticks % (5000 / POLL_MS) == 0) {
 			if (batt_ok) {
 				battery_read(&bs);
 			}
 			if (bs.valid) {
-				bt_bas_set_battery_level(bs.percent);
+				/* Measurements only -- no state-of-charge percent. See battery.h. */
 				snprintk(status_line, sizeof(status_line),
-					 "%u%% %u.%02uV %s | reset=%s boots=%u%s",
-					 bs.percent, bs.millivolts / 1000,
-					 (bs.millivolts % 1000) / 10,
-					 battery_state_str(bs.state), bi->cause_str,
+					 "%d.%02dV %+dmA die%d.%dC %s%s st=0x%02x | reset=%s boots=%u%s",
+					 bs.millivolts / 1000, (bs.millivolts % 1000) / 10,
+					 bs.milliamps,
+					 bs.die_temp_decidegc / 10, abs(bs.die_temp_decidegc % 10),
+					 battery_state_str(bs.state),
+					 bs.vbus ? " USB" : "", bs.vbus_status_raw, bi->cause_str,
 					 bi->boot_count, bi->safe_mode ? " SAFE" : "");
 			} else {
 				snprintk(status_line, sizeof(status_line),
@@ -259,21 +283,63 @@ int main(void)
 			}
 			/* Log only on change: the same line every 5s would bury everything
 			 * else, but a silent battery path is impossible to verify. */
-			static char last_line[64];
+			static char last_line[112];
 			if (strcmp(last_line, status_line) != 0) {
 				strncpy(last_line, status_line, sizeof(last_line) - 1);
 				LOG_INF("status: %s", status_line);
 			}
 			status_publish();
 
-			/* LED: safe mode outranks everything -- if the device needs
-			 * recovery that is the one thing the user must notice. */
-			if (bi->safe_mode)                        led_status_set(LED_SAFE_MODE);
-			else if (bs.state == BATTERY_CHARGING)    led_status_set(LED_CHARGING);
-			else if (bs.state == BATTERY_CHARGED)     led_status_set(LED_CHARGED);
-			else if (bs.state == BATTERY_NONE)        led_status_set(LED_LOW_BATTERY);
-			else if (bs.valid && bs.percent < 15)     led_status_set(LED_LOW_BATTERY);
-			else                                      led_status_set(LED_OFF);
+			/* Safe mode outranks everything: if the device needs recovery that
+			 * is the one thing the user must notice. */
+			if (bi->safe_mode) {
+				led_status_set(LED_SAFE_MODE);
+			} else if (bs.state == BATTERY_STATE_TRICKLE ||
+				   bs.state == BATTERY_STATE_CC ||
+				   bs.state == BATTERY_STATE_CV) {
+				led_status_set(LED_CHARGING);
+			} else if (bs.state == BATTERY_STATE_COMPLETE) {
+				led_status_set(LED_CHARGED);
+			} else if (bs.valid && !bs.vbus && bs.millivolts < LOW_BATT_WARN_MV) {
+				led_status_set(LED_LOW_BATTERY);
+			} else {
+				led_status_set(LED_OFF);
+			}
+
+			if (bs.valid && bs.charger_error != 0 &&
+			    bs.charger_error != last_chg_err) {
+				LOG_WRN("charger error register: 0x%02x",
+					(unsigned)bs.charger_error);
+			}
+			last_chg_err = bs.charger_error;
+
+			/* Over-discharge guard. Only on battery: with USB present the
+			 * charger is feeding the cell, and staying awake keeps the board
+			 * flashable. Requires a VALID reading -- never ship on a failed
+			 * PMIC read. */
+			if (bs.valid && !bs.vbus && bs.millivolts < SHIP_CUTOFF_MV) {
+				low_reads++;
+				LOG_WRN("battery %dmV below cutoff (%d/%d)", bs.millivolts,
+					low_reads, SHIP_CONFIRM_READS);
+			} else {
+				low_reads = 0;
+			}
+			if (low_reads >= SHIP_CONFIRM_READS) {
+				LOG_WRN("LOW BATTERY -> ship mode. Plug in USB to wake.");
+				led_status_set(LED_OFF);
+				resilience_note_low_battery_shutdown();
+				k_sleep(K_MSEC(100));   /* let the log line drain */
+				int rc = battery_enter_ship_mode();
+				/* Only reached if power was NOT cut. rc==0 means the PMIC accepted
+				 * the ship command but woke straight back up -- it will not stay in
+				 * ship mode with external power present. rc<0 is a real error. */
+				if (rc == 0) {
+					LOG_ERR("ship accepted but still powered -- external power present?");
+				} else {
+					LOG_ERR("ship mode command failed: %d -- staying up", rc);
+				}
+				low_reads = 0;
+			}
 		}
 		ticks++;
 
@@ -286,20 +352,52 @@ int main(void)
 				if (agree >= DEBOUNCE_N && raw != stable) {
 					stable = raw;
 					atomic_set(&btn_state, stable);
-					press_started = stable ? k_uptime_get() : 0;
 					LOG_INF("[BTN] %s", stable ? "PRESSED" : "released");
 					int rc = bt_lbs_send_button_state(stable != 0);
 					if (rc && rc != -ENOTCONN) {
 						LOG_WRN("notify failed: %d", rc);
 					}
 				}
-				/* Long-press restart: the user-facing "turn it off and on
-				 * again" that needs no cable and no instructions. */
-				if (stable && press_started &&
-				    (k_uptime_get() - press_started) >= LONG_PRESS_MS) {
-					LOG_WRN("long press -> restarting");
-					k_sleep(K_MSEC(50));
-					sys_reboot(SYS_REBOOT_COLD);
+
+				/* Gesture recognition runs on the DEBOUNCED signal. The machine
+				 * is pure and host-tested -- tests/test_button_gesture.cpp. */
+				enum button_event ev =
+					button_gesture_update(&gest, stable != 0,
+							      k_uptime_get_32());
+				switch (ev) {
+				case BG_EVT_HOLD_START:
+					LOG_INF("gesture: HOLD -> agentic command start");
+					break;
+				case BG_EVT_HOLD_END:
+					LOG_INF("gesture: HOLD end");
+					break;
+				case BG_EVT_DOUBLE_TAP:
+					LOG_INF("gesture: DOUBLE TAP -> recording toggle");
+					break;
+				case BG_EVT_SINGLE_TAP:
+					LOG_INF("gesture: single tap (reserved)");
+					break;
+				/* Maintenance is gated on USB being present: it must be
+				 * impossible to reach these in a pocket. */
+				case BG_EVT_MAINT_5S:
+					if (bs.vbus) {
+						LOG_WRN("gesture: MAINT 5s -> pairing mode "
+							"(bonding not built yet)");
+					} else {
+						LOG_INF("MAINT 5s ignored -- USB not connected");
+					}
+					break;
+				case BG_EVT_MAINT_10S:
+					if (bs.vbus) {
+						LOG_WRN("gesture: MAINT 10s -> restarting");
+						k_sleep(K_MSEC(50));
+						sys_reboot(SYS_REBOOT_COLD);
+					} else {
+						LOG_INF("MAINT 10s ignored -- USB not connected");
+					}
+					break;
+				default:
+					break;
 				}
 			}
 		}

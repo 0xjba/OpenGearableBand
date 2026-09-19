@@ -62,6 +62,15 @@ void resilience_mark_healthy(void);
 /* True if this boot is running in safe mode. */
 bool resilience_in_safe_mode(void);
 
+/*
+ * Record, in NVS, that the device is about to cut its own power for a low
+ * battery. Waking from nPM1300 ship mode is a power-on reset (RESETREAS = 0),
+ * which is indistinguishable from a BROWNOUT -- exactly the ambiguity that cost
+ * an evening on 2026-09-05. With this note the next boot reports
+ * "low-battery shutdown" instead. Call immediately before entering ship mode.
+ */
+void resilience_note_low_battery_shutdown(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -16,21 +16,28 @@
 
 LOG_MODULE_REGISTER(resilience, LOG_LEVEL_INF);
 
-/* [UNIT] Consecutive unhealthy boots before we stop trusting the full firmware.
+/* POLICY, not a verified hardware fact. There is no authority for "how many
+ * failed boots means give up" -- this is a design choice, stated so it can be
+ * argued with rather than mistaken for a spec.
+ * Consecutive unhealthy boots before we stop trusting the full firmware.
  * 5 tolerates a user power-cycling a few times in frustration without demoting
  * a working device, but still trips within ~6s of a 1.09s reset loop. */
 #define SAFE_MODE_THRESHOLD  5
 
-/* [UNIT] Uptime that counts as "the firmware works". Must comfortably exceed
+/* POLICY, not a verified hardware fact.
+ * Uptime that counts as "the firmware works". Must comfortably exceed
  * the time to bring up every optional peripheral, or a late-boot crash would
  * clear the counter and defeat the loop detector. */
 #define RESILIENCE_HEALTHY_MS  30000
 
-/* [UNIT] Watchdog period. Long enough that a busy BLE + audio path never trips
- * it spuriously; short enough that a user does not give up on a hung device. */
+/* POLICY, not a verified hardware fact. The correct value is bounded below by
+ * the longest legitimate blocking operation in the system -- measure that before
+ * shortening it. 8s is long enough for a busy BLE + audio path and short enough
+ * that a user has not given up on a hung device. */
 #define WDT_TIMEOUT_MS  8000
 
 #define NVS_KEY_BOOT_COUNT  1
+#define NVS_KEY_SHUTDOWN    2   /* 1 = last power-off was a low-battery ship */
 
 static struct nvs_fs fs;
 static bool nvs_ok;
@@ -117,6 +124,17 @@ const struct resilience_boot_info *resilience_boot(bool button_held)
 
 	info.reset_cause = reas;
 	info.cause_str   = decode_reset(reas);
+
+	/* A ship-mode wake is a power-on reset; say so if we shipped on purpose. */
+	uint8_t shut = 0;
+	if (nvs_ok && nvs_read(&fs, NVS_KEY_SHUTDOWN, &shut, sizeof(shut)) == sizeof(shut)
+	    && shut == 1) {
+		if (reas == 0) {
+			info.cause_str = "woke from LOW-BATTERY shutdown";
+		}
+		shut = 0;
+		nvs_write(&fs, NVS_KEY_SHUTDOWN, &shut, sizeof(shut));
+	}
 	info.boot_count  = boot_count_bump();
 	info.user_forced = button_held;
 	info.safe_mode   = button_held || (info.boot_count >= SAFE_MODE_THRESHOLD);
@@ -130,6 +148,18 @@ const struct resilience_boot_info *resilience_boot(bool button_held)
 		 * counter now: they should get a normal boot next time. */
 		if (button_held) {
 			resilience_mark_healthy();
+		} else {
+			/* Once this minimal image has stayed up for the healthy window,
+			 * clear the counter so the NEXT boot retries the full firmware.
+			 * Without this, automatic safe mode was PERMANENT: nothing else
+			 * clears the counter, and a reflash does not erase NVS -- so a
+			 * device that tripped it stayed there even with fixed firmware.
+			 * Found on HW 2026-09-19: each probe-rs flash causes two watchdog
+			 * resets while the core is halted, so two quick flashes reached
+			 * the threshold. If the full firmware is still broken it simply
+			 * returns here after SAFE_MODE_THRESHOLD more boots -- a bounded
+			 * retry, not a trap. */
+			k_work_schedule(&healthy_work, K_MSEC(RESILIENCE_HEALTHY_MS));
 		}
 	} else {
 		k_work_schedule(&healthy_work, K_MSEC(RESILIENCE_HEALTHY_MS));
@@ -138,6 +168,14 @@ const struct resilience_boot_info *resilience_boot(bool button_held)
 }
 
 bool resilience_in_safe_mode(void) { return info.safe_mode; }
+
+void resilience_note_low_battery_shutdown(void)
+{
+	uint8_t one = 1;
+	if (nvs_ok) {
+		nvs_write(&fs, NVS_KEY_SHUTDOWN, &one, sizeof(one));
+	}
+}
 
 static void wdt_expired(int channel, void *user)
 {

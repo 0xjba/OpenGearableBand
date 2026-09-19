@@ -1,5 +1,13 @@
-# Copyright (c) 2026 gestureband
+# Copyright (c) 2025 Seeed Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
+#
+# LOCAL PATCH (not Seeed's): Seeed selects SOC_NRF54LM20A_CPUAPP / _CPUFLPR,
+# the production-silicon symbols. This NCS (3.2.3 / Zephyr 4.2.99) only defines
+# the engineering-A symbols SOC_NRF54LM20A_ENGA_CPUAPP / _ENGA_CPUFLPR, so the
+# select silently matched nothing and the SoC was never chosen -- which showed
+# up as CPU_HAS_MPU=n and ARM_MPU/HW_STACK_PROTECTION failing to apply.
+# Symbol rename only; no hardware description changes. Revert on SDK upgrade.
 
 config BOARD_XIAO_NRF54LM20A
 	select SOC_NRF54LM20A_ENGA_CPUAPP if BOARD_XIAO_NRF54LM20A_NRF54LM20A_CPUAPP
+	select SOC_NRF54LM20A_ENGA_CPUFLPR if BOARD_XIAO_NRF54LM20A_NRF54LM20A_CPUFLPR

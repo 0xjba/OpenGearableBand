@@ -12,5 +12,6 @@ target_sources(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/resilience.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/battery.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/led_status.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/button_gesture.cpp
 )
 target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)

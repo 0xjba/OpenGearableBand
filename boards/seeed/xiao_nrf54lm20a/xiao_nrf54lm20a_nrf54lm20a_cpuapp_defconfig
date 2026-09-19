@@ -1,4 +1,4 @@
-# Copyright (c) 2026 gestureband
+# Copyright (c) 2025 Seeed Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
 # Enable UART driver
@@ -11,12 +11,14 @@ CONFIG_UART_CONSOLE=y
 # Enable GPIO
 CONFIG_GPIO=y
 
-# Enable MPU + stack protection
+# Enable MPU
 CONFIG_ARM_MPU=y
+
+# Enable hardware stack protection
 CONFIG_HW_STACK_PROTECTION=y
 
-# MPU-based null-pointer dereferencing detection cannot be applied as the
-# (0x0 - 0x400) region is unmapped for this target.
+# MPU-based null-pointer dereferencing detection cannot
+# be applied as the (0x0 - 0x400) is unmapped for this target.
 CONFIG_NULL_POINTER_EXCEPTION_DETECTION_NONE=y
 
 # Enable Cache
@@ -25,6 +27,3 @@ CONFIG_EXTERNAL_CACHE=y
 
 # Start SYSCOUNTER on driver init
 CONFIG_NRF_GRTC_START_SYSCOUNTER=y
-
-# Regulators (nPM1300 / on-die vregmain handled later; fixed regulators for hogs)
-CONFIG_REGULATOR=y

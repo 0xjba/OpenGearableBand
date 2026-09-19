@@ -9,13 +9,14 @@
 
 LOG_MODULE_REGISTER(led_status, LOG_LEVEL_INF);
 
-static const struct gpio_dt_spec red   = GPIO_DT_SPEC_GET(DT_NODELABEL(led_red),   gpios);
-static const struct gpio_dt_spec green = GPIO_DT_SPEC_GET(DT_NODELABEL(led_green), gpios);
+static const struct gpio_dt_spec red   = GPIO_DT_SPEC_GET(DT_NODELABEL(red_led),   gpios);
+static const struct gpio_dt_spec green = GPIO_DT_SPEC_GET(DT_NODELABEL(green_led), gpios);
 static bool leds_ok;
 static enum led_mode cur_mode;
 static int phase;
 
-/* [UNIT] Blink cadences, ms. Distinct on purpose: a user must be able to tell
+/* POLICY, not verified hardware facts -- chosen for legibility, not measured.
+ * Blink cadences, ms. Distinct on purpose: a user must be able to tell
  * "charging" from "something is wrong" across a room without a manual. */
 #define TICK_MS        250
 #define SAFE_ON_TICKS    1   /* 250ms on, 250ms off -- urgent  */
